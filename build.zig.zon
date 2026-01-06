@@ -1,0 +1,7 @@
+.{
+    .name = .wave,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.16.0-dev.1859+212968c57",
+    .paths = .{"."},
+    .fingerprint = 0xda04ad89ad4e2917,
+}
