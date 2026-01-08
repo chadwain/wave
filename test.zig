@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 
 const wave = @import("wave");
 
@@ -9,42 +10,79 @@ pub fn main() !void {
     defer assert(dbg_alloc.deinit() == .ok);
     const allocator = dbg_alloc.allocator();
 
-    var threaded = std.Io.Threaded.init(allocator, .{});
+    var threaded = Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const config = try makeConfig(allocator);
-    defer freeConfig(config, allocator);
+    var args = try Args.init(allocator);
+    defer args.deinit(allocator);
 
-    var server: wave.Server = try .init(config, io, allocator);
-    defer server.deinit(io);
+    // const sync_dir = try Io.Dir.cwd().openDir(io, args.syncDir(), .{ .iterate = true });
+    // defer sync_dir.close(io);
 
-    var server_task = try io.concurrent(wave.Server.start, .{ &server, io });
-    defer server_task.cancel(io) catch {};
+    // var listing = try wave.host.completeScan(sync_dir, io, allocator);
+    // defer listing.deinit(allocator);
+    // var stdout = Io.File.stdout().writer(io, &.{});
+    // try listing.print(&stdout.interface);
 
-    const port = server.tcp.socket.address.getPort();
-    var client_task = try io.concurrent(wave.Client.start, .{ io, port });
-    defer client_task.cancel(io) catch {};
+    const w = std.os.windows;
+    const sync_dir_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
+    defer allocator.free(sync_dir_wtf16);
+    const FILE_SHARE_READ = 0x1;
+    const FILE_SHARE_WRITE = 0x2;
+    const FILE_SHARE_DELETE = 0x4;
+    const sync_dir = std.os.windows.kernel32.CreateFileW(
+        sync_dir_wtf16,
+        .{ .GENERIC = .{ .READ = true } },
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        null,
+        w.OPEN_EXISTING,
+        w.FILE_FLAG_BACKUP_SEMANTICS | w.FILE_FLAG_OVERLAPPED,
+        null,
+    );
+    if (sync_dir == w.INVALID_HANDLE_VALUE) return error.CreateFile;
+    defer w.CloseHandle(sync_dir);
 
-    try server_task.await(io);
-    try client_task.await(io);
-}
+    var watch_task = try io.concurrent(wave.host.watch, .{ sync_dir, io });
+    defer watch_task.cancel(io) catch {};
 
-fn makeConfig(allocator: Allocator) !wave.Server.Config {
-    var args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var stdin_buffer: [64]u8 = undefined;
+    var stdin = Io.File.stdin().reader(io, &stdin_buffer);
+    const reader = &stdin.interface;
 
-    switch (args.len) {
-        2 => {
-            const server_sync_dir = try allocator.dupe(u8, args[1]);
-            return .{ .sync_dir_absolute = server_sync_dir, .port = 0 };
-        },
-        else => {
-            return error.InvalidArguments;
-        },
+    std.debug.print("Press q to quit\n", .{});
+    while (true) {
+        var line: []const u8 = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.ReadFailed, error.EndOfStream => |e| return e,
+            error.StreamTooLong => {
+                _ = try reader.discardDelimiterInclusive('\n');
+                continue;
+            },
+        };
+        reader.toss(1);
+        line = std.mem.trimEnd(u8, line, "\r");
+        if (std.mem.eql(u8, line, "q")) return;
     }
 }
 
-fn freeConfig(config: wave.Server.Config, allocator: Allocator) void {
-    allocator.free(config.sync_dir_absolute);
-}
+const Args = struct {
+    all_args: [][:0]u8,
+
+    fn init(allocator: Allocator) !Args {
+        var args = try std.process.argsAlloc(allocator);
+        errdefer std.process.argsFree(allocator, args);
+
+        switch (args.len) {
+            2 => return .{ .all_args = args },
+            else => return error.InvalidArguments,
+        }
+    }
+
+    fn deinit(args: Args, allocator: Allocator) void {
+        std.process.argsFree(allocator, args.all_args);
+    }
+
+    fn syncDir(args: Args) []const u8 {
+        return args.all_args[1];
+    }
+};
