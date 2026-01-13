@@ -17,9 +17,6 @@ pub fn main() !void {
     var args = try Args.init(allocator);
     defer args.deinit(allocator);
 
-    // const sync_dir = try Io.Dir.cwd().openDir(io, args.syncDir(), .{ .iterate = true });
-    // defer sync_dir.close(io);
-
     // var listing = try wave.host.completeScan(sync_dir, io, allocator);
     // defer listing.deinit(allocator);
     // var stdout = Io.File.stdout().writer(io, &.{});
@@ -28,19 +25,11 @@ pub fn main() !void {
     const w = std.os.windows;
     const sync_dir_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
     defer allocator.free(sync_dir_wtf16);
-    const FILE_SHARE_READ = 0x1;
-    const FILE_SHARE_WRITE = 0x2;
-    const FILE_SHARE_DELETE = 0x4;
-    const sync_dir = std.os.windows.kernel32.CreateFileW(
-        sync_dir_wtf16,
-        .{ .GENERIC = .{ .READ = true } },
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        null,
-        w.OPEN_EXISTING,
-        w.FILE_FLAG_BACKUP_SEMANTICS | w.FILE_FLAG_OVERLAPPED,
-        null,
-    );
-    if (sync_dir == w.INVALID_HANDLE_VALUE) return error.CreateFile;
+
+    // const sync_dir = try Io.Dir.cwd().openDir(io, args.syncDir(), .{ .iterate = true });
+    // defer sync_dir.close(io);
+
+    const sync_dir = try wave.host.openSyncDir(sync_dir_wtf16);
     defer w.CloseHandle(sync_dir);
 
     var watch_task = try io.concurrent(wave.host.watch, .{ sync_dir, io });
@@ -63,6 +52,8 @@ pub fn main() !void {
         line = std.mem.trimEnd(u8, line, "\r");
         if (std.mem.eql(u8, line, "q")) return;
     }
+
+    try wave.host.simulateFileTransfer(io, allocator, sync_dir.handle);
 }
 
 const Args = struct {
