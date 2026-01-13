@@ -17,7 +17,7 @@ pub fn main() !void {
     var args = try Args.init(allocator);
     defer args.deinit(allocator);
 
-    // var listing = try wave.host.completeScan(sync_dir, io, allocator);
+    // var listing = try wave.host_windows.completeScan(sync_dir, io, allocator);
     // defer listing.deinit(allocator);
     // var stdout = Io.File.stdout().writer(io, &.{});
     // try listing.print(&stdout.interface);
@@ -29,10 +29,10 @@ pub fn main() !void {
     // const sync_dir = try Io.Dir.cwd().openDir(io, args.syncDir(), .{ .iterate = true });
     // defer sync_dir.close(io);
 
-    const sync_dir = try wave.host.openSyncDir(sync_dir_wtf16);
+    const sync_dir = try wave.host_windows.openSyncDir(sync_dir_wtf16);
     defer w.CloseHandle(sync_dir);
 
-    var watch_task = try io.concurrent(wave.host.watch, .{ sync_dir, io });
+    var watch_task = try io.concurrent(wave.host_windows.watch, .{ sync_dir, io });
     defer watch_task.cancel(io) catch {};
 
     var stdin_buffer: [64]u8 = undefined;
