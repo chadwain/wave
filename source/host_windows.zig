@@ -1,58 +1,141 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const w = std.os.windows;
 const wtf16 = std.unicode.wtf8ToWtf16LeStringLiteral;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-/// A listing of all files in the sync directory.
-pub const Listing = struct {
-    map: std.ArrayHashMapUnmanaged([]const u16, void, MapContext, true) = .empty,
-    strings: std.heap.ArenaAllocator.State = .{},
+pub const Wtf16 = struct {
+    slice: []const w.WCHAR,
 
-    pub const MapContext = struct {
-        pub fn hash(_: MapContext, s: []const u16) u32 {
-            // TODO: Better hashing
-            // TODO: Do WTF-16 strings have a unique representation?
-            var hasher = std.hash.Wyhash.init(0);
-            for (s) |c| std.hash.autoHash(&hasher, c);
-            return @truncate(hasher.final());
-        }
-        pub fn eql(_: @This(), a: []const u16, b: []const u16, _: usize) bool {
-            return std.mem.eql(u16, a, b);
-        }
-    };
-
-    pub fn deinit(listing: *Listing, allocator: Allocator) void {
-        listing.map.deinit(allocator);
-        var arena = listing.strings.promote(allocator);
-        arena.deinit();
-        listing.* = undefined;
+    pub fn wtf16Cast(slice: []const w.WCHAR) Wtf16 {
+        return .{ .slice = slice };
     }
 
-    pub fn print(listing: *const Listing, writer: *std.Io.Writer) !void {
-        var it = listing.map.iterator();
-        while (it.next()) |entry| {
-            try writer.print("{f}\n", .{std.unicode.fmtUtf16Le(entry.key_ptr.*)});
-        }
+    pub fn format(self: Wtf16, writer: *Io.Writer) Io.Writer.Error!void {
+        try writer.print("{f}", .{std.unicode.fmtUtf16Le(self.slice)});
     }
 };
 
-const ScanContext = struct {
-    listing: Listing = .{},
-    pending_dirs: std.ArrayList([]const u16) = .empty,
-    pending_dir_names: std.heap.ArenaAllocator.State = .{},
-    sub_path: std.ArrayList(u16) = .empty,
-    component_delimeters: std.ArrayList(u16) = .empty,
-    open_dir_handles: std.ArrayList(w.HANDLE) = .empty,
+pub const Wtf16Z = struct {
+    slice: [:0]const w.WCHAR,
 
-    fn init(sync_dir: w.HANDLE, allocator: Allocator) !ScanContext {
-        var ctx = ScanContext{};
-        try ctx.open_dir_handles.append(allocator, sync_dir);
-        return ctx;
+    pub fn wtf16ZCast(slice: [:0]const w.WCHAR) Wtf16Z {
+        return .{ .slice = slice };
+    }
+};
+
+pub const Database = struct {
+    allocator: Allocator,
+    file_path_arena: std.heap.ArenaAllocator.State = .{},
+    all_known_files: FileHashMap(Entry) = .empty,
+    files_needing_sync: FileHashMap(void) = .empty,
+    debug: Debug,
+
+    pub const Entry = struct {
+        hash: Blake3Hash,
+        modified_time: w.LARGE_INTEGER,
+        size: w.LARGE_INTEGER,
+    };
+
+    pub const Blake3Hash = [32]u8;
+
+    pub fn FileHashMap(comptime V: type) type {
+        const Context = struct {
+            pub fn hash(_: @This(), self: Wtf16) u32 {
+                // TODO: Better hashing
+                // TODO: Do WTF-16 strings have a unique representation?
+                var hasher = std.hash.Wyhash.init(0);
+                for (self.slice) |c| std.hash.autoHash(&hasher, c);
+                return @truncate(hasher.final());
+            }
+            pub fn eql(_: @This(), a: Wtf16, b: Wtf16) bool {
+                return std.mem.eql(w.WCHAR, a.slice, b.slice);
+            }
+        };
+        return std.HashMapUnmanaged(Wtf16, V, Context, std.hash_map.default_max_load_percentage);
     }
 
-    fn deinit(ctx: *ScanContext, allocator: Allocator) void {
-        ctx.listing.deinit(allocator);
+    pub fn init(allocator: Allocator) Database {
+        return .{
+            .allocator = allocator,
+            .file_path_arena = .{},
+            .all_known_files = .empty,
+            .files_needing_sync = .empty,
+            .debug = .{},
+        };
+    }
+
+    pub fn deinit(db: *Database) void {
+        db.all_known_files.deinit(db.allocator);
+        db.files_needing_sync.deinit(db.allocator);
+        var file_path_arena = db.file_path_arena.promote(db.allocator);
+        file_path_arena.deinit();
+        db.* = undefined;
+    }
+
+    fn createOrUpdateEntry(
+        db: *Database,
+        path: Wtf16,
+        information: *const NtQueryInformation,
+        hash: *const Blake3Hash,
+    ) !void {
+        const gop = try db.all_known_files.getOrPut(db.allocator, path);
+        errdefer db.all_known_files.removeByPtr(gop.key_ptr);
+
+        const need_sync = !gop.found_existing or !std.mem.eql(u8, &gop.value_ptr.hash, hash);
+
+        var file_path_arena = db.file_path_arena.promote(db.allocator);
+        defer db.file_path_arena = file_path_arena.state;
+        const file_path_allocator = file_path_arena.allocator();
+        if (!gop.found_existing) {
+            const path_copied = try file_path_allocator.dupe(w.WCHAR, path.slice);
+            gop.key_ptr.* = .wtf16Cast(path_copied);
+        }
+        errdefer if (!gop.found_existing) file_path_allocator.free(gop.key_ptr.slice);
+
+        gop.value_ptr.* = .{
+            .hash = hash.*,
+            .modified_time = information.ChangeTime,
+            .size = information.EndOfFile,
+        };
+        if (need_sync) try db.files_needing_sync.put(db.allocator, gop.key_ptr.*, {});
+    }
+
+    pub const Debug = struct {
+        pub fn print(debug: *const Debug, writer: *Io.Writer) !void {
+            const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
+            var it = db.all_known_files.iterator();
+            while (it.next()) |entry| {
+                try writer.print(
+                    "{f}: modified({}) size({})\n",
+                    .{ entry.key_ptr.*, entry.value_ptr.modified_time, entry.value_ptr.size },
+                );
+            }
+        }
+    };
+};
+
+const FullScanContext = struct {
+    pending_dirs: std.ArrayList(Wtf16),
+    pending_dir_names: std.heap.ArenaAllocator.State,
+    sub_path: std.ArrayList(w.WCHAR),
+    component_delimeters: std.ArrayList(u16),
+    open_dir_handles: std.ArrayList(w.HANDLE),
+
+    fn init(sync_dir: w.HANDLE, allocator: Allocator) !FullScanContext {
+        var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
+        try open_dir_handles.append(allocator, sync_dir);
+        return .{
+            .pending_dirs = .empty,
+            .pending_dir_names = .{},
+            .sub_path = .empty,
+            .component_delimeters = .empty,
+            .open_dir_handles = open_dir_handles,
+        };
+    }
+
+    fn deinit(ctx: *FullScanContext, allocator: Allocator) void {
         ctx.pending_dirs.deinit(allocator);
         var arena = ctx.pending_dir_names.promote(allocator);
         arena.deinit();
@@ -67,89 +150,110 @@ const ScanContext = struct {
         ctx.* = undefined;
     }
 
-    fn finalize(ctx: *ScanContext, allocator: Allocator) Listing {
-        const listing = ctx.listing;
-        ctx.listing = .{};
-        ctx.deinit(allocator);
-        return listing;
-    }
-
-    fn enterDir(ctx: *ScanContext, allocator: Allocator, dir_path: []const u16) !w.HANDLE {
+    fn enterDir(ctx: *FullScanContext, allocator: Allocator, dir_path: Wtf16) !void {
         try ctx.component_delimeters.append(allocator, @intCast(ctx.sub_path.items.len));
-        try ctx.sub_path.appendSlice(allocator, dir_path);
+        try ctx.sub_path.appendSlice(allocator, dir_path.slice);
         try ctx.sub_path.appendSlice(allocator, comptime wtf16("\\"));
 
         const parent_dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
         const dir = try openDir(parent_dir, dir_path);
         try ctx.open_dir_handles.append(allocator, dir);
-        return dir;
     }
 
-    fn exitDir(ctx: *ScanContext) void {
-        _ = ctx.pending_dirs.pop();
+    fn exitDir(ctx: *FullScanContext) void {
         const component_delimeter_index = ctx.component_delimeters.pop().?;
         ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
         const dir = ctx.open_dir_handles.pop().?;
         w.CloseHandle(dir);
     }
 
-    fn addObject(ctx: *ScanContext, allocator: Allocator, name: []const u16, attrs: w.FILE.ATTRIBUTE) !void {
-        if (attrs.REPARSE_POINT) return;
-
-        const component_delimeter_index = ctx.sub_path.items.len;
-        defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
-        try ctx.sub_path.appendSlice(allocator, name);
-        try ctx.sub_path.append(allocator, 0);
-
-        const sub_path = ctx.sub_path.items[0 .. ctx.sub_path.items.len - 1 :0];
-        const gop = try ctx.listing.map.getOrPut(allocator, sub_path);
-        errdefer if (!gop.found_existing) ctx.listing.map.swapRemoveAt(gop.index);
-        if (gop.found_existing) {
-            std.debug.panic(
-                "TODO: Found existing path while generating a directory listing: {f}\n",
-                .{std.unicode.fmtUtf16Le(sub_path)},
-            );
+    fn addObject(
+        ctx: *FullScanContext,
+        db: *Database,
+        allocator: Allocator,
+        name: Wtf16,
+        information: *const NtQueryInformation,
+    ) !void {
+        const rejected: w.FILE.ATTRIBUTE = .{
+            .HIDDEN = true,
+            .SYSTEM = true,
+            .TEMPORARY = true,
+            .REPARSE_POINT = true,
+            .ENCRYPTED = true,
+        };
+        if (@as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0) {
+            const component_delimeter_index = ctx.sub_path.items.len;
+            defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
+            try ctx.sub_path.appendSlice(allocator, name.slice);
+            std.debug.print("Not processing file: {f}\n", .{std.unicode.fmtUtf16Le(ctx.sub_path.items)});
+            return;
         }
 
-        {
-            var arena = ctx.listing.strings.promote(allocator);
-            defer ctx.listing.strings = arena.state;
-            const copied_sub_path = try arena.allocator().dupe(u16, sub_path);
-            gop.key_ptr.* = copied_sub_path;
-        }
-
-        if (attrs.NORMAL) return;
-        if (attrs.DIRECTORY) {
+        if (information.FileAttributes.DIRECTORY) {
             var arena = ctx.pending_dir_names.promote(allocator);
             defer ctx.pending_dir_names = arena.state;
-            const copied_name = try arena.allocator().dupe(u16, name);
-            try ctx.pending_dirs.append(allocator, copied_name);
+            const copied_name = try arena.allocator().dupe(w.WCHAR, name.slice);
+            try ctx.pending_dirs.append(allocator, .wtf16Cast(copied_name));
+        } else {
+            const component_delimeter_index = ctx.sub_path.items.len;
+            defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
+            try ctx.sub_path.appendSlice(allocator, name.slice);
+
+            const hash: Database.Blake3Hash = @splat(0x42); // TODO
+
+            try db.createOrUpdateEntry(.wtf16Cast(ctx.sub_path.items), information, &hash);
         }
     }
 };
 
-pub fn completeScan(sync_dir: w.HANDLE, allocator: Allocator) !Listing {
-    var ctx = try ScanContext.init(sync_dir, allocator);
-    errdefer ctx.deinit(allocator);
+const nt_query_information_class: w.FILE.INFORMATION_CLASS = .IdBothDirectory;
 
-    try scanOneDirectory(sync_dir, allocator, &ctx);
+// Corresponds to FILE_ID_BOTH_DIR_INFORMATION.
+// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_id_both_dir_information
+const NtQueryInformation = extern struct {
+    NextEntryOffset: w.ULONG,
+    FileIndex: w.ULONG,
+    CreationTime: w.LARGE_INTEGER,
+    LastAccessTime: w.LARGE_INTEGER,
+    LastWriteTime: w.LARGE_INTEGER,
+    ChangeTime: w.LARGE_INTEGER,
+    EndOfFile: w.LARGE_INTEGER,
+    AllocationSize: w.LARGE_INTEGER,
+    FileAttributes: w.FILE.ATTRIBUTE,
+    FileNameLength: w.ULONG,
+    EaSize: w.ULONG,
+    ShortNameLength: CCHAR,
+    ShortName: [12]w.WCHAR,
+    FileId: w.LARGE_INTEGER,
+    FileName: [1]w.WCHAR,
+
+    // https://learn.microsoft.com/en-us/windows/win32/winprog/windows-data-types
+    const CCHAR = w.CHAR;
+};
+
+pub fn completeScan(db: *Database, sync_dir: w.HANDLE, allocator: Allocator) !void {
+    var ctx = try FullScanContext.init(sync_dir, allocator);
+    defer ctx.deinit(allocator);
+
+    try scanOneDirectory(db, allocator, &ctx);
     while (ctx.pending_dirs.items.len > 0) {
         const dir_path_ptr = &ctx.pending_dirs.items[ctx.pending_dirs.items.len - 1];
-        if (dir_path_ptr.len == 0) {
+        if (dir_path_ptr.slice.len == 0) {
+            _ = ctx.pending_dirs.pop();
             ctx.exitDir();
             continue;
         }
 
         const dir_path = dir_path_ptr.*;
-        dir_path_ptr.* = &.{};
-        const dir = try ctx.enterDir(allocator, dir_path);
-        try scanOneDirectory(dir, allocator, &ctx);
+        dir_path_ptr.* = .wtf16Cast(&.{});
+        try ctx.enterDir(allocator, dir_path);
+        try scanOneDirectory(db, allocator, &ctx);
     }
-    return ctx.finalize(allocator);
 }
 
-fn scanOneDirectory(dir: w.HANDLE, allocator: Allocator, ctx: *ScanContext) !void {
-    var buffer align(@alignOf(w.FILE_BOTH_DIR_INFORMATION)) = @as([64 * 1024]u8, undefined);
+fn scanOneDirectory(db: *Database, allocator: Allocator, ctx: *FullScanContext) !void {
+    const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
+    var buffer align(@alignOf(NtQueryInformation)) = @as([64 * 1024]u8, undefined);
     var io_status_block: w.IO_STATUS_BLOCK = undefined;
     var restart_scan: w.BOOLEAN = w.TRUE;
 
@@ -162,7 +266,7 @@ fn scanOneDirectory(dir: w.HANDLE, allocator: Allocator, ctx: *ScanContext) !voi
             &io_status_block,
             &buffer,
             buffer.len,
-            .BothDirectory,
+            nt_query_information_class,
             w.FALSE,
             null,
             restart_scan,
@@ -172,7 +276,10 @@ fn scanOneDirectory(dir: w.HANDLE, allocator: Allocator, ctx: *ScanContext) !voi
             .BUFFER_OVERFLOW => return error.NtBufferOverflow,
             .SUCCESS => if (io_status_block.Information == 0) return error.NtBufferOverflow,
             .PENDING => {
-                try w.WaitForSingleObject(dir, w.INFINITE);
+                w.WaitForSingleObject(dir, w.INFINITE) catch |err| switch (err) {
+                    error.WaitAbandoned, error.WaitTimeOut => unreachable,
+                    error.Unexpected => |e| return e,
+                };
                 continue :sw io_status_block.u.Status;
             },
             else => return w.unexpectedStatus(status),
@@ -182,30 +289,30 @@ fn scanOneDirectory(dir: w.HANDLE, allocator: Allocator, ctx: *ScanContext) !voi
         var offset: usize = 0;
         var next_entry_offset: usize = 1; // Any non-zero value
         while (next_entry_offset != 0) : (offset += next_entry_offset) {
-            const info: *const w.FILE_BOTH_DIR_INFORMATION = @ptrCast(@alignCast(&buffer[offset]));
+            const info: *const NtQueryInformation = @ptrCast(@alignCast(&buffer[offset]));
             next_entry_offset = info.NextEntryOffset;
-            const offset_of_file_name = @offsetOf(w.FILE_BOTH_DIR_INFORMATION, "FileName");
+            const offset_of_file_name = @offsetOf(NtQueryInformation, "FileName");
             const file_name_bytes = buffer[offset + offset_of_file_name ..][0..info.FileNameLength];
-            const file_name: []const u16 = @ptrCast(@alignCast(file_name_bytes));
+            const file_name: Wtf16 = .wtf16Cast(@ptrCast(@alignCast(file_name_bytes)));
 
-            switch (file_name.len) {
-                1 => if (std.mem.eql(u16, file_name, comptime wtf16("."))) continue,
-                2 => if (std.mem.eql(u16, file_name, comptime wtf16(".."))) continue,
-                else => {},
-            }
+            if (std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".")) or
+                std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".."))) continue;
 
-            try ctx.addObject(allocator, file_name, info.FileAttributes);
+            ctx.addObject(db, allocator, file_name, info) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+            };
         }
     }
 }
 
-pub fn openDir(parent: ?w.HANDLE, path_wtf16: []const u16) !w.HANDLE {
+/// Opens a directory capable of async operations and being waited on.
+pub fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     var handle: w.HANDLE = undefined;
-    const path_len_bytes: w.USHORT = @intCast(@as([]const u8, @ptrCast(path_wtf16)).len);
+    const path_len_bytes: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
     var unicode_string: w.UNICODE_STRING = .{
         .Length = path_len_bytes,
         .MaximumLength = path_len_bytes,
-        .Buffer = @constCast(path_wtf16.ptr),
+        .Buffer = @constCast(path.slice.ptr),
     };
     const object_attributes: w.OBJECT_ATTRIBUTES = .{
         .Length = @sizeOf(w.OBJECT_ATTRIBUTES),
@@ -249,6 +356,7 @@ pub fn openDir(parent: ?w.HANDLE, path_wtf16: []const u16) !w.HANDLE {
         null,
         0,
     );
+    // TODO: Do I need to wait?
 
     switch (status) {
         .SUCCESS => return handle,
@@ -256,10 +364,10 @@ pub fn openDir(parent: ?w.HANDLE, path_wtf16: []const u16) !w.HANDLE {
     }
 }
 
-pub fn openSyncDir(path_wtf16: [:0]const u16) !w.HANDLE {
-    if (!std.fs.path.isAbsoluteWindowsWtf16(path_wtf16)) return error.NonAbsoluteSyncDirPath;
-    const normalized = try w.wToPrefixedFileW(null, path_wtf16);
-    return openDir(null, normalized.span());
+pub fn openSyncDir(path_wtf16: Wtf16Z) !w.HANDLE {
+    if (!std.fs.path.isAbsoluteWindowsWtf16(path_wtf16.slice)) return error.NonAbsoluteSyncDirPath;
+    const normalized = try w.wToPrefixedFileW(null, path_wtf16.slice);
+    return openDir(null, .wtf16Cast(normalized.span()));
 }
 
 pub fn watch(sync_dir: w.HANDLE, io: Io) !void {

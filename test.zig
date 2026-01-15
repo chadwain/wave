@@ -21,13 +21,15 @@ pub fn main() !void {
     defer allocator.free(sync_dir_wtf16);
 
     const w = std.os.windows;
-    const sync_dir = try wave.host_windows.openSyncDir(sync_dir_wtf16);
+    const sync_dir = try wave.host_windows.openSyncDir(.wtf16ZCast(sync_dir_wtf16));
     defer w.CloseHandle(sync_dir);
 
-    var listing = try wave.host_windows.completeScan(sync_dir, allocator);
-    defer listing.deinit(allocator);
+    var db = wave.host_windows.Database.init(allocator);
+    defer db.deinit();
+
+    try wave.host_windows.completeScan(&db, sync_dir, allocator);
     var stdout = Io.File.stdout().writer(io, &.{});
-    try listing.print(&stdout.interface);
+    try db.debug.print(&stdout.interface);
 
     var watch_task = try io.concurrent(wave.host_windows.watch, .{ sync_dir, io });
     defer watch_task.cancel(io) catch {};
