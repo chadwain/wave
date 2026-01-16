@@ -27,10 +27,6 @@ pub fn main() !void {
     var db = wave.host_windows.Database.init(allocator);
     defer db.deinit();
 
-    try wave.host_windows.completeScan(&db, sync_dir, allocator);
-    var stdout = Io.File.stdout().writer(io, &.{});
-    try db.debug.print(&stdout.interface);
-
     var watch_task = try io.concurrent(wave.host_windows.watch, .{ sync_dir, io });
     defer watch_task.cancel(io) catch {};
 
@@ -38,7 +34,8 @@ pub fn main() !void {
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
     const reader = &stdin.interface;
 
-    std.debug.print("Press q to quit\n", .{});
+    var stdout = Io.File.stdout().writer(io, &.{});
+    std.debug.print("s - scan, a - print all files, n - print files needing sync, q - quit\n", .{});
     while (true) {
         var line: []const u8 = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.ReadFailed, error.EndOfStream => |e| return e,
@@ -49,10 +46,27 @@ pub fn main() !void {
         };
         reader.toss(1);
         line = std.mem.trimEnd(u8, line, "\r");
-        if (std.mem.eql(u8, line, "q")) return;
+        if (line.len != 1) continue;
+        switch (line[0]) {
+            'a' => {
+                try db.debug.printKnownFiles(&stdout.interface);
+                try stdout.interface.flush();
+            },
+            'n' => {
+                try db.debug.printFilesNeedingSync(&stdout.interface);
+                try stdout.interface.flush();
+            },
+            's' => {
+                try wave.host_windows.completeScan(&db, sync_dir, allocator);
+                try stdout.interface.writeAll("scan complete\n");
+                try stdout.interface.flush();
+            },
+            'q' => break,
+            else => continue,
+        }
     }
 
-    try wave.host.simulateFileTransfer(io, allocator, sync_dir.handle);
+    try wave.host_windows.simulateFileTransfer(&db, sync_dir, io, allocator);
 }
 
 const Args = struct {

@@ -12,8 +12,12 @@ pub const Wtf16 = struct {
         return .{ .slice = slice };
     }
 
-    pub fn format(self: Wtf16, writer: *Io.Writer) Io.Writer.Error!void {
-        try writer.print("{f}", .{std.unicode.fmtUtf16Le(self.slice)});
+    pub fn byteLen(self: Wtf16) usize {
+        return self.slice.len * @sizeOf(w.WCHAR);
+    }
+
+    pub fn formatUtf8(self: Wtf16) std.fmt.Alt(Wtf16, formatWtf16AsUtf8(Wtf16)) {
+        return .{ .data = self };
     }
 };
 
@@ -23,7 +27,20 @@ pub const Wtf16Z = struct {
     pub fn wtf16ZCast(slice: [:0]const w.WCHAR) Wtf16Z {
         return .{ .slice = slice };
     }
+
+    pub fn formatUtf8(self: Wtf16) std.fmt.Alt(Wtf16, formatWtf16AsUtf8(Wtf16)) {
+        return .{ .data = self };
+    }
 };
+
+fn formatWtf16AsUtf8(comptime T: type) fn (T, *Io.Writer) Io.Writer.Error!void {
+    const ns = struct {
+        fn format(self: T, writer: *Io.Writer) Io.Writer.Error!void {
+            try writer.print("{f}", .{std.unicode.fmtUtf16Le(self.slice)});
+        }
+    };
+    return ns.format;
+}
 
 pub const Database = struct {
     allocator: Allocator,
@@ -33,12 +50,18 @@ pub const Database = struct {
     debug: Debug,
 
     pub const Entry = struct {
-        hash: Blake3Hash,
+        hash: FileHash,
         modified_time: w.LARGE_INTEGER,
         size: w.LARGE_INTEGER,
     };
 
-    pub const Blake3Hash = [32]u8;
+    pub const FileHash = extern struct {
+        blake3: [32]u8,
+
+        pub fn format(hash: FileHash, writer: *Io.Writer) Io.Writer.Error!void {
+            try writer.print("{x}", .{std.mem.nativeToBig(u256, @bitCast(hash.blake3))});
+        }
+    };
 
     pub fn FileHashMap(comptime V: type) type {
         const Context = struct {
@@ -78,12 +101,12 @@ pub const Database = struct {
         db: *Database,
         path: Wtf16,
         information: *const NtQueryInformation,
-        hash: *const Blake3Hash,
+        hash: *const FileHash,
     ) !void {
         const gop = try db.all_known_files.getOrPut(db.allocator, path);
         errdefer db.all_known_files.removeByPtr(gop.key_ptr);
 
-        const need_sync = !gop.found_existing or !std.mem.eql(u8, &gop.value_ptr.hash, hash);
+        const need_sync = !gop.found_existing or !std.mem.eql(u8, &gop.value_ptr.hash.blake3, &hash.blake3);
 
         var file_path_arena = db.file_path_arena.promote(db.allocator);
         defer db.file_path_arena = file_path_arena.state;
@@ -103,19 +126,27 @@ pub const Database = struct {
     }
 
     pub const Debug = struct {
-        pub fn print(debug: *const Debug, writer: *Io.Writer) !void {
+        pub fn printKnownFiles(debug: *const Debug, writer: *Io.Writer) !void {
             const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
             var it = db.all_known_files.iterator();
             while (it.next()) |entry| {
                 try writer.print(
-                    "{f}: hash({x}) modified({}) size({})\n",
+                    "{f}: hash({f}) modified({}) size({})\n",
                     .{
-                        entry.key_ptr.*,
-                        std.mem.nativeToBig(u256, @as(u256, @bitCast(entry.value_ptr.hash))),
+                        entry.key_ptr.formatUtf8(),
+                        entry.value_ptr.hash,
                         entry.value_ptr.modified_time,
                         entry.value_ptr.size,
                     },
                 );
+            }
+        }
+
+        pub fn printFilesNeedingSync(debug: *const Debug, writer: *Io.Writer) !void {
+            const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
+            var it = db.files_needing_sync.iterator();
+            while (it.next()) |entry| {
+                try writer.print("{f}\n", .{entry.key_ptr.formatUtf8()});
             }
         }
     };
@@ -207,7 +238,7 @@ const FullScanContext = struct {
             const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
             const file = try openFile(dir, name);
             defer w.CloseHandle(file);
-            const hash = try computeFileHash(file, information);
+            const hash = try computeFileHash(file, information.EndOfFile);
 
             try db.createOrUpdateEntry(.wtf16Cast(ctx.sub_path.items), information, &hash);
         }
@@ -422,18 +453,18 @@ pub fn openFile(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     }
 }
 
-fn computeFileHash(file: w.HANDLE, information: *const NtQueryInformation) !Database.Blake3Hash {
+fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !Database.FileHash {
     var iosb: w.IO_STATUS_BLOCK = undefined;
     var buffer: [64 * 1024]u8 = undefined;
-    var offset: w.LARGE_INTEGER = 0;
+    var written: w.LARGE_INTEGER = 0;
     var hash: std.crypto.hash.Blake3 = .init(.{});
 
-    while (offset < information.EndOfFile) {
-        const status = w.ntdll.NtReadFile(file, null, null, null, &iosb, &buffer, buffer.len, &offset, null);
+    while (written < file_size) {
+        const status = w.ntdll.NtReadFile(file, null, null, null, &iosb, &buffer, buffer.len, &written, null);
         sw: switch (status) {
             .SUCCESS => {
                 hash.update((&buffer)[0..iosb.Information]);
-                offset += @intCast(iosb.Information);
+                written += @intCast(iosb.Information);
             },
             .PENDING => {
                 try w.WaitForSingleObject(file, w.INFINITE);
@@ -442,10 +473,10 @@ fn computeFileHash(file: w.HANDLE, information: *const NtQueryInformation) !Data
             else => return w.unexpectedStatus(status),
         }
     }
-    assert(offset == information.EndOfFile);
+    assert(written == file_size);
 
-    var result: Database.Blake3Hash = undefined;
-    hash.final(&result);
+    var result: Database.FileHash = undefined;
+    hash.final(&result.blake3);
     return result;
 }
 
@@ -520,78 +551,144 @@ fn processChanges(buffer_complete: []align(@alignOf(w.DWORD)) w.BYTE) void {
     }
 }
 
-const FileInfo = extern struct {
-    path_len_bytes: u64,
-    size: u64,
+/// The endian-ness of messages, excluding file paths.
+const message_endian: std.builtin.Endian = .little;
+
+const cpu_endian = @import("builtin").cpu.arch.endian();
+
+const Message = enum(u8) {
+    transfer_file,
 };
-const endian: std.builtin.Endian = .little;
 
-fn sendFile(
+const PathEncoding = enum(u8) {
+    wtf16le,
+};
+
+fn sendTransferFileMessage(
     writer: *Io.Writer,
-    sync_dir: w.HANDLE,
-    file_name_wtf16: [:0]const u16,
-    file_name_wtf8: []const u8,
-) !FileInfo {
-    var temp_io = Io.Threaded.init_single_threaded;
-    const io = temp_io.io();
+    file: w.HANDLE,
+    file_path: Wtf16,
+    information: *const w.FILE.STANDARD_INFORMATION,
+    hash: *const Database.FileHash,
+) !void {
+    try writer.writeByte(@intFromEnum(Message.transfer_file));
 
-    var file = try temp_io.dirOpenFileWtf16(sync_dir, file_name_wtf16, .{});
-    defer file.close(io);
-    const stat = try file.stat(io);
+    const path_encoding: PathEncoding = switch (cpu_endian) {
+        .big => @compileError("Big endian not supported"),
+        .little => .wtf16le,
+    };
+    try writer.writeByte(@intFromEnum(path_encoding));
+    try writer.writeInt(u64, file_path.byteLen(), message_endian);
+    try writer.writeInt(u64, @intCast(information.EndOfFile), message_endian);
+    try writer.writeAll(&hash.blake3);
+    try writer.writeSliceEndian(w.WCHAR, file_path.slice, cpu_endian);
 
-    const info = FileInfo{ .size = stat.size, .path_len_bytes = file_name_wtf8.len };
-    std.debug.print("send: {}\n", .{info});
-    try writer.writeStruct(info, endian);
-    try writer.writeAll(file_name_wtf8);
-
-    var reader_buffer: [1 << 20]u8 = undefined;
-    var reader = file.readerStreaming(io, &reader_buffer);
-    try reader.interface.streamExact(writer, stat.size);
+    var iosb: w.IO_STATUS_BLOCK = undefined;
+    var written: w.LARGE_INTEGER = 0;
+    while (written < information.EndOfFile) {
+        const buffer = blk: {
+            const slice = try writer.writableSliceGreedy(1);
+            break :blk slice[0..@min(slice.len, std.math.maxInt(u32))];
+        };
+        const status = w.ntdll.NtReadFile(
+            file,
+            null,
+            null,
+            null,
+            &iosb,
+            buffer.ptr,
+            @intCast(buffer.len),
+            &written,
+            null,
+        );
+        sw: switch (status) {
+            .SUCCESS => {
+                writer.advance(iosb.Information);
+                written += @intCast(iosb.Information);
+            },
+            .PENDING => {
+                try w.WaitForSingleObject(file, w.INFINITE);
+                continue :sw iosb.u.Status;
+            },
+            else => return w.unexpectedStatus(status),
+        }
+    }
+    assert(written == information.EndOfFile);
 
     try writer.flush();
-    return info;
 }
 
-fn receiveFile(reader: *Io.Reader, allocator: Allocator, expected: FileInfo) !void {
-    const info = try reader.takeStruct(FileInfo, endian);
-    std.debug.assert(std.meta.eql(info, expected));
+/// Asserts a reader buffer size of at least 8.
+fn receiveTransferFileMessage(reader: *Io.Reader, allocator: Allocator) !void {
+    const alignment: std.mem.Alignment = comptime .max(.of(w.WCHAR), .of(u64));
+    var dest: Io.Writer.Allocating = .initAligned(allocator, alignment);
+    defer dest.deinit();
 
-    const file_name = blk: {
-        const buffer = try allocator.alloc(u8, info.path_len_bytes);
-        errdefer allocator.free(buffer);
-        try reader.readSliceAll(buffer);
-        break :blk buffer;
+    const path_encoding: PathEncoding = @enumFromInt(try reader.takeByte());
+    const path_len_bytes = try reader.takeInt(u64, message_endian);
+    const file_size = try reader.takeInt(u64, message_endian);
+
+    try reader.streamExact(&dest.writer, @sizeOf(Database.FileHash));
+    const hash: Database.FileHash = .{ .blake3 = dest.written()[0..@sizeOf(Database.FileHash)].* };
+    dest.clearRetainingCapacity();
+
+    try reader.streamExact(&dest.writer, path_len_bytes);
+    const path_bytes: []align(alignment.toByteUnits()) const u8 = @alignCast(try dest.toOwnedSlice());
+    defer allocator.free(path_bytes);
+    const path: Wtf16 = switch (path_encoding) {
+        .wtf16le => switch (cpu_endian) {
+            .big => @compileError("Big endian not supported"),
+            .little => .wtf16Cast(@ptrCast(@alignCast(path_bytes))),
+        },
     };
-    defer allocator.free(file_name);
 
-    const content = blk: {
-        const buffer = try allocator.alloc(u8, info.size);
-        errdefer allocator.free(buffer);
-        try reader.readSliceAll(buffer);
-        break :blk buffer;
-    };
-    defer allocator.free(content);
+    try reader.streamExact(&dest.writer, file_size);
+    const file_contents: []align(alignment.toByteUnits()) const u8 = @alignCast(try dest.toOwnedSlice());
+    defer allocator.free(file_contents);
 
-    std.debug.print("{s}\n{s}\n", .{ file_name, content });
+    std.debug.print("{f}: hash({f}) size({})\n{s}\n", .{
+        path.formatUtf8(),
+        hash,
+        file_size,
+        file_contents,
+    });
 }
 
-pub fn simulateFileTransfer(io: Io, allocator: Allocator, sync_dir: w.HANDLE) !void {
-    var listing = try completeScan(.{ .handle = sync_dir }, io, allocator);
-    defer listing.deinit(allocator);
-    if (listing.map.entries.len == 0) return error.NoFiles;
-
-    const random_file_path_wtf8 = blk: {
-        var rng = std.Random.DefaultPrng.init(42);
-        const int = rng.random().uintAtMost(usize, listing.map.entries.len - 1);
-        break :blk listing.map.keys()[int];
+pub fn simulateFileTransfer(db: *const Database, sync_dir: w.HANDLE, io: Io, allocator: Allocator) !void {
+    const random_file = blk: {
+        const max = std.math.sub(usize, db.all_known_files.size, 1) catch return;
+        const now = try Io.Clock.real.now(io);
+        var rng = std.Random.DefaultPrng.init(@bitCast(now.toMilliseconds()));
+        const int = rng.random().uintAtMost(usize, max);
+        var it = db.all_known_files.keyIterator();
+        for (0..int) |_| _ = it.next().?;
+        break :blk it.next().?.*;
     };
-    const random_file_path_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, random_file_path_wtf8);
-    defer allocator.free(random_file_path_wtf16);
+
+    const file = try openFile(sync_dir, random_file);
+    defer w.CloseHandle(file);
+
+    var iosb: w.IO_STATUS_BLOCK = undefined;
+    var information: w.FILE.STANDARD_INFORMATION = undefined;
+    const status = w.ntdll.NtQueryInformationFile(file, &iosb, &information, @sizeOf(@TypeOf(information)), .Standard);
+    sw: switch (status) {
+        .SUCCESS => {},
+        .PENDING => {
+            try w.WaitForSingleObject(file, w.INFINITE);
+            continue :sw iosb.u.Status;
+        },
+        else => return w.unexpectedStatus(status),
+    }
+
+    const hash = try computeFileHash(file, information.EndOfFile);
 
     var writer = Io.Writer.Allocating.init(allocator);
     defer writer.deinit();
-    const info = try sendFile(&writer.writer, sync_dir, random_file_path_wtf16, random_file_path_wtf8);
+    try sendTransferFileMessage(&writer.writer, file, random_file, &information, &hash);
 
     var reader = Io.Reader.fixed(writer.written());
-    try receiveFile(&reader, allocator, info);
+    const message: Message = @enumFromInt(try reader.takeByte());
+    switch (message) {
+        .transfer_file => try receiveTransferFileMessage(&reader, allocator),
+    }
 }
