@@ -108,8 +108,13 @@ pub const Database = struct {
             var it = db.all_known_files.iterator();
             while (it.next()) |entry| {
                 try writer.print(
-                    "{f}: modified({}) size({})\n",
-                    .{ entry.key_ptr.*, entry.value_ptr.modified_time, entry.value_ptr.size },
+                    "{f}: hash({x}) modified({}) size({})\n",
+                    .{
+                        entry.key_ptr.*,
+                        std.mem.nativeToBig(u256, @as(u256, @bitCast(entry.value_ptr.hash))),
+                        entry.value_ptr.modified_time,
+                        entry.value_ptr.size,
+                    },
                 );
             }
         }
@@ -199,7 +204,10 @@ const FullScanContext = struct {
             defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
             try ctx.sub_path.appendSlice(allocator, name.slice);
 
-            const hash: Database.Blake3Hash = @splat(0x42); // TODO
+            const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
+            const file = try openFile(dir, name);
+            defer w.CloseHandle(file);
+            const hash = try computeFileHash(file, information);
 
             try db.createOrUpdateEntry(.wtf16Cast(ctx.sub_path.items), information, &hash);
         }
@@ -298,9 +306,7 @@ fn scanOneDirectory(db: *Database, allocator: Allocator, ctx: *FullScanContext) 
             if (std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".")) or
                 std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".."))) continue;
 
-            ctx.addObject(db, allocator, file_name, info) catch |err| switch (err) {
-                error.OutOfMemory => |e| return e,
-            };
+            try ctx.addObject(db, allocator, file_name, info);
         }
     }
 }
@@ -368,6 +374,79 @@ pub fn openSyncDir(path_wtf16: Wtf16Z) !w.HANDLE {
     if (!std.fs.path.isAbsoluteWindowsWtf16(path_wtf16.slice)) return error.NonAbsoluteSyncDirPath;
     const normalized = try w.wToPrefixedFileW(null, path_wtf16.slice);
     return openDir(null, .wtf16Cast(normalized.span()));
+}
+
+pub fn openFile(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
+    var handle: w.HANDLE = undefined;
+    const path_len_bytes: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
+    var unicode_string: w.UNICODE_STRING = .{
+        .Length = path_len_bytes,
+        .MaximumLength = path_len_bytes,
+        .Buffer = @constCast(path.slice.ptr),
+    };
+    const object_attributes: w.OBJECT_ATTRIBUTES = .{
+        .Length = @sizeOf(w.OBJECT_ATTRIBUTES),
+        .RootDirectory = parent,
+        .ObjectName = &unicode_string,
+        .Attributes = .{
+            .CASE_INSENSITIVE = true,
+        },
+        .SecurityDescriptor = null,
+        .SecurityQualityOfService = null,
+    };
+    var iosb: w.IO_STATUS_BLOCK = undefined;
+    const status = w.ntdll.NtCreateFile(
+        &handle,
+        .{
+            .GENERIC = .{ .READ = true },
+        },
+        &object_attributes,
+        &iosb,
+        null,
+        .{ .NORMAL = true },
+        .{
+            .READ = true,
+            .WRITE = true,
+            .DELETE = true,
+        },
+        .OPEN,
+        .{},
+        null,
+        0,
+    );
+    // TODO: Do I need to wait?
+
+    switch (status) {
+        .SUCCESS => return handle,
+        else => return w.unexpectedStatus(status),
+    }
+}
+
+fn computeFileHash(file: w.HANDLE, information: *const NtQueryInformation) !Database.Blake3Hash {
+    var iosb: w.IO_STATUS_BLOCK = undefined;
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: w.LARGE_INTEGER = 0;
+    var hash: std.crypto.hash.Blake3 = .init(.{});
+
+    while (offset < information.EndOfFile) {
+        const status = w.ntdll.NtReadFile(file, null, null, null, &iosb, &buffer, buffer.len, &offset, null);
+        sw: switch (status) {
+            .SUCCESS => {
+                hash.update((&buffer)[0..iosb.Information]);
+                offset += @intCast(iosb.Information);
+            },
+            .PENDING => {
+                try w.WaitForSingleObject(file, w.INFINITE);
+                continue :sw iosb.u.Status;
+            },
+            else => return w.unexpectedStatus(status),
+        }
+    }
+    assert(offset == information.EndOfFile);
+
+    var result: Database.Blake3Hash = undefined;
+    hash.final(&result);
+    return result;
 }
 
 pub fn watch(sync_dir: w.HANDLE, io: Io) !void {
