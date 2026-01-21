@@ -5,30 +5,33 @@ const Io = std.Io;
 
 const wave = @import("wave");
 
-pub fn main() !void {
-    var dbg_alloc = std.heap.DebugAllocator(.{}).init;
-    defer assert(dbg_alloc.deinit() == .ok);
-    const allocator = dbg_alloc.allocator();
-
-    var threaded = Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var args = try Args.init(allocator);
-    defer args.deinit(allocator);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const args = try Args.init(init.minimal.args, init.arena);
 
     const sync_dir_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
     defer allocator.free(sync_dir_wtf16);
 
     const w = std.os.windows;
-    const sync_dir = try wave.host_windows.openSyncDir(.wtf16ZCast(sync_dir_wtf16));
+    const sync_dir = try wave.windows.openSyncDir(.wtf16ZCast(sync_dir_wtf16));
     defer w.CloseHandle(sync_dir);
 
-    var db = wave.host_windows.Database.init(allocator);
+    var db = wave.windows.Database.init(allocator);
     defer db.deinit();
 
-    var watch_task = try io.concurrent(wave.host_windows.watch, .{ sync_dir, io });
+    var watch_task = try io.concurrent(wave.windows.watch, .{ sync_dir, io });
     defer watch_task.cancel(io) catch {};
+
+    var addr_queue_buffer: [1]Io.net.IpAddress = undefined;
+    var addr_queue = Io.Queue(Io.net.IpAddress).init(&addr_queue_buffer);
+    defer addr_queue.close(io);
+
+    var server_task = try io.concurrent(startServer, .{ io, &addr_queue });
+    defer server_task.cancel(io) catch {};
+
+    var client_task = try io.concurrent(startClient, .{ io, &addr_queue });
+    defer client_task.cancel(io) catch {};
 
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
@@ -57,7 +60,7 @@ pub fn main() !void {
                 try stdout.interface.flush();
             },
             's' => {
-                try wave.host_windows.completeScan(&db, sync_dir, allocator);
+                try wave.windows.completeScan(&db, sync_dir, allocator);
                 try stdout.interface.writeAll("scan complete\n");
                 try stdout.interface.flush();
             },
@@ -66,27 +69,67 @@ pub fn main() !void {
         }
     }
 
-    try wave.host_windows.simulateFileTransfer(&db, sync_dir, io, allocator);
+    try wave.windows.simulateFileTransfer(&db, sync_dir, io, allocator);
 }
 
 const Args = struct {
-    all_args: [][:0]u8,
+    slice: []const [:0]const u8,
 
-    fn init(allocator: Allocator) !Args {
-        var args = try std.process.argsAlloc(allocator);
-        errdefer std.process.argsFree(allocator, args);
+    fn init(args: std.process.Args, arena: *std.heap.ArenaAllocator) !Args {
+        const slice = try args.toSlice(arena.allocator());
 
-        switch (args.len) {
-            2 => return .{ .all_args = args },
+        switch (slice.len) {
+            2 => return .{ .slice = slice },
             else => return error.InvalidArguments,
         }
     }
 
-    fn deinit(args: Args, allocator: Allocator) void {
-        std.process.argsFree(allocator, args.all_args);
-    }
-
     fn syncDir(args: Args) []const u8 {
-        return args.all_args[1];
+        return args.slice[1];
     }
 };
+
+fn startServer(io: Io, addr_queue: *Io.Queue(Io.net.IpAddress)) !void {
+    const addr = Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+    try addr_queue.putAll(io, &.{server.socket.address});
+    const stream = try server.accept(io);
+    defer stream.close(io);
+
+    var read_buffer: [64]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var write_buffer: [64]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+
+    var futures = try wave.Server.start(io, &reader.interface, &writer.interface);
+    defer {
+        futures.send.cancel(io) catch {};
+        futures.receive.cancel(io) catch {};
+    }
+    _ = try io.select(.{
+        .send = &futures.send,
+        .receive = &futures.receive,
+    });
+}
+
+fn startClient(io: Io, addr_queue: *Io.Queue(Io.net.IpAddress)) !void {
+    const addr = try addr_queue.getOne(io);
+    const stream = try addr.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var read_buffer: [64]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var write_buffer: [64]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+
+    var futures = try wave.Client.start(io, &reader.interface, &writer.interface);
+    defer {
+        futures.send.cancel(io) catch {};
+        futures.receive.cancel(io) catch {};
+    }
+    _ = try io.select(.{
+        .send = &futures.send,
+        .receive = &futures.receive,
+    });
+}

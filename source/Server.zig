@@ -1,54 +1,42 @@
 const Server = @This();
 
+const wave = @import("wave.zig");
+const network = wave.network;
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-pub const Config = struct {
-    sync_dir_absolute: []const u8,
-    port: u16,
-};
+pub fn start(io: Io, in: *Io.Reader, out: *Io.Writer) !struct {
+    send: Io.Future(@typeInfo(@TypeOf(send)).@"fn".return_type.?),
+    receive: Io.Future(@typeInfo(@TypeOf(receive)).@"fn".return_type.?),
+} {
+    var send_task = try io.concurrent(send, .{out});
+    errdefer send_task.cancel(io) catch {};
+    const receive_task = try io.concurrent(receive, .{in});
+    errdefer comptime unreachable;
 
-sync_dir: Io.Dir,
-tcp: Io.net.Server,
+    return .{
+        .send = send_task,
+        .receive = receive_task,
+    };
+}
 
-pub fn init(config: Config, io: Io, allocator: Allocator) !Server {
-    const sync_dir = try Io.Dir.cwd().openDir(io, config.sync_dir_absolute, .{ .iterate = true });
-    errdefer sync_dir.close(io);
+fn send(writer: *Io.Writer) !void {
+    try network.sendTransactionId(writer, .disconnect);
+    try writer.flush();
+}
 
-    var walker = try sync_dir.walk(allocator);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        std.debug.print("{s}\n", .{entry.path});
+// const ReceiveContext = struct {
+//     txs: std.AutoHashMapUnmanaged(transaction.Id, Transaction),
+// };
+
+fn receive(reader: *Io.Reader) !void {
+    // var ctx = ReceiveContext{};
+    // defer ctx.deinit();
+
+    while (true) {
+        const id = try network.receiveTransactionId(reader) orelse break;
+        _ = id;
     }
-
-    const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", config.port);
-    var tcp_server = try addr.listen(io, .{ .protocol = .tcp, .mode = .stream });
-    errdefer tcp_server.deinit(io);
-
-    std.debug.print("TCP Server created at {f}\n", .{tcp_server.socket.address});
-
-    return .{ .sync_dir = sync_dir, .tcp = tcp_server };
-}
-
-pub fn deinit(server: *Server, io: Io) void {
-    server.sync_dir.close(io);
-    server.tcp.deinit(io);
-}
-
-pub fn start(server: *Server, io: Io) !void {
-    var stream = try server.tcp.accept(io);
-    defer stream.close(io);
-
-    var out_buffer: [1024]u8 = undefined;
-    var writer = stream.writer(io, &out_buffer);
-
-    var in_buffer: [1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buffer);
-
-    try writer.interface.writeAll("Hello from server!\n");
-    try writer.interface.flush();
-
-    const line = try reader.interface.takeDelimiter('\n');
-    std.debug.print("Server received: {?s}\n", .{line});
 }

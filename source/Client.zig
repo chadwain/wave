@@ -1,23 +1,35 @@
 const Client = @This();
 
+const wave = @import("wave.zig");
+const network = wave.network;
+
 const std = @import("std");
 const Io = std.Io;
 
-pub fn start(io: Io, port: u16) !void {
-    const addr = try Io.net.IpAddress.parse("127.0.0.1", port);
-    std.debug.print("Client connecting to {f}\n", .{addr});
-    var stream = try addr.connect(io, .{ .protocol = .tcp, .mode = .stream });
-    defer stream.close(io);
+pub fn start(io: Io, in: *Io.Reader, out: *Io.Writer) !struct {
+    send: Io.Future(@typeInfo(@TypeOf(send)).@"fn".return_type.?),
+    receive: Io.Future(@typeInfo(@TypeOf(receive)).@"fn".return_type.?),
+} {
+    var send_task = try io.concurrent(send, .{out});
+    errdefer send_task.cancel(io) catch {};
+    const receive_task = try io.concurrent(receive, .{in});
+    errdefer comptime unreachable;
 
-    var out_buffer: [1024]u8 = undefined;
-    var writer = stream.writer(io, &out_buffer);
+    return .{
+        .send = send_task,
+        .receive = receive_task,
+    };
+}
 
-    var in_buffer: [1024]u8 = undefined;
-    var reader = stream.reader(io, &in_buffer);
+fn send(writer: *Io.Writer) !void {
+    try network.sendTransactionId(writer, @enumFromInt(47));
+    try network.sendTransactionId(writer, .disconnect);
+    try writer.flush();
+}
 
-    try writer.interface.writeAll("Hello from client!\n");
-    try writer.interface.flush();
-
-    const line = try reader.interface.takeDelimiter('\n');
-    std.debug.print("Client received: {?s}\n", .{line});
+fn receive(reader: *Io.Reader) !void {
+    while (true) {
+        const id = try network.receiveTransactionId(reader) orelse break;
+        _ = id;
+    }
 }
