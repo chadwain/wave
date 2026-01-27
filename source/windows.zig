@@ -1,10 +1,15 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const panic = std.debug.panic;
 const w = std.os.windows;
 const wtf16 = std.unicode.wtf8ToWtf16LeStringLiteral;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+const wave = @import("wave.zig");
+const network = wave.network;
+
+/// A WTF-16 encoded string, with the endianness of the host system.
 pub const Wtf16 = struct {
     slice: []const w.WCHAR,
 
@@ -16,11 +21,12 @@ pub const Wtf16 = struct {
         return self.slice.len * @sizeOf(w.WCHAR);
     }
 
-    pub fn formatUtf8(self: Wtf16) std.fmt.Alt(Wtf16, formatWtf16AsUtf8(Wtf16)) {
-        return .{ .data = self };
+    pub fn formatUtf8(self: Wtf16) std.fmt.Alt([]const w.WCHAR, formatWtf16AsUtf8) {
+        return .{ .data = self.slice };
     }
 };
 
+/// A WTF-16 encoded zero-terminated string, with the endianness of the host system.
 pub const Wtf16Z = struct {
     slice: [:0]const w.WCHAR,
 
@@ -28,21 +34,20 @@ pub const Wtf16Z = struct {
         return .{ .slice = slice };
     }
 
-    pub fn formatUtf8(self: Wtf16) std.fmt.Alt(Wtf16, formatWtf16AsUtf8(Wtf16)) {
-        return .{ .data = self };
+    pub fn formatUtf8(self: Wtf16Z) std.fmt.Alt([]const w.WCHAR, formatWtf16AsUtf8) {
+        return .{ .data = self.slice };
     }
 };
 
-fn formatWtf16AsUtf8(comptime T: type) fn (T, *Io.Writer) Io.Writer.Error!void {
-    const ns = struct {
-        fn format(self: T, writer: *Io.Writer) Io.Writer.Error!void {
-            try writer.print("{f}", .{std.unicode.fmtUtf16Le(self.slice)});
-        }
-    };
-    return ns.format;
+fn formatWtf16AsUtf8(slice: []const w.WCHAR, writer: *Io.Writer) Io.Writer.Error!void {
+    switch (comptime @import("builtin").cpu.arch.endian()) {
+        .little => try writer.print("{f}", .{std.unicode.fmtUtf16Le(slice)}),
+        .big => @compileError("TODO big endian"),
+    }
 }
 
 pub const Database = struct {
+    sync_dir: w.HANDLE,
     allocator: Allocator,
     file_path_arena: std.heap.ArenaAllocator.State = .{},
     all_known_files: FileHashMap(Entry) = .empty,
@@ -50,17 +55,9 @@ pub const Database = struct {
     debug: Debug,
 
     pub const Entry = struct {
-        hash: FileHash,
+        hash: network.FileHash,
         modified_time: w.LARGE_INTEGER,
-        size: w.LARGE_INTEGER,
-    };
-
-    pub const FileHash = extern struct {
-        blake3: [32]u8,
-
-        pub fn format(hash: FileHash, writer: *Io.Writer) Io.Writer.Error!void {
-            try writer.print("{x}", .{std.mem.nativeToBig(u256, @bitCast(hash.blake3))});
-        }
+        size: w.LARGE_INTEGER, // TODO: Store as an unsigned integer
     };
 
     pub fn FileHashMap(comptime V: type) type {
@@ -72,6 +69,7 @@ pub const Database = struct {
                 for (self.slice) |c| std.hash.autoHash(&hasher, c);
                 return @truncate(hasher.final());
             }
+
             pub fn eql(_: @This(), a: Wtf16, b: Wtf16) bool {
                 return std.mem.eql(w.WCHAR, a.slice, b.slice);
             }
@@ -79,8 +77,11 @@ pub const Database = struct {
         return std.HashMapUnmanaged(Wtf16, V, Context, std.hash_map.default_max_load_percentage);
     }
 
-    pub fn init(allocator: Allocator) Database {
+    pub fn init(sync_dir_path: Wtf16Z, allocator: Allocator) !Database {
+        const sync_dir = try openSyncDir(sync_dir_path);
+        errdefer comptime unreachable;
         return .{
+            .sync_dir = sync_dir,
             .allocator = allocator,
             .file_path_arena = .{},
             .all_known_files = .empty,
@@ -90,6 +91,7 @@ pub const Database = struct {
     }
 
     pub fn deinit(db: *Database) void {
+        w.CloseHandle(db.sync_dir);
         db.all_known_files.deinit(db.allocator);
         db.files_needing_sync.deinit(db.allocator);
         var file_path_arena = db.file_path_arena.promote(db.allocator);
@@ -101,7 +103,7 @@ pub const Database = struct {
         db: *Database,
         path: Wtf16,
         information: *const NtQueryInformation,
-        hash: *const FileHash,
+        hash: *const network.FileHash,
     ) !void {
         const gop = try db.all_known_files.getOrPut(db.allocator, path);
         errdefer db.all_known_files.removeByPtr(gop.key_ptr);
@@ -149,6 +151,25 @@ pub const Database = struct {
                 try writer.print("{f}\n", .{entry.key_ptr.formatUtf8()});
             }
         }
+
+        pub fn clientTransferFile(debug: *const Debug, io: Io, client: *Client, index: usize) !void {
+            const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
+            const entry = blk: {
+                var it = db.all_known_files.iterator();
+                for (0..index) |_| _ = it.next().?;
+                break :blk it.next().?;
+            };
+            const transaction: Client.Transaction = .{
+                .transfer_file = .{
+                    .peer_id = .new,
+                    .state = .send_metadata,
+                    .path = entry.key_ptr.*,
+                    .size = entry.value_ptr.size,
+                    .hash = entry.value_ptr.hash,
+                },
+            };
+            try client.insertTransaction(io, transaction, .send);
+        }
     };
 };
 
@@ -159,9 +180,9 @@ const FullScanContext = struct {
     component_delimeters: std.ArrayList(u16),
     open_dir_handles: std.ArrayList(w.HANDLE),
 
-    fn init(sync_dir: w.HANDLE, allocator: Allocator) !FullScanContext {
+    fn init(db: *const Database, allocator: Allocator) !FullScanContext {
         var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
-        try open_dir_handles.append(allocator, sync_dir);
+        try open_dir_handles.append(allocator, db.sync_dir);
         return .{
             .pending_dirs = .empty,
             .pending_dir_names = .{},
@@ -270,8 +291,8 @@ const NtQueryInformation = extern struct {
     const CCHAR = w.CHAR;
 };
 
-pub fn completeScan(db: *Database, sync_dir: w.HANDLE, allocator: Allocator) !void {
-    var ctx = try FullScanContext.init(sync_dir, allocator);
+pub fn completeScan(db: *Database, allocator: Allocator) !void {
+    var ctx = try FullScanContext.init(db, allocator);
     defer ctx.deinit(allocator);
 
     try scanOneDirectory(db, allocator, &ctx);
@@ -453,7 +474,7 @@ pub fn openFile(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     }
 }
 
-fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !Database.FileHash {
+fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash {
     var iosb: w.IO_STATUS_BLOCK = undefined;
     var buffer: [64 * 1024]u8 = undefined;
     var written: w.LARGE_INTEGER = 0;
@@ -475,7 +496,7 @@ fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !Database.FileHas
     }
     assert(written == file_size);
 
-    var result: Database.FileHash = undefined;
+    var result: network.FileHash = undefined;
     hash.final(&result.blake3);
     return result;
 }
@@ -551,144 +572,424 @@ fn processChanges(buffer_complete: []align(@alignOf(w.DWORD)) w.BYTE) void {
     }
 }
 
-/// The endian-ness of messages, excluding file paths.
-const message_endian: std.builtin.Endian = .little;
+pub const Client = struct {
+    send_task: Io.Future(@typeInfo(@TypeOf(send)).@"fn".return_type.?),
+    receive_task: Io.Future(@typeInfo(@TypeOf(receive)).@"fn".return_type.?),
+    transactions: std.AutoArrayHashMapUnmanaged(network.TransactionId, Transaction),
+    next_tx_id: ?std.meta.Tag(network.TransactionId),
+    transaction_owner: std.ArrayList(TransactionOwner),
+    send_count: std.atomic.Value(usize),
+    receive_count: std.atomic.Value(usize),
+    transactions_mutex: Io.Mutex,
+    allocator: Allocator,
+    db: *const Database,
 
-const cpu_endian = @import("builtin").cpu.arch.endian();
+    pub const TransactionOwner = enum { send, receive };
 
-const Message = enum(u8) {
-    transfer_file,
-};
+    pub const Transaction = union(enum) {
+        transfer_file: TransferFile,
+        receive_file: ReceiveFile,
 
-const PathEncoding = enum(u8) {
-    wtf16le,
-};
+        const TransferFile = struct {
+            peer_id: network.TransactionId,
+            state: State,
+            path: Wtf16,
+            size: w.LARGE_INTEGER,
+            hash: network.FileHash,
 
-fn sendTransferFileMessage(
-    writer: *Io.Writer,
-    file: w.HANDLE,
-    file_path: Wtf16,
-    information: *const w.FILE.STANDARD_INFORMATION,
-    hash: *const Database.FileHash,
-) !void {
-    try writer.writeByte(@intFromEnum(Message.transfer_file));
-
-    const path_encoding: PathEncoding = switch (cpu_endian) {
-        .big => @compileError("Big endian not supported"),
-        .little => .wtf16le,
-    };
-    try writer.writeByte(@intFromEnum(path_encoding));
-    try writer.writeInt(u64, file_path.byteLen(), message_endian);
-    try writer.writeInt(u64, @intCast(information.EndOfFile), message_endian);
-    try writer.writeAll(&hash.blake3);
-    try writer.writeSliceEndian(w.WCHAR, file_path.slice, cpu_endian);
-
-    var iosb: w.IO_STATUS_BLOCK = undefined;
-    var written: w.LARGE_INTEGER = 0;
-    while (written < information.EndOfFile) {
-        const buffer = blk: {
-            const slice = try writer.writableSliceGreedy(1);
-            break :blk slice[0..@min(slice.len, std.math.maxInt(u32))];
+            const State = enum { send_metadata, receive_decision, send_file_contents, receive_confirmation };
         };
-        const status = w.ntdll.NtReadFile(
-            file,
-            null,
-            null,
-            null,
-            &iosb,
-            buffer.ptr,
-            @intCast(buffer.len),
-            &written,
-            null,
-        );
-        sw: switch (status) {
-            .SUCCESS => {
-                writer.advance(iosb.Information);
-                written += @intCast(iosb.Information);
-            },
-            .PENDING => {
-                try w.WaitForSingleObject(file, w.INFINITE);
-                continue :sw iosb.u.Status;
-            },
-            else => return w.unexpectedStatus(status),
+
+        const ReceiveFile = struct {
+            peer_id: network.TransactionId,
+            state: State,
+            path: Wtf16,
+            size: w.LARGE_INTEGER,
+            hash: network.FileHash,
+
+            const State = union(enum) {
+                send_decision: enum { yes, no },
+                receive_file_contents,
+                send_confirmation,
+            };
+        };
+    };
+
+    pub fn init(db: *const Database, allocator: Allocator) Client {
+        return .{
+            .send_task = undefined,
+            .receive_task = undefined,
+            .transactions = .empty,
+            .next_tx_id = 0,
+            .transaction_owner = .empty,
+            .send_count = .init(0),
+            .receive_count = .init(0),
+            .transactions_mutex = .init,
+            .allocator = allocator,
+            .db = db,
+        };
+    }
+
+    pub fn deinit(client: *Client) void {
+        client.transactions.deinit(client.allocator);
+        client.transaction_owner.deinit(client.allocator);
+        client.* = undefined;
+    }
+
+    pub fn insertTransaction(client: *Client, io: Io, transaction: Transaction, owner: TransactionOwner) !void {
+        try client.transactions_mutex.lock(io);
+        defer client.transactions_mutex.unlock(io);
+
+        const next_tx_id = client.next_tx_id orelse return error.OutOfTransactionIds;
+        client.next_tx_id = std.math.add(std.meta.Tag(network.TransactionId), next_tx_id, 1) catch null;
+        errdefer client.next_tx_id = next_tx_id;
+
+        const gop = try client.transactions.getOrPut(client.allocator, @enumFromInt(next_tx_id));
+        assert(!gop.found_existing);
+        errdefer client.transactions.orderedRemoveAt(gop.index);
+        gop.value_ptr.* = transaction;
+
+        try client.transaction_owner.insert(client.allocator, gop.index, owner);
+        errdefer comptime unreachable;
+
+        switch (owner) {
+            .send => _ = client.send_count.fetchAdd(1, .seq_cst),
+            .receive => _ = client.receive_count.fetchAdd(1, .seq_cst),
         }
     }
-    assert(written == information.EndOfFile);
 
-    try writer.flush();
-}
+    pub fn start(client: *Client, io: Io, in: *Io.Reader, out: *Io.Writer) !void {
+        var send_task = try io.concurrent(send, .{ client, io, out });
+        errdefer send_task.cancel(io) catch {};
+        const receive_task = try io.concurrent(receive, .{ client, io, in });
+        errdefer comptime unreachable;
 
-/// Asserts a reader buffer size of at least 8.
-fn receiveTransferFileMessage(reader: *Io.Reader, allocator: Allocator) !void {
-    const alignment: std.mem.Alignment = comptime .max(.of(w.WCHAR), .of(u64));
-    var dest: Io.Writer.Allocating = .initAligned(allocator, alignment);
-    defer dest.deinit();
-
-    const path_encoding: PathEncoding = @enumFromInt(try reader.takeByte());
-    const path_len_bytes = try reader.takeInt(u64, message_endian);
-    const file_size = try reader.takeInt(u64, message_endian);
-
-    try reader.streamExact(&dest.writer, @sizeOf(Database.FileHash));
-    const hash: Database.FileHash = .{ .blake3 = dest.written()[0..@sizeOf(Database.FileHash)].* };
-    dest.clearRetainingCapacity();
-
-    try reader.streamExact(&dest.writer, path_len_bytes);
-    const path_bytes: []align(alignment.toByteUnits()) const u8 = @alignCast(try dest.toOwnedSlice());
-    defer allocator.free(path_bytes);
-    const path: Wtf16 = switch (path_encoding) {
-        .wtf16le => switch (cpu_endian) {
-            .big => @compileError("Big endian not supported"),
-            .little => .wtf16Cast(@ptrCast(@alignCast(path_bytes))),
-        },
-    };
-
-    try reader.streamExact(&dest.writer, file_size);
-    const file_contents: []align(alignment.toByteUnits()) const u8 = @alignCast(try dest.toOwnedSlice());
-    defer allocator.free(file_contents);
-
-    std.debug.print("{f}: hash({f}) size({})\n{s}\n", .{
-        path.formatUtf8(),
-        hash,
-        file_size,
-        file_contents,
-    });
-}
-
-pub fn simulateFileTransfer(db: *const Database, sync_dir: w.HANDLE, io: Io, allocator: Allocator) !void {
-    const random_file = blk: {
-        const max = std.math.sub(usize, db.all_known_files.size, 1) catch return;
-        const now = try Io.Clock.real.now(io);
-        var rng = std.Random.DefaultPrng.init(@bitCast(now.toMilliseconds()));
-        const int = rng.random().uintAtMost(usize, max);
-        var it = db.all_known_files.keyIterator();
-        for (0..int) |_| _ = it.next().?;
-        break :blk it.next().?.*;
-    };
-
-    const file = try openFile(sync_dir, random_file);
-    defer w.CloseHandle(file);
-
-    var iosb: w.IO_STATUS_BLOCK = undefined;
-    var information: w.FILE.STANDARD_INFORMATION = undefined;
-    const status = w.ntdll.NtQueryInformationFile(file, &iosb, &information, @sizeOf(@TypeOf(information)), .Standard);
-    sw: switch (status) {
-        .SUCCESS => {},
-        .PENDING => {
-            try w.WaitForSingleObject(file, w.INFINITE);
-            continue :sw iosb.u.Status;
-        },
-        else => return w.unexpectedStatus(status),
+        client.send_task = send_task;
+        client.receive_task = receive_task;
     }
 
-    const hash = try computeFileHash(file, information.EndOfFile);
-
-    var writer = Io.Writer.Allocating.init(allocator);
-    defer writer.deinit();
-    try sendTransferFileMessage(&writer.writer, file, random_file, &information, &hash);
-
-    var reader = Io.Reader.fixed(writer.written());
-    const message: Message = @enumFromInt(try reader.takeByte());
-    switch (message) {
-        .transfer_file => try receiveTransferFileMessage(&reader, allocator),
+    pub fn stop(client: *Client, io: Io) void {
+        client.send_task.cancel(io) catch {};
+        client.receive_task.cancel(io) catch {};
+        client.send_task = undefined;
+        client.receive_task = undefined;
     }
-}
+
+    fn getTransaction(client: *Client, io: Io, comptime owner: TransactionOwner) !usize {
+        try client.transactions_mutex.lock(io);
+        defer client.transactions_mutex.unlock(io);
+
+        for (0..client.transactions.count()) |tx_index| {
+            if (client.transaction_owner.items[tx_index] == owner) {
+                return tx_index;
+            }
+        }
+        unreachable;
+    }
+
+    fn send(client: *Client, io: Io, writer: *Io.Writer) !void {
+        while (true) {
+            try io.checkCancel();
+            // TODO: Use `Io.Condition` or `Io.futexWait` to wait for a non-zero value
+            // TODO: Learn a thing or two about atomic orderings and pick something other than seq_cst
+            if (client.send_count.load(.seq_cst) == 0) {
+                continue;
+            }
+
+            const transaction_index = try client.getTransaction(io, .send);
+            const transaction_id = client.transactions.keys()[transaction_index];
+            const transaction = client.transactions.values()[transaction_index];
+            _ = client.send_count.fetchSub(1, .seq_cst);
+
+            switch (transaction) {
+                .transfer_file => |*transfer_file| try client.sendTransferFileTransaction(
+                    transaction_id,
+                    transfer_file,
+                    io,
+                    writer,
+                ),
+                .receive_file => |*receive_file| try client.sendReceiveFileTransaction(
+                    transaction_id,
+                    receive_file,
+                    io,
+                    writer,
+                ),
+            }
+        }
+    }
+
+    fn sendTransferFileTransaction(
+        client: *Client,
+        transaction_id: network.TransactionId,
+        transfer_file: *const Transaction.TransferFile,
+        io: Io,
+        writer: *Io.Writer,
+    ) !void {
+        const next_state: Transaction.TransferFile.State = blk: switch (transfer_file.state) {
+            .send_metadata => {
+                errdefer std.debug.panic("TODO: Client send error", .{});
+                const file_size = std.math.cast(network.FileSize, transfer_file.size) orelse
+                    std.debug.panic(
+                        "TODO: File too large to transfer: '{f}' with size {}",
+                        .{ transfer_file.path.formatUtf8(), transfer_file.size },
+                    );
+                try network.sendTransactionId(writer, .new);
+                try network.sendTransactionId(writer, transaction_id);
+                try network.sendAction(writer, .transfer_file_metadata);
+                try network.sendTransferFileMetadata(
+                    writer,
+                    .wtf16le,
+                    @ptrCast(transfer_file.path.slice),
+                    file_size,
+                    &transfer_file.hash,
+                );
+                try writer.flush();
+                break :blk .receive_decision;
+            },
+            .send_file_contents => {
+                errdefer std.debug.panic("TODO: Client send error", .{});
+                // TODO: Probably a good idea to make Database act as a middleman for opening files
+                const handle = try openFile(client.db.sync_dir, transfer_file.path);
+                defer w.CloseHandle(handle);
+                try network.sendTransactionId(writer, transfer_file.peer_id);
+                try network.sendTransactionId(writer, transaction_id);
+                try network.sendAction(writer, .transfer_file_contents);
+
+                var iosb: w.IO_STATUS_BLOCK = undefined;
+                var written: w.LARGE_INTEGER = 0;
+                while (written < transfer_file.size) {
+                    const buffer = buffer: {
+                        const slice = try writer.writableSliceGreedy(1);
+                        break :buffer slice[0..@min(slice.len, std.math.maxInt(u32))];
+                    };
+                    const status = w.ntdll.NtReadFile(
+                        handle,
+                        null,
+                        null,
+                        null,
+                        &iosb,
+                        buffer.ptr,
+                        @intCast(buffer.len),
+                        &written,
+                        null,
+                    );
+                    sw: switch (status) {
+                        .SUCCESS => {
+                            writer.advance(iosb.Information);
+                            written += @intCast(iosb.Information);
+                        },
+                        .PENDING => {
+                            try w.WaitForSingleObject(handle, w.INFINITE);
+                            continue :sw iosb.u.Status;
+                        },
+                        else => return w.unexpectedStatus(status),
+                    }
+                }
+                assert(written == transfer_file.size);
+                try writer.flush();
+                break :blk .receive_confirmation;
+            },
+            .receive_decision, .receive_confirmation => unreachable,
+        };
+
+        try client.transactions_mutex.lock(io);
+        defer client.transactions_mutex.unlock(io);
+
+        const gop = client.transactions.getOrPutAssumeCapacity(transaction_id);
+        assert(gop.found_existing);
+        gop.value_ptr.transfer_file.state = next_state;
+        client.transaction_owner.items[gop.index] = .receive;
+        _ = client.receive_count.fetchAdd(1, .seq_cst);
+    }
+
+    fn sendReceiveFileTransaction(
+        client: *Client,
+        transaction_id: network.TransactionId,
+        receive_file: *const Transaction.ReceiveFile,
+        io: Io,
+        writer: *Io.Writer,
+    ) !void {
+        switch (receive_file.state) {
+            .send_decision => |send_decision| {
+                errdefer std.debug.panic("TODO: Client send error", .{});
+                try network.sendTransactionId(writer, receive_file.peer_id);
+                try network.sendTransactionId(writer, transaction_id);
+                try network.sendAction(writer, switch (send_decision) {
+                    .yes => .transfer_file_decision_yes,
+                    .no => .transfer_file_decision_no,
+                });
+                try writer.flush();
+
+                try client.transactions_mutex.lock(io);
+                defer client.transactions_mutex.unlock(io);
+
+                const tx_index = client.transactions.getIndex(transaction_id).?;
+                client.transactions.values()[tx_index].receive_file.state = .receive_file_contents;
+                client.transaction_owner.items[tx_index] = .receive;
+                _ = client.receive_count.fetchAdd(1, .seq_cst);
+            },
+            .send_confirmation => {
+                errdefer std.debug.panic("TODO: Client send error", .{});
+                try network.sendTransactionId(writer, receive_file.peer_id);
+                try network.sendTransactionId(writer, transaction_id);
+                try network.sendAction(writer, .transfer_file_confirmation);
+
+                try client.transactions_mutex.lock(io);
+                defer client.transactions_mutex.unlock(io);
+
+                const tx_index = client.transactions.getIndex(transaction_id).?;
+                client.transactions.orderedRemoveAt(tx_index);
+                assert(client.transaction_owner.orderedRemove(tx_index) == .send);
+            },
+            .receive_file_contents => unreachable,
+        }
+    }
+
+    fn receive(client: *Client, io: Io, reader: *Io.Reader) !void {
+        while (true) {
+            const tx_id = try network.receiveTransactionId(reader) orelse break;
+            const peer_tx_id = try network.receiveTransactionId(reader) orelse panic("bad tx id", .{});
+            const action = try network.receiveAction(reader);
+
+            switch (action) {
+                .transfer_file_metadata => {
+                    if (tx_id != .new) panic("invalid tx id", .{});
+                    try client.receiveTransferFileMetadataAction(io, reader, peer_tx_id);
+                    continue;
+                },
+                else => {},
+            }
+
+            const transaction = blk: {
+                try client.transactions_mutex.lock(io);
+                defer client.transactions_mutex.unlock(io);
+
+                const transaction_index = client.transactions.getIndex(tx_id) orelse panic("nonexistent transaction", .{});
+                switch (client.transaction_owner.items[transaction_index]) {
+                    .send => panic("transaction is in the send state", .{}),
+                    .receive => {},
+                }
+                break :blk client.transactions.values()[transaction_index];
+            };
+            _ = client.receive_count.fetchSub(1, .seq_cst);
+
+            switch (transaction) {
+                .transfer_file => |*transfer_file| try client.receiveTransferFileTransaction(
+                    tx_id,
+                    transfer_file,
+                    io,
+                    action,
+                    peer_tx_id,
+                ),
+                .receive_file => |*receive_file| try client.receiveReceiveFileTransaction(
+                    tx_id,
+                    receive_file,
+                    io,
+                    reader,
+                    action,
+                    peer_tx_id,
+                ),
+            }
+        }
+    }
+
+    fn receiveTransferFileMetadataAction(
+        client: *Client,
+        io: Io,
+        reader: *Io.Reader,
+        peer_tx_id: network.TransactionId,
+    ) !void {
+        var file_path_buffer: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&file_path_buffer);
+        const metadata = try network.receiveTransferFileMetadata(reader, fba.allocator());
+        const transaction: Transaction = .{
+            .receive_file = .{
+                .peer_id = peer_tx_id,
+                .state = .{ .send_decision = .yes },
+                .path = .wtf16Cast(&.{}),
+                .size = @as(w.LARGE_INTEGER, @intCast(metadata.file_size)),
+                .hash = metadata.hash,
+            },
+        };
+        try client.insertTransaction(io, transaction, .send);
+    }
+
+    fn receiveTransferFileTransaction(
+        client: *Client,
+        tx_id: network.TransactionId,
+        transfer_file: *const Transaction.TransferFile,
+        io: Io,
+        action: network.Action,
+        peer_tx_id: network.TransactionId,
+    ) !void {
+        if (peer_tx_id != transfer_file.peer_id) panic("mismatched peer id", .{});
+
+        switch (transfer_file.state) {
+            .receive_decision => switch (action) {
+                .transfer_file_decision_no => {
+                    try client.transactions_mutex.lock(io);
+                    defer client.transactions_mutex.unlock(io);
+
+                    const tx_index = client.transactions.getIndex(tx_id).?;
+                    client.transactions.orderedRemoveAt(tx_index);
+                    assert(client.transaction_owner.orderedRemove(tx_index) == .receive);
+                },
+                .transfer_file_decision_yes => {
+                    try client.transactions_mutex.lock(io);
+                    defer client.transactions_mutex.unlock(io);
+
+                    const tx_index = client.transactions.getIndex(tx_id).?;
+                    client.transactions.values()[tx_index].transfer_file.state = .send_file_contents;
+                    client.transaction_owner.items[tx_index] = .send;
+                    _ = client.send_count.fetchAdd(1, .seq_cst);
+                },
+                else => panic("invalid server action", .{}),
+            },
+            .receive_confirmation => switch (action) {
+                .transfer_file_confirmation => {
+                    try client.transactions_mutex.lock(io);
+                    defer client.transactions_mutex.unlock(io);
+
+                    const tx_index = client.transactions.getIndex(tx_id).?;
+                    client.transactions.orderedRemoveAt(tx_index);
+                    assert(client.transaction_owner.orderedRemove(tx_index) == .receive);
+                },
+                else => panic("invalid server action", .{}),
+            },
+            else => unreachable,
+        }
+    }
+
+    fn receiveReceiveFileTransaction(
+        client: *Client,
+        tx_id: network.TransactionId,
+        receive_file: *const Transaction.ReceiveFile,
+        io: Io,
+        reader: *Io.Reader,
+        action: network.Action,
+        peer_tx_id: network.TransactionId,
+    ) !void {
+        if (peer_tx_id != receive_file.peer_id) panic("mismatched peer id", .{});
+
+        switch (receive_file.state) {
+            .receive_file_contents => switch (action) {
+                .transfer_file_contents => {
+                    reader.discardAll(@intCast(receive_file.size)) catch |err| switch (err) {
+                        error.ReadFailed => |e| return e,
+                        error.EndOfStream => panic("file transfer failed", .{}),
+                    };
+
+                    try client.transactions_mutex.lock(io);
+                    defer client.transactions_mutex.unlock(io);
+
+                    const tx_index = client.transactions.getIndex(tx_id).?;
+                    client.transactions.values()[tx_index].receive_file.state = .send_confirmation;
+                    client.transaction_owner.items[tx_index] = .send;
+                    _ = client.send_count.fetchAdd(1, .seq_cst);
+                },
+                else => panic("invalid action", .{}),
+            },
+            .send_decision, .send_confirmation => unreachable,
+        }
+    }
+};

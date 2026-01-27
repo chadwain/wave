@@ -7,13 +7,17 @@ const Io = std.Io;
 pub const endian: std.builtin.Endian = .little;
 
 pub const TransactionId = enum(u32) {
+    new = 0xfffffffe,
     disconnect = 0xffffffff,
     _,
 };
 
 pub const Action = enum(u8) {
     transfer_file_metadata,
-    transfer_file,
+    transfer_file_decision_yes,
+    transfer_file_decision_no,
+    transfer_file_contents,
+    transfer_file_confirmation,
 };
 
 pub const FileHash = struct {
@@ -48,12 +52,12 @@ pub fn sendAction(writer: *Io.Writer, action: Action) !void {
 pub fn sendTransferFileMetadata(
     writer: *Io.Writer,
     path_encoding: PathEncoding,
-    path: []const u8,
+    path: []const u8, // TODO: Make a Path struct
     file_size: FileSize,
     hash: *const FileHash,
 ) !void {
     try writer.writeByte(@intFromEnum(path_encoding));
-    try writer.writeInt(PathLenInBytes, path.len, endian);
+    try writer.writeInt(PathLenInBytes, @intCast(path.len), endian);
     try writer.writeInt(FileSize, file_size, endian);
     try writer.writeAll(&hash.blake3);
     try writer.writeAll(path);
@@ -65,7 +69,7 @@ pub fn receiveTransactionId(reader: *Io.Reader) !?TransactionId {
     const id: TransactionId = @enumFromInt(try reader.takeInt(std.meta.Tag(TransactionId), endian));
     switch (id) {
         .disconnect => return null,
-        _ => return id,
+        .new, _ => return id,
     }
 }
 
@@ -86,7 +90,7 @@ pub fn receiveTransferFileMetadata(reader: *Io.Reader, allocator: Allocator) !st
     const file_size = try reader.takeInt(FileSize, endian);
 
     const hash_bytes = try reader.takeArray(FileHash.byte_size);
-    const hash: FileHash = .{ .blake3 = hash_bytes };
+    const hash: FileHash = .{ .blake3 = hash_bytes.* };
 
     var dest: Io.Writer.Allocating = try .initCapacity(allocator, path_len_bytes);
     defer dest.deinit();

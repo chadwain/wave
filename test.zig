@@ -13,25 +13,19 @@ pub fn main(init: std.process.Init) !void {
     const sync_dir_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
     defer allocator.free(sync_dir_wtf16);
 
-    const w = std.os.windows;
-    const sync_dir = try wave.windows.openSyncDir(.wtf16ZCast(sync_dir_wtf16));
-    defer w.CloseHandle(sync_dir);
-
-    var db = wave.windows.Database.init(allocator);
+    var db = try wave.windows.Database.init(.wtf16ZCast(sync_dir_wtf16), allocator);
     defer db.deinit();
 
-    var watch_task = try io.concurrent(wave.windows.watch, .{ sync_dir, io });
+    var watch_task = try io.concurrent(wave.windows.watch, .{ db.sync_dir, io });
     defer watch_task.cancel(io) catch {};
 
-    var addr_queue_buffer: [1]Io.net.IpAddress = undefined;
-    var addr_queue = Io.Queue(Io.net.IpAddress).init(&addr_queue_buffer);
-    defer addr_queue.close(io);
-
-    var server_task = try io.concurrent(startServer, .{ io, &addr_queue });
-    defer server_task.cancel(io) catch {};
-
-    var client_task = try io.concurrent(startClient, .{ io, &addr_queue });
-    defer client_task.cancel(io) catch {};
+    var client_in = Io.Reader.fixed(&.{});
+    var client_out = Io.Writer.Allocating.init(allocator);
+    defer client_out.deinit();
+    var client = wave.windows.Client.init(&db, allocator);
+    defer client.deinit();
+    try client.start(io, &client_in, &client_out.writer);
+    defer client.stop(io);
 
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
@@ -60,16 +54,21 @@ pub fn main(init: std.process.Init) !void {
                 try stdout.interface.flush();
             },
             's' => {
-                try wave.windows.completeScan(&db, sync_dir, allocator);
+                try wave.windows.completeScan(&db, allocator);
                 try stdout.interface.writeAll("scan complete\n");
                 try stdout.interface.flush();
+            },
+            '0'...'9' => |c| {
+                const index = c - '0';
+                try db.debug.clientTransferFile(io, &client, index);
+            },
+            'w' => {
+                std.debug.print("{x}\n", .{client_out.written()});
             },
             'q' => break,
             else => continue,
         }
     }
-
-    try wave.windows.simulateFileTransfer(&db, sync_dir, io, allocator);
 }
 
 const Args = struct {
