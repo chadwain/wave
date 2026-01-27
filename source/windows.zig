@@ -578,8 +578,8 @@ pub const Client = struct {
     transactions: std.AutoArrayHashMapUnmanaged(network.TransactionId, Transaction),
     next_tx_id: ?std.meta.Tag(network.TransactionId),
     transaction_owner: std.ArrayList(TransactionOwner),
-    send_count: std.atomic.Value(usize),
-    receive_count: std.atomic.Value(usize),
+    send_count: std.atomic.Value(u32),
+    receive_count: std.atomic.Value(u32),
     transactions_mutex: Io.Mutex,
     allocator: Allocator,
     db: *const Database,
@@ -653,9 +653,14 @@ pub const Client = struct {
         errdefer comptime unreachable;
 
         switch (owner) {
-            .send => _ = client.send_count.fetchAdd(1, .seq_cst),
+            .send => client.addSendTransaction(io),
             .receive => _ = client.receive_count.fetchAdd(1, .seq_cst),
         }
+    }
+
+    fn addSendTransaction(client: *Client, io: Io) void {
+        const previous_send_count = client.send_count.fetchAdd(1, .seq_cst);
+        if (previous_send_count == 0) io.futexWake(u32, &client.send_count.raw, 1);
     }
 
     pub fn start(client: *Client, io: Io, in: *Io.Reader, out: *Io.Writer) !void {
@@ -689,11 +694,9 @@ pub const Client = struct {
 
     fn send(client: *Client, io: Io, writer: *Io.Writer) !void {
         while (true) {
-            try io.checkCancel();
-            // TODO: Use `Io.Condition` or `Io.futexWait` to wait for a non-zero value
             // TODO: Learn a thing or two about atomic orderings and pick something other than seq_cst
-            if (client.send_count.load(.seq_cst) == 0) {
-                continue;
+            while (client.send_count.load(.seq_cst) == 0) {
+                try io.futexWait(u32, &client.send_count.raw, 0);
             }
 
             const transaction_index = try client.getTransaction(io, .send);
@@ -941,7 +944,7 @@ pub const Client = struct {
                     const tx_index = client.transactions.getIndex(tx_id).?;
                     client.transactions.values()[tx_index].transfer_file.state = .send_file_contents;
                     client.transaction_owner.items[tx_index] = .send;
-                    _ = client.send_count.fetchAdd(1, .seq_cst);
+                    client.addSendTransaction(io);
                 },
                 else => panic("invalid server action", .{}),
             },
@@ -985,7 +988,7 @@ pub const Client = struct {
                     const tx_index = client.transactions.getIndex(tx_id).?;
                     client.transactions.values()[tx_index].receive_file.state = .send_confirmation;
                     client.transaction_owner.items[tx_index] = .send;
-                    _ = client.send_count.fetchAdd(1, .seq_cst);
+                    client.addSendTransaction(io);
                 },
                 else => panic("invalid action", .{}),
             },
