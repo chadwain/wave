@@ -9,6 +9,8 @@ const Io = std.Io;
 const wave = @import("wave.zig");
 const network = wave.network;
 
+const cpu_endian = @import("builtin").cpu.arch.endian();
+
 /// A WTF-16 encoded string, with the endianness of the host system.
 pub const Wtf16 = struct {
     slice: []const w.WCHAR,
@@ -40,7 +42,7 @@ pub const Wtf16Z = struct {
 };
 
 fn formatWtf16AsUtf8(slice: []const w.WCHAR, writer: *Io.Writer) Io.Writer.Error!void {
-    switch (comptime @import("builtin").cpu.arch.endian()) {
+    switch (cpu_endian) {
         .little => try writer.print("{f}", .{std.unicode.fmtUtf16Le(slice)}),
         .big => @compileError("TODO big endian"),
     }
@@ -152,23 +154,22 @@ pub const Database = struct {
             }
         }
 
-        pub fn clientTransferFile(debug: *const Debug, io: Io, client: *Client, index: usize) !void {
+        pub fn hostTransferFile(debug: *const Debug, io: Io, host: *Host, index: usize) !void {
             const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
             const entry = blk: {
                 var it = db.all_known_files.iterator();
                 for (0..index) |_| _ = it.next().?;
                 break :blk it.next().?;
             };
-            const transaction: Client.Transaction = .{
-                .transfer_file = .{
-                    .peer_id = .new,
+            const transaction_data: Host.Transaction.Data = .{
+                .send_file = .{
                     .state = .send_metadata,
                     .path = entry.key_ptr.*,
                     .size = entry.value_ptr.size,
                     .hash = entry.value_ptr.hash,
                 },
             };
-            try client.insertTransaction(io, transaction, .send);
+            try host.addSendTransaction(io, transaction_data, .new);
         }
     };
 };
@@ -572,148 +573,191 @@ fn processChanges(buffer_complete: []align(@alignOf(w.DWORD)) w.BYTE) void {
     }
 }
 
-pub const Client = struct {
-    send_task: Io.Future(@typeInfo(@TypeOf(send)).@"fn".return_type.?),
-    receive_task: Io.Future(@typeInfo(@TypeOf(receive)).@"fn".return_type.?),
-    transactions: std.AutoArrayHashMapUnmanaged(network.TransactionId, Transaction),
+pub const Host = struct {
     next_tx_id: ?std.meta.Tag(network.TransactionId),
-    transaction_owner: std.ArrayList(TransactionOwner),
-    send_count: std.atomic.Value(u32),
-    receive_count: std.atomic.Value(u32),
-    transactions_mutex: Io.Mutex,
+    /// Maps transaction IDs to indeces with `txs`.
+    tx_id_index_map: std.AutoArrayHashMapUnmanaged(network.TransactionId, void),
+    txs: std.MultiArrayList(Transaction),
+    outgoing_tx_count: std.atomic.Value(u32),
     allocator: Allocator,
+    mutex: Io.Mutex,
+
     db: *const Database,
+    debug: Debug,
 
-    pub const TransactionOwner = enum { send, receive };
+    pub const Debug = struct {
+        name: ?[]const u8 = null,
+    };
 
-    pub const Transaction = union(enum) {
-        transfer_file: TransferFile,
-        receive_file: ReceiveFile,
+    pub const Transaction = struct {
+        direction: Direction,
+        data: Data,
+        peer_tx_id: network.TransactionId,
 
-        const TransferFile = struct {
-            peer_id: network.TransactionId,
-            state: State,
-            path: Wtf16,
-            size: w.LARGE_INTEGER,
-            hash: network.FileHash,
+        pub const Direction = enum { outgoing, incoming };
 
-            const State = enum { send_metadata, receive_decision, send_file_contents, receive_confirmation };
-        };
+        pub const Data = union(enum) {
+            send_file: SendFile,
+            receive_file: ReceiveFile,
 
-        const ReceiveFile = struct {
-            peer_id: network.TransactionId,
-            state: State,
-            path: Wtf16,
-            size: w.LARGE_INTEGER,
-            hash: network.FileHash,
+            pub const SendFile = struct {
+                state: State,
+                path: Wtf16,
+                size: w.LARGE_INTEGER,
+                hash: network.FileHash,
 
-            const State = union(enum) {
-                send_decision: enum { yes, no },
-                receive_file_contents,
-                send_confirmation,
+                pub const State = enum {
+                    send_metadata,
+                    receive_decision,
+                    send_file_contents,
+                    receive_result,
+                };
+            };
+
+            pub const ReceiveFile = struct {
+                state: State,
+                path: Wtf16,
+                size: w.LARGE_INTEGER,
+                hash: network.FileHash,
+
+                pub const State = union(enum) {
+                    send_decision: enum { accept, decline },
+                    receive_file_contents,
+                    send_result,
+                };
             };
         };
     };
 
-    pub fn init(db: *const Database, allocator: Allocator) Client {
+    pub fn init(db: *const Database, allocator: Allocator, debug: Debug) Host {
         return .{
-            .send_task = undefined,
-            .receive_task = undefined,
-            .transactions = .empty,
             .next_tx_id = 0,
-            .transaction_owner = .empty,
-            .send_count = .init(0),
-            .receive_count = .init(0),
-            .transactions_mutex = .init,
+            .tx_id_index_map = .empty,
+            .txs = .empty,
+            .outgoing_tx_count = .init(0),
             .allocator = allocator,
+            .mutex = .init,
+
             .db = db,
+            .debug = debug,
         };
     }
 
-    pub fn deinit(client: *Client) void {
-        client.transactions.deinit(client.allocator);
-        client.transaction_owner.deinit(client.allocator);
-        client.* = undefined;
+    pub fn deinit(host: *Host) void {
+        host.tx_id_index_map.deinit(host.allocator);
+        host.txs.deinit(host.allocator);
+        host.* = undefined;
     }
 
-    pub fn insertTransaction(client: *Client, io: Io, transaction: Transaction, owner: TransactionOwner) !void {
-        try client.transactions_mutex.lock(io);
-        defer client.transactions_mutex.unlock(io);
+    pub fn addSendTransaction(host: *Host, io: Io, data: Transaction.Data, peer_tx_id: network.TransactionId) !void {
+        try host.mutex.lock(io);
+        defer host.mutex.unlock(io);
 
-        const next_tx_id = client.next_tx_id orelse return error.OutOfTransactionIds;
-        client.next_tx_id = std.math.add(std.meta.Tag(network.TransactionId), next_tx_id, 1) catch null;
-        errdefer client.next_tx_id = next_tx_id;
+        const next_tx_id = host.next_tx_id orelse return error.OutOfTransactionIds;
+        host.next_tx_id = std.math.add(std.meta.Tag(network.TransactionId), next_tx_id, 1) catch null;
+        errdefer host.next_tx_id = next_tx_id;
 
-        const gop = try client.transactions.getOrPut(client.allocator, @enumFromInt(next_tx_id));
+        const gop = try host.tx_id_index_map.getOrPut(host.allocator, @enumFromInt(next_tx_id));
         assert(!gop.found_existing);
-        errdefer client.transactions.orderedRemoveAt(gop.index);
-        gop.value_ptr.* = transaction;
+        errdefer host.tx_id_index_map.orderedRemoveAt(gop.index);
 
-        try client.transaction_owner.insert(client.allocator, gop.index, owner);
+        try host.txs.insert(host.allocator, gop.index, .{
+            .direction = .outgoing,
+            .data = data,
+            .peer_tx_id = peer_tx_id,
+        });
         errdefer comptime unreachable;
 
-        switch (owner) {
-            .send => client.addSendTransaction(io),
-            .receive => _ = client.receive_count.fetchAdd(1, .seq_cst),
+        host.incrementOutgoingTxCount(io);
+    }
+
+    fn incrementOutgoingTxCount(host: *Host, io: Io) void {
+        const previous_send_count = host.outgoing_tx_count.fetchAdd(1, .seq_cst);
+        if (previous_send_count == 0) io.futexWake(u32, &host.outgoing_tx_count.raw, 1);
+    }
+
+    fn deleteTransaction(
+        host: *Host,
+        io: Io,
+        tx_id: network.TransactionId,
+        expected_direction: Transaction.Direction,
+    ) !void {
+        try host.mutex.lock(io);
+        defer host.mutex.unlock(io);
+
+        const index = host.tx_id_index_map.getIndex(tx_id).?;
+        assert(host.txs.items(.direction)[index] == expected_direction);
+        host.tx_id_index_map.orderedRemoveAt(index);
+        host.txs.orderedRemove(index);
+
+        if (expected_direction == .outgoing) {
+            _ = host.outgoing_tx_count.fetchSub(1, .seq_cst);
         }
     }
 
-    fn addSendTransaction(client: *Client, io: Io) void {
-        const previous_send_count = client.send_count.fetchAdd(1, .seq_cst);
-        if (previous_send_count == 0) io.futexWake(u32, &client.send_count.raw, 1);
-    }
-
-    pub fn start(client: *Client, io: Io, in: *Io.Reader, out: *Io.Writer) !void {
-        var send_task = try io.concurrent(send, .{ client, io, out });
-        errdefer send_task.cancel(io) catch {};
-        const receive_task = try io.concurrent(receive, .{ client, io, in });
-        errdefer comptime unreachable;
-
-        client.send_task = send_task;
-        client.receive_task = receive_task;
-    }
-
-    pub fn stop(client: *Client, io: Io) void {
-        client.send_task.cancel(io) catch {};
-        client.receive_task.cancel(io) catch {};
-        client.send_task = undefined;
-        client.receive_task = undefined;
-    }
-
-    fn getTransaction(client: *Client, io: Io, comptime owner: TransactionOwner) !usize {
-        try client.transactions_mutex.lock(io);
-        defer client.transactions_mutex.unlock(io);
-
-        for (0..client.transactions.count()) |tx_index| {
-            if (client.transaction_owner.items[tx_index] == owner) {
-                return tx_index;
-            }
+    fn log(host: *const Host, comptime fmt: []const u8, args: anytype) void {
+        if (host.debug.name) |name| {
+            wave.log.debug("(host:{s}) " ++ fmt, .{name} ++ args);
+        } else {
+            wave.log.debug(fmt, args);
         }
-        unreachable;
     }
 
-    fn send(client: *Client, io: Io, writer: *Io.Writer) !void {
+    fn logAction(host: *const Host, action: network.Action) network.Action {
+        host.log("action: {s}", .{@tagName(action)});
+        return action;
+    }
+
+    pub const RunError = Io.ConcurrentError || Io.Cancelable;
+
+    pub fn run(host: *Host, io: Io, reader: *Io.Reader, writer: *Io.Writer) RunError!void {
+        var outgoing = try io.concurrent(sendOutgoingTxs, .{ host, io, writer });
+        defer outgoing.cancel(io) catch {}; // TODO: Store the return value and print error trace
+        var incoming = try io.concurrent(receiveIncomingTxs, .{ host, io, reader });
+        defer incoming.cancel(io) catch {}; // TODO: Store the return value and print error trace
+        host.log("started", .{});
+        _ = try io.select(.{
+            .outgoing = &outgoing,
+            .incoming = &incoming,
+        });
+    }
+
+    fn sendOutgoingTxs(host: *Host, io: Io, writer: *Io.Writer) !void {
         while (true) {
             // TODO: Learn a thing or two about atomic orderings and pick something other than seq_cst
-            while (client.send_count.load(.seq_cst) == 0) {
-                try io.futexWait(u32, &client.send_count.raw, 0);
+            while (host.outgoing_tx_count.load(.seq_cst) == 0) {
+                try io.futexWait(u32, &host.outgoing_tx_count.raw, 0);
             }
 
-            const transaction_index = try client.getTransaction(io, .send);
-            const transaction_id = client.transactions.keys()[transaction_index];
-            const transaction = client.transactions.values()[transaction_index];
-            _ = client.send_count.fetchSub(1, .seq_cst);
+            const data, const tx_id, const peer_tx_id, const index = blk: {
+                try host.mutex.lock(io);
+                defer host.mutex.unlock(io);
 
-            switch (transaction) {
-                .transfer_file => |*transfer_file| try client.sendTransferFileTransaction(
-                    transaction_id,
-                    transfer_file,
+                const txs = host.txs.slice();
+                for (txs.items(.direction), 0..) |direction, index| {
+                    if (direction == .outgoing) break :blk .{
+                        txs.items(.data)[index],
+                        host.tx_id_index_map.keys()[index],
+                        txs.items(.peer_tx_id)[index],
+                        index,
+                    };
+                }
+                unreachable;
+            };
+            host.log("send tx {}@{}", .{ @intFromEnum(tx_id), index });
+
+            switch (data) {
+                .send_file => |*send_file| try host.outgoingSendFile(
+                    send_file,
+                    tx_id,
+                    peer_tx_id,
                     io,
                     writer,
                 ),
-                .receive_file => |*receive_file| try client.sendReceiveFileTransaction(
-                    transaction_id,
+                .receive_file => |*receive_file| try host.outgoingReceiveFile(
                     receive_file,
+                    tx_id,
+                    peer_tx_id,
                     io,
                     writer,
                 ),
@@ -721,46 +765,50 @@ pub const Client = struct {
         }
     }
 
-    fn sendTransferFileTransaction(
-        client: *Client,
-        transaction_id: network.TransactionId,
-        transfer_file: *const Transaction.TransferFile,
+    fn outgoingSendFile(
+        host: *Host,
+        send_file: *const Transaction.Data.SendFile,
+        tx_id: network.TransactionId,
+        peer_tx_id: network.TransactionId,
         io: Io,
         writer: *Io.Writer,
     ) !void {
-        const next_state: Transaction.TransferFile.State = blk: switch (transfer_file.state) {
+        const next_state: Transaction.Data.SendFile.State = blk: switch (send_file.state) {
             .send_metadata => {
-                errdefer std.debug.panic("TODO: Client send error", .{});
-                const file_size = std.math.cast(network.FileSize, transfer_file.size) orelse
+                errdefer std.debug.panic("TODO: Host send error", .{});
+                const file_size = std.math.cast(network.FileSize, send_file.size) orelse
                     std.debug.panic(
                         "TODO: File too large to transfer: '{f}' with size {}",
-                        .{ transfer_file.path.formatUtf8(), transfer_file.size },
+                        .{ send_file.path.formatUtf8(), send_file.size },
                     );
-                try network.sendTransactionId(writer, .new);
-                try network.sendTransactionId(writer, transaction_id);
-                try network.sendAction(writer, .transfer_file_metadata);
+                try network.sendTransactionId(writer, peer_tx_id);
+                try network.sendTransactionId(writer, tx_id);
+                try network.sendAction(writer, host.logAction(.transfer_file_metadata));
                 try network.sendTransferFileMetadata(
                     writer,
-                    .wtf16le,
-                    @ptrCast(transfer_file.path.slice),
+                    switch (cpu_endian) {
+                        .big => @compileError("TODO big endian"),
+                        .little => .wtf16le,
+                    },
+                    @ptrCast(send_file.path.slice),
                     file_size,
-                    &transfer_file.hash,
+                    &send_file.hash,
                 );
                 try writer.flush();
                 break :blk .receive_decision;
             },
             .send_file_contents => {
-                errdefer std.debug.panic("TODO: Client send error", .{});
+                errdefer std.debug.panic("TODO: Host send error", .{});
                 // TODO: Probably a good idea to make Database act as a middleman for opening files
-                const handle = try openFile(client.db.sync_dir, transfer_file.path);
+                const handle = try openFile(host.db.sync_dir, send_file.path);
                 defer w.CloseHandle(handle);
-                try network.sendTransactionId(writer, transfer_file.peer_id);
-                try network.sendTransactionId(writer, transaction_id);
-                try network.sendAction(writer, .transfer_file_contents);
+                try network.sendTransactionId(writer, peer_tx_id);
+                try network.sendTransactionId(writer, tx_id);
+                try network.sendAction(writer, host.logAction(.transfer_file_contents));
 
                 var iosb: w.IO_STATUS_BLOCK = undefined;
                 var written: w.LARGE_INTEGER = 0;
-                while (written < transfer_file.size) {
+                while (written < send_file.size) {
                     const buffer = buffer: {
                         const slice = try writer.writableSliceGreedy(1);
                         break :buffer slice[0..@min(slice.len, std.math.maxInt(u32))];
@@ -788,211 +836,210 @@ pub const Client = struct {
                         else => return w.unexpectedStatus(status),
                     }
                 }
-                assert(written == transfer_file.size);
+                assert(written == send_file.size);
                 try writer.flush();
-                break :blk .receive_confirmation;
+                break :blk .receive_result;
             },
-            .receive_decision, .receive_confirmation => unreachable,
+            .receive_decision, .receive_result => unreachable,
         };
 
-        try client.transactions_mutex.lock(io);
-        defer client.transactions_mutex.unlock(io);
+        try host.mutex.lock(io);
+        defer host.mutex.unlock(io);
 
-        const gop = client.transactions.getOrPutAssumeCapacity(transaction_id);
-        assert(gop.found_existing);
-        gop.value_ptr.transfer_file.state = next_state;
-        client.transaction_owner.items[gop.index] = .receive;
-        _ = client.receive_count.fetchAdd(1, .seq_cst);
+        const index = host.tx_id_index_map.getIndex(tx_id).?;
+        const txs = host.txs.slice();
+        txs.items(.data)[index].send_file.state = next_state;
+        txs.items(.direction)[index] = .incoming;
+        _ = host.outgoing_tx_count.fetchSub(1, .seq_cst);
     }
 
-    fn sendReceiveFileTransaction(
-        client: *Client,
-        transaction_id: network.TransactionId,
-        receive_file: *const Transaction.ReceiveFile,
+    fn outgoingReceiveFile(
+        host: *Host,
+        receive_file: *const Transaction.Data.ReceiveFile,
+        tx_id: network.TransactionId,
+        peer_tx_id: network.TransactionId,
         io: Io,
         writer: *Io.Writer,
     ) !void {
         switch (receive_file.state) {
             .send_decision => |send_decision| {
-                errdefer std.debug.panic("TODO: Client send error", .{});
-                try network.sendTransactionId(writer, receive_file.peer_id);
-                try network.sendTransactionId(writer, transaction_id);
-                try network.sendAction(writer, switch (send_decision) {
-                    .yes => .transfer_file_decision_yes,
-                    .no => .transfer_file_decision_no,
+                errdefer std.debug.panic("TODO: Host send error", .{});
+                try network.sendTransactionId(writer, peer_tx_id);
+                try network.sendTransactionId(writer, switch (send_decision) {
+                    .accept => tx_id,
+                    .decline => .new,
                 });
+                try network.sendAction(writer, host.logAction(switch (send_decision) {
+                    .accept => .transfer_file_accept,
+                    .decline => .transfer_file_decline,
+                }));
                 try writer.flush();
 
-                try client.transactions_mutex.lock(io);
-                defer client.transactions_mutex.unlock(io);
+                switch (send_decision) {
+                    .accept => {
+                        try host.mutex.lock(io);
+                        defer host.mutex.unlock(io);
 
-                const tx_index = client.transactions.getIndex(transaction_id).?;
-                client.transactions.values()[tx_index].receive_file.state = .receive_file_contents;
-                client.transaction_owner.items[tx_index] = .receive;
-                _ = client.receive_count.fetchAdd(1, .seq_cst);
+                        const index = host.tx_id_index_map.getIndex(tx_id).?;
+                        const txs = host.txs.slice();
+                        txs.items(.data)[index].receive_file.state = .receive_file_contents;
+                        txs.items(.direction)[index] = .incoming;
+                        _ = host.outgoing_tx_count.fetchSub(1, .seq_cst);
+                    },
+                    .decline => try host.deleteTransaction(io, tx_id, .outgoing),
+                }
             },
-            .send_confirmation => {
-                errdefer std.debug.panic("TODO: Client send error", .{});
-                try network.sendTransactionId(writer, receive_file.peer_id);
-                try network.sendTransactionId(writer, transaction_id);
-                try network.sendAction(writer, .transfer_file_confirmation);
+            .send_result => {
+                errdefer std.debug.panic("TODO: Host send error", .{});
+                try network.sendTransactionId(writer, peer_tx_id);
+                try network.sendTransactionId(writer, tx_id);
+                try network.sendAction(writer, host.logAction(switch (@intFromEnum(tx_id) % 2 == 0) {
+                    true => .transfer_file_success,
+                    false => .transfer_file_failure,
+                }));
+                try writer.flush();
 
-                try client.transactions_mutex.lock(io);
-                defer client.transactions_mutex.unlock(io);
-
-                const tx_index = client.transactions.getIndex(transaction_id).?;
-                client.transactions.orderedRemoveAt(tx_index);
-                assert(client.transaction_owner.orderedRemove(tx_index) == .send);
+                try host.deleteTransaction(io, tx_id, .outgoing);
             },
             .receive_file_contents => unreachable,
         }
     }
 
-    fn receive(client: *Client, io: Io, reader: *Io.Reader) !void {
+    fn receiveIncomingTxs(host: *Host, io: Io, reader: *Io.Reader) !void {
         while (true) {
             const tx_id = try network.receiveTransactionId(reader) orelse break;
             const peer_tx_id = try network.receiveTransactionId(reader) orelse panic("bad tx id", .{});
             const action = try network.receiveAction(reader);
+            host.log("incoming action {}", .{action});
 
             switch (action) {
                 .transfer_file_metadata => {
                     if (tx_id != .new) panic("invalid tx id", .{});
-                    try client.receiveTransferFileMetadataAction(io, reader, peer_tx_id);
+                    try host.newIncomingReceiveFile(peer_tx_id, io, reader);
                     continue;
                 },
                 else => {},
             }
 
-            const transaction = blk: {
-                try client.transactions_mutex.lock(io);
-                defer client.transactions_mutex.unlock(io);
+            const data = blk: {
+                try host.mutex.lock(io);
+                defer host.mutex.unlock(io);
 
-                const transaction_index = client.transactions.getIndex(tx_id) orelse panic("nonexistent transaction", .{});
-                switch (client.transaction_owner.items[transaction_index]) {
-                    .send => panic("transaction is in the send state", .{}),
-                    .receive => {},
+                const index = host.tx_id_index_map.getIndex(tx_id) orelse panic("nonexistent transaction", .{});
+                const txs = host.txs.slice();
+                switch (txs.items(.direction)[index]) {
+                    .outgoing => panic("transaction is outgoing", .{}),
+                    .incoming => {},
                 }
-                break :blk client.transactions.values()[transaction_index];
-            };
-            _ = client.receive_count.fetchSub(1, .seq_cst);
+                const real_peer_tx_id = txs.items(.peer_tx_id)[index];
+                if (real_peer_tx_id != .new and real_peer_tx_id != peer_tx_id) panic("wrong peer tx id", .{});
 
-            switch (transaction) {
-                .transfer_file => |*transfer_file| try client.receiveTransferFileTransaction(
+                host.log("receive tx {}@{} peer tx {}", .{ @intFromEnum(tx_id), index, @intFromEnum(peer_tx_id) });
+                break :blk txs.items(.data)[index];
+            };
+
+            switch (data) {
+                .send_file => |*send_file| try host.incomingSendFile(
+                    send_file,
                     tx_id,
-                    transfer_file,
-                    io,
-                    action,
                     peer_tx_id,
+                    action,
+                    io,
                 ),
-                .receive_file => |*receive_file| try client.receiveReceiveFileTransaction(
-                    tx_id,
+                .receive_file => |*receive_file| try host.incomingReceiveFile(
                     receive_file,
+                    tx_id,
+                    action,
                     io,
                     reader,
-                    action,
-                    peer_tx_id,
                 ),
             }
         }
     }
 
-    fn receiveTransferFileMetadataAction(
-        client: *Client,
+    fn newIncomingReceiveFile(
+        host: *Host,
+        peer_tx_id: network.TransactionId,
         io: Io,
         reader: *Io.Reader,
-        peer_tx_id: network.TransactionId,
     ) !void {
         var file_path_buffer: [256]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&file_path_buffer);
         const metadata = try network.receiveTransferFileMetadata(reader, fba.allocator());
-        const transaction: Transaction = .{
+        const data: Transaction.Data = .{
             .receive_file = .{
-                .peer_id = peer_tx_id,
-                .state = .{ .send_decision = .yes },
-                .path = .wtf16Cast(&.{}),
+                .state = .{ .send_decision = .accept }, // TODO
+                .path = .wtf16Cast(&.{}), // TODO
                 .size = @as(w.LARGE_INTEGER, @intCast(metadata.file_size)),
                 .hash = metadata.hash,
             },
         };
-        try client.insertTransaction(io, transaction, .send);
+        try host.addSendTransaction(io, data, peer_tx_id);
     }
 
-    fn receiveTransferFileTransaction(
-        client: *Client,
+    fn incomingSendFile(
+        host: *Host,
+        send_file: *const Transaction.Data.SendFile,
         tx_id: network.TransactionId,
-        transfer_file: *const Transaction.TransferFile,
-        io: Io,
-        action: network.Action,
         peer_tx_id: network.TransactionId,
+        action: network.Action,
+        io: Io,
     ) !void {
-        if (peer_tx_id != transfer_file.peer_id) panic("mismatched peer id", .{});
-
-        switch (transfer_file.state) {
+        switch (send_file.state) {
             .receive_decision => switch (action) {
-                .transfer_file_decision_no => {
-                    try client.transactions_mutex.lock(io);
-                    defer client.transactions_mutex.unlock(io);
+                .transfer_file_accept => {
+                    try host.mutex.lock(io);
+                    defer host.mutex.unlock(io);
 
-                    const tx_index = client.transactions.getIndex(tx_id).?;
-                    client.transactions.orderedRemoveAt(tx_index);
-                    assert(client.transaction_owner.orderedRemove(tx_index) == .receive);
+                    const index = host.tx_id_index_map.getIndex(tx_id).?;
+                    const txs = host.txs.slice();
+                    txs.items(.data)[index].send_file.state = .send_file_contents;
+                    txs.items(.peer_tx_id)[index] = peer_tx_id;
+                    txs.items(.direction)[index] = .outgoing;
+                    host.incrementOutgoingTxCount(io);
                 },
-                .transfer_file_decision_yes => {
-                    try client.transactions_mutex.lock(io);
-                    defer client.transactions_mutex.unlock(io);
-
-                    const tx_index = client.transactions.getIndex(tx_id).?;
-                    client.transactions.values()[tx_index].transfer_file.state = .send_file_contents;
-                    client.transaction_owner.items[tx_index] = .send;
-                    client.addSendTransaction(io);
-                },
-                else => panic("invalid server action", .{}),
+                .transfer_file_decline => try host.deleteTransaction(io, tx_id, .incoming),
+                else => panic("invalid peer action", .{}),
             },
-            .receive_confirmation => switch (action) {
-                .transfer_file_confirmation => {
-                    try client.transactions_mutex.lock(io);
-                    defer client.transactions_mutex.unlock(io);
-
-                    const tx_index = client.transactions.getIndex(tx_id).?;
-                    client.transactions.orderedRemoveAt(tx_index);
-                    assert(client.transaction_owner.orderedRemove(tx_index) == .receive);
-                },
-                else => panic("invalid server action", .{}),
+            .receive_result => {
+                switch (action) {
+                    .transfer_file_success, .transfer_file_failure => try host.deleteTransaction(io, tx_id, .incoming),
+                    else => panic("invalid peer action", .{}),
+                }
             },
             else => unreachable,
         }
     }
 
-    fn receiveReceiveFileTransaction(
-        client: *Client,
+    fn incomingReceiveFile(
+        host: *Host,
+        receive_file: *const Transaction.Data.ReceiveFile,
         tx_id: network.TransactionId,
-        receive_file: *const Transaction.ReceiveFile,
+        action: network.Action,
         io: Io,
         reader: *Io.Reader,
-        action: network.Action,
-        peer_tx_id: network.TransactionId,
     ) !void {
-        if (peer_tx_id != receive_file.peer_id) panic("mismatched peer id", .{});
-
         switch (receive_file.state) {
             .receive_file_contents => switch (action) {
                 .transfer_file_contents => {
+                    // TODO: Check the hash
                     reader.discardAll(@intCast(receive_file.size)) catch |err| switch (err) {
                         error.ReadFailed => |e| return e,
                         error.EndOfStream => panic("file transfer failed", .{}),
                     };
 
-                    try client.transactions_mutex.lock(io);
-                    defer client.transactions_mutex.unlock(io);
+                    try host.mutex.lock(io);
+                    defer host.mutex.unlock(io);
 
-                    const tx_index = client.transactions.getIndex(tx_id).?;
-                    client.transactions.values()[tx_index].receive_file.state = .send_confirmation;
-                    client.transaction_owner.items[tx_index] = .send;
-                    client.addSendTransaction(io);
+                    const index = host.tx_id_index_map.getIndex(tx_id).?;
+                    const txs = host.txs.slice();
+                    txs.items(.data)[index].receive_file.state = .send_result;
+                    txs.items(.direction)[index] = .outgoing;
+                    host.incrementOutgoingTxCount(io);
                 },
                 else => panic("invalid action", .{}),
             },
-            .send_decision, .send_confirmation => unreachable,
+            .send_decision, .send_result => unreachable,
         }
     }
 };

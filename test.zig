@@ -10,22 +10,29 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = try Args.init(init.minimal.args, init.arena);
 
-    const sync_dir_wtf16 = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
-    defer allocator.free(sync_dir_wtf16);
+    const sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
+    defer allocator.free(sync_dir);
 
-    var db = try wave.windows.Database.init(.wtf16ZCast(sync_dir_wtf16), allocator);
+    var db = try wave.windows.Database.init(.wtf16ZCast(sync_dir), allocator);
     defer db.deinit();
 
-    var watch_task = try io.concurrent(wave.windows.watch, .{ db.sync_dir, io });
-    defer watch_task.cancel(io) catch {};
+    // var watch_task = try io.concurrent(wave.windows.watch, .{ db.sync_dir, io });
+    // defer watch_task.cancel(io) catch {};
 
-    var client_in = Io.Reader.fixed(&.{});
-    var client_out = Io.Writer.Allocating.init(allocator);
-    defer client_out.deinit();
-    var client = wave.windows.Client.init(&db, allocator);
-    defer client.deinit();
-    try client.start(io, &client_in, &client_out.writer);
-    defer client.stop(io);
+    // var client_in = Io.Reader.fixed(&.{});
+    // var client_out = Io.Writer.Allocating.init(allocator);
+    // defer client_out.deinit();
+    // var client = wave.windows.Client.init(&db, allocator);
+    // defer client.deinit();
+    // try client.start(io, &client_in, &client_out.writer);
+    // defer client.stop(io);
+
+    const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.peerSyncDir());
+    defer allocator.free(peer_sync_dir);
+
+    var host: ?*wave.windows.Host = null;
+    var host_pair_task = try io.concurrent(startHostPair, .{ io, &db, .wtf16ZCast(peer_sync_dir), &host });
+    defer host_pair_task.cancel(io) catch {};
 
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
@@ -60,10 +67,13 @@ pub fn main(init: std.process.Init) !void {
             },
             '0'...'9' => |c| {
                 const index = c - '0';
-                try db.debug.clientTransferFile(io, &client, index);
+                if (host) |h| try db.debug.hostTransferFile(io, h, index) else {
+                    try stdout.interface.writeAll("host not ready\n");
+                    try stdout.interface.flush();
+                }
             },
             'w' => {
-                std.debug.print("{x}\n", .{client_out.written()});
+                // std.debug.print("{x}\n", .{client_out.written()});
             },
             'q' => break,
             else => continue,
@@ -78,7 +88,7 @@ const Args = struct {
         const slice = try args.toSlice(arena.allocator());
 
         switch (slice.len) {
-            2 => return .{ .slice = slice },
+            3 => return .{ .slice = slice },
             else => return error.InvalidArguments,
         }
     }
@@ -86,13 +96,25 @@ const Args = struct {
     fn syncDir(args: Args) []const u8 {
         return args.slice[1];
     }
+
+    fn peerSyncDir(args: Args) []const u8 {
+        return args.slice[2];
+    }
 };
 
-fn startServer(io: Io, addr_queue: *Io.Queue(Io.net.IpAddress)) !void {
+fn startHostPair(
+    io: Io,
+    db: *wave.windows.Database,
+    peer_sync_dir: wave.windows.Wtf16Z,
+    out_host: *?*wave.windows.Host,
+) !void {
     const addr = Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
     var server = try addr.listen(io, .{});
     defer server.deinit(io);
-    try addr_queue.putAll(io, &.{server.socket.address});
+
+    var peer = try io.concurrent(startPeer, .{ io, server.socket.address, peer_sync_dir });
+    defer peer.cancel(io) catch {};
+
     const stream = try server.accept(io);
     defer stream.close(io);
 
@@ -101,19 +123,18 @@ fn startServer(io: Io, addr_queue: *Io.Queue(Io.net.IpAddress)) !void {
     var write_buffer: [64]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
 
-    var futures = try wave.Server.start(io, &reader.interface, &writer.interface);
-    defer {
-        futures.send.cancel(io) catch {};
-        futures.receive.cancel(io) catch {};
-    }
-    _ = try io.select(.{
-        .send = &futures.send,
-        .receive = &futures.receive,
-    });
+    var dbg_allocator = std.heap.DebugAllocator(.{}).init;
+    defer assert(dbg_allocator.deinit() == .ok);
+    const allocator = dbg_allocator.allocator();
+
+    var host = wave.windows.Host.init(db, allocator, .{ .name = "A" });
+    defer host.deinit();
+    std.debug.print("connected\n", .{});
+    out_host.* = &host;
+    try host.run(io, &reader.interface, &writer.interface);
 }
 
-fn startClient(io: Io, addr_queue: *Io.Queue(Io.net.IpAddress)) !void {
-    const addr = try addr_queue.getOne(io);
+fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16Z) !void {
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
@@ -122,13 +143,14 @@ fn startClient(io: Io, addr_queue: *Io.Queue(Io.net.IpAddress)) !void {
     var write_buffer: [64]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
 
-    var futures = try wave.Client.start(io, &reader.interface, &writer.interface);
-    defer {
-        futures.send.cancel(io) catch {};
-        futures.receive.cancel(io) catch {};
-    }
-    _ = try io.select(.{
-        .send = &futures.send,
-        .receive = &futures.receive,
-    });
+    var dbg_allocator = std.heap.DebugAllocator(.{}).init;
+    defer assert(dbg_allocator.deinit() == .ok);
+    const allocator = dbg_allocator.allocator();
+
+    var db = try wave.windows.Database.init(sync_dir, allocator);
+    defer db.deinit();
+
+    var host = wave.windows.Host.init(&db, allocator, .{ .name = "B" });
+    defer host.deinit();
+    try host.run(io, &reader.interface, &writer.interface);
 }

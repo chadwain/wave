@@ -14,10 +14,11 @@ pub const TransactionId = enum(u32) {
 
 pub const Action = enum(u8) {
     transfer_file_metadata,
-    transfer_file_decision_yes,
-    transfer_file_decision_no,
+    transfer_file_accept,
+    transfer_file_decline,
     transfer_file_contents,
-    transfer_file_confirmation,
+    transfer_file_success,
+    transfer_file_failure,
 };
 
 pub const FileHash = struct {
@@ -48,7 +49,7 @@ pub fn sendAction(writer: *Io.Writer, action: Action) !void {
     try writer.writeByte(@intFromEnum(action));
 }
 
-/// Asserts a writer buffer size of at least `FileHash.byte_size`.
+/// Asserts a writer buffer size of at least `@sizeOf(FileSize)`.
 pub fn sendTransferFileMetadata(
     writer: *Io.Writer,
     path_encoding: PathEncoding,
