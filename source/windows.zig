@@ -1,6 +1,5 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const panic = std.debug.panic;
 const w = std.os.windows;
 const wtf16 = std.unicode.wtf8ToWtf16LeStringLiteral;
 const Allocator = std.mem.Allocator;
@@ -23,6 +22,7 @@ pub const Wtf16 = struct {
         return self.slice.len * @sizeOf(w.WCHAR);
     }
 
+    /// Does a potentially lossy conversion from WTF-16 to UTF-8.
     pub fn formatUtf8(self: Wtf16) std.fmt.Alt([]const w.WCHAR, formatWtf16AsUtf8) {
         return .{ .data = self.slice };
     }
@@ -36,6 +36,7 @@ pub const Wtf16Z = struct {
         return .{ .slice = slice };
     }
 
+    /// Does a potentially lossy conversion from WTF-16 to UTF-8.
     pub fn formatUtf8(self: Wtf16Z) std.fmt.Alt([]const w.WCHAR, formatWtf16AsUtf8) {
         return .{ .data = self.slice };
     }
@@ -50,6 +51,11 @@ fn formatWtf16AsUtf8(slice: []const w.WCHAR, writer: *Io.Writer) Io.Writer.Error
 
 pub const Database = struct {
     sync_dir: w.HANDLE,
+    sync_dir_io: Io.Dir,
+    currently_opened_file: struct {
+        handle: Io.File,
+        size: w.LARGE_INTEGER,
+    },
     allocator: Allocator,
     file_path_arena: std.heap.ArenaAllocator.State = .{},
     all_known_files: FileHashMap(Entry) = .empty,
@@ -66,6 +72,7 @@ pub const Database = struct {
         const Context = struct {
             pub fn hash(_: @This(), self: Wtf16) u32 {
                 // TODO: Better hashing
+                // TODO: Case insensitivity
                 // TODO: Do WTF-16 strings have a unique representation?
                 var hasher = std.hash.Wyhash.init(0);
                 for (self.slice) |c| std.hash.autoHash(&hasher, c);
@@ -79,11 +86,19 @@ pub const Database = struct {
         return std.HashMapUnmanaged(Wtf16, V, Context, std.hash_map.default_max_load_percentage);
     }
 
-    pub fn init(sync_dir_path: Wtf16Z, allocator: Allocator) !Database {
-        const sync_dir = try openSyncDir(sync_dir_path);
+    pub fn init(sync_dir_path: Wtf16Z, io: Io, sync_dir_path_wtf8: []const u8, allocator: Allocator) !Database {
+        if (!std.fs.path.isAbsoluteWindowsWtf16(sync_dir_path.slice)) return error.NonAbsoluteSyncDirPath;
+        const normalized = try w.wToPrefixedFileW(null, sync_dir_path.slice);
+        const sync_dir = try openDir(null, .wtf16Cast(normalized.span()));
+        errdefer w.CloseHandle(sync_dir);
+
+        const sync_dir_io = try Io.Dir.cwd().openDir(io, sync_dir_path_wtf8, .{});
         errdefer comptime unreachable;
+
         return .{
             .sync_dir = sync_dir,
+            .sync_dir_io = sync_dir_io,
+            .currently_opened_file = undefined,
             .allocator = allocator,
             .file_path_arena = .{},
             .all_known_files = .empty,
@@ -92,13 +107,28 @@ pub const Database = struct {
         };
     }
 
-    pub fn deinit(db: *Database) void {
+    pub fn deinit(db: *Database, io: Io) void {
         w.CloseHandle(db.sync_dir);
+        db.sync_dir_io.close(io);
         db.all_known_files.deinit(db.allocator);
         db.files_needing_sync.deinit(db.allocator);
         var file_path_arena = db.file_path_arena.promote(db.allocator);
         file_path_arena.deinit();
         db.* = undefined;
+    }
+
+    fn openFile(db: *Database, io: Io, path: Wtf16) !Io.File {
+        var wtf8_buffer: [w.PATH_MAX_WIDE * 2]u8 = undefined; // TODO: Hope this buffer is big enough
+        const len = std.unicode.wtf16LeToWtf8(&wtf8_buffer, path.slice);
+        db.currently_opened_file = try db.sync_dir_io.openFile(io, (&wtf8_buffer)[0..len], .{
+            .mode = .read_only,
+            .allow_directory = false,
+            .follow_symlinks = false,
+        });
+    }
+
+    fn closeFile(db: *Database, io: Io) void {
+        db.currently_opened_file.handle.close(io);
     }
 
     fn createOrUpdateEntry(
@@ -183,7 +213,9 @@ const FullScanContext = struct {
 
     fn init(db: *const Database, allocator: Allocator) !FullScanContext {
         var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
+        errdefer open_dir_handles.deinit(allocator);
         try open_dir_handles.append(allocator, db.sync_dir);
+
         return .{
             .pending_dirs = .empty,
             .pending_dir_names = .{},
@@ -423,12 +455,6 @@ pub fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     }
 }
 
-pub fn openSyncDir(path_wtf16: Wtf16Z) !w.HANDLE {
-    if (!std.fs.path.isAbsoluteWindowsWtf16(path_wtf16.slice)) return error.NonAbsoluteSyncDirPath;
-    const normalized = try w.wToPrefixedFileW(null, path_wtf16.slice);
-    return openDir(null, .wtf16Cast(normalized.span()));
-}
-
 pub fn openFile(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     var handle: w.HANDLE = undefined;
     const path_len_bytes: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
@@ -582,6 +608,13 @@ pub const Host = struct {
     allocator: Allocator,
     mutex: Io.Mutex,
 
+    /// The error returned by the outgoing data task, if any.
+    /// This is set to null when the run function begins and is filled in before it returns.
+    outgoing_error: ?OutgoingError,
+    /// The error returned by the incoming data task, if any.
+    /// This is set to null when the run function begins and is filled in before it returns.
+    incoming_error: ?IncomingError,
+
     db: *const Database,
     debug: Debug,
 
@@ -638,6 +671,9 @@ pub const Host = struct {
             .allocator = allocator,
             .mutex = .init,
 
+            .outgoing_error = null,
+            .incoming_error = null,
+
             .db = db,
             .debug = debug,
         };
@@ -649,11 +685,18 @@ pub const Host = struct {
         host.* = undefined;
     }
 
-    pub fn addSendTransaction(host: *Host, io: Io, data: Transaction.Data, peer_tx_id: network.TransactionId) !void {
+    pub const AddSendTransactionError = error{NoMoreTransactions} || Allocator.Error || Io.Cancelable;
+
+    pub fn addSendTransaction(
+        host: *Host,
+        io: Io,
+        data: Transaction.Data,
+        peer_tx_id: network.TransactionId,
+    ) AddSendTransactionError!void {
         try host.mutex.lock(io);
         defer host.mutex.unlock(io);
 
-        const next_tx_id = host.next_tx_id orelse return error.OutOfTransactionIds;
+        const next_tx_id = host.next_tx_id orelse return error.NoMoreTransactions;
         host.next_tx_id = std.math.add(std.meta.Tag(network.TransactionId), next_tx_id, 1) catch null;
         errdefer host.next_tx_id = next_tx_id;
 
@@ -711,10 +754,20 @@ pub const Host = struct {
     pub const RunError = Io.ConcurrentError || Io.Cancelable;
 
     pub fn run(host: *Host, io: Io, reader: *Io.Reader, writer: *Io.Writer) RunError!void {
+        host.outgoing_error = null;
+        host.incoming_error = null;
+
         var outgoing = try io.concurrent(sendOutgoingTxs, .{ host, io, writer });
-        defer outgoing.cancel(io) catch {}; // TODO: Store the return value and print error trace
+        defer outgoing.cancel(io) catch |err| {
+            host.outgoing_error = err;
+            host.log("outgoing error: {s}", .{@errorName(err)});
+        };
         var incoming = try io.concurrent(receiveIncomingTxs, .{ host, io, reader });
-        defer incoming.cancel(io) catch {}; // TODO: Store the return value and print error trace
+        defer incoming.cancel(io) catch |err| {
+            host.incoming_error = err;
+            host.log("incoming error: {s}", .{@errorName(err)});
+        };
+
         host.log("started", .{});
         _ = try io.select(.{
             .outgoing = &outgoing,
@@ -722,7 +775,15 @@ pub const Host = struct {
         });
     }
 
-    fn sendOutgoingTxs(host: *Host, io: Io, writer: *Io.Writer) !void {
+    pub const OutgoingError = Io.Writer.Error || Io.Cancelable || w.WaitForSingleObjectError;
+
+    fn sendOutgoingTxs(host: *Host, io: Io, writer: *Io.Writer) OutgoingError!void {
+        errdefer {
+            if (@errorReturnTrace()) |trace| {
+                host.log("{f}", .{std.debug.FormatStackTrace{ .stack_trace = trace.* }});
+            }
+        }
+
         while (true) {
             // TODO: Learn a thing or two about atomic orderings and pick something other than seq_cst
             while (host.outgoing_tx_count.load(.seq_cst) == 0) {
@@ -775,7 +836,6 @@ pub const Host = struct {
     ) !void {
         const next_state: Transaction.Data.SendFile.State = blk: switch (send_file.state) {
             .send_metadata => {
-                errdefer std.debug.panic("TODO: Host send error", .{});
                 const file_size = std.math.cast(network.FileSize, send_file.size) orelse
                     std.debug.panic(
                         "TODO: File too large to transfer: '{f}' with size {}",
@@ -798,8 +858,8 @@ pub const Host = struct {
                 break :blk .receive_decision;
             },
             .send_file_contents => {
-                errdefer std.debug.panic("TODO: Host send error", .{});
                 // TODO: Probably a good idea to make Database act as a middleman for opening files
+                // TODO: Detect if the file contents have changed while sending it
                 const handle = try openFile(host.db.sync_dir, send_file.path);
                 defer w.CloseHandle(handle);
                 try network.sendTransactionId(writer, peer_tx_id);
@@ -811,7 +871,7 @@ pub const Host = struct {
                 while (written < send_file.size) {
                     const buffer = buffer: {
                         const slice = try writer.writableSliceGreedy(1);
-                        break :buffer slice[0..@min(slice.len, std.math.maxInt(u32))];
+                        break :buffer slice[0..@min(slice.len, std.math.maxInt(w.ULONG))];
                     };
                     const status = w.ntdll.NtReadFile(
                         handle,
@@ -863,7 +923,6 @@ pub const Host = struct {
     ) !void {
         switch (receive_file.state) {
             .send_decision => |send_decision| {
-                errdefer std.debug.panic("TODO: Host send error", .{});
                 try network.sendTransactionId(writer, peer_tx_id);
                 try network.sendTransactionId(writer, switch (send_decision) {
                     .accept => tx_id,
@@ -890,7 +949,6 @@ pub const Host = struct {
                 }
             },
             .send_result => {
-                errdefer std.debug.panic("TODO: Host send error", .{});
                 try network.sendTransactionId(writer, peer_tx_id);
                 try network.sendTransactionId(writer, tx_id);
                 try network.sendAction(writer, host.logAction(switch (@intFromEnum(tx_id) % 2 == 0) {
@@ -905,16 +963,30 @@ pub const Host = struct {
         }
     }
 
-    fn receiveIncomingTxs(host: *Host, io: Io, reader: *Io.Reader) !void {
+    pub const IncomingError = error{
+        InvalidTxId,
+        InvalidPeerTxId,
+        WrongTxId,
+        WrongPeerTxId,
+        InvalidAction,
+    } || Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddSendTransactionError;
+
+    fn receiveIncomingTxs(host: *Host, io: Io, reader: *Io.Reader) IncomingError!void {
+        errdefer {
+            if (@errorReturnTrace()) |trace| {
+                host.log("{f}", .{std.debug.FormatStackTrace{ .stack_trace = trace.* }});
+            }
+        }
+
         while (true) {
             const tx_id = try network.receiveTransactionId(reader) orelse break;
-            const peer_tx_id = try network.receiveTransactionId(reader) orelse panic("bad tx id", .{});
+            const peer_tx_id = try network.receiveTransactionId(reader) orelse return error.InvalidPeerTxId;
             const action = try network.receiveAction(reader);
             host.log("incoming action {}", .{action});
 
             switch (action) {
                 .transfer_file_metadata => {
-                    if (tx_id != .new) panic("invalid tx id", .{});
+                    if (tx_id != .new) return error.InvalidTxId;
                     try host.newIncomingReceiveFile(peer_tx_id, io, reader);
                     continue;
                 },
@@ -925,14 +997,14 @@ pub const Host = struct {
                 try host.mutex.lock(io);
                 defer host.mutex.unlock(io);
 
-                const index = host.tx_id_index_map.getIndex(tx_id) orelse panic("nonexistent transaction", .{});
+                const index = host.tx_id_index_map.getIndex(tx_id) orelse return error.WrongTxId;
                 const txs = host.txs.slice();
                 switch (txs.items(.direction)[index]) {
-                    .outgoing => panic("transaction is outgoing", .{}),
+                    .outgoing => return error.InvalidTxId,
                     .incoming => {},
                 }
-                const real_peer_tx_id = txs.items(.peer_tx_id)[index];
-                if (real_peer_tx_id != .new and real_peer_tx_id != peer_tx_id) panic("wrong peer tx id", .{});
+                const expected_peer_tx_id = txs.items(.peer_tx_id)[index];
+                if (expected_peer_tx_id != .new and expected_peer_tx_id != peer_tx_id) return error.WrongPeerTxId;
 
                 host.log("receive tx {}@{} peer tx {}", .{ @intFromEnum(tx_id), index, @intFromEnum(peer_tx_id) });
                 break :blk txs.items(.data)[index];
@@ -999,12 +1071,12 @@ pub const Host = struct {
                     host.incrementOutgoingTxCount(io);
                 },
                 .transfer_file_decline => try host.deleteTransaction(io, tx_id, .incoming),
-                else => panic("invalid peer action", .{}),
+                else => return error.InvalidAction,
             },
             .receive_result => {
                 switch (action) {
                     .transfer_file_success, .transfer_file_failure => try host.deleteTransaction(io, tx_id, .incoming),
-                    else => panic("invalid peer action", .{}),
+                    else => return error.InvalidAction,
                 }
             },
             else => unreachable,
@@ -1023,10 +1095,7 @@ pub const Host = struct {
             .receive_file_contents => switch (action) {
                 .transfer_file_contents => {
                     // TODO: Check the hash
-                    reader.discardAll(@intCast(receive_file.size)) catch |err| switch (err) {
-                        error.ReadFailed => |e| return e,
-                        error.EndOfStream => panic("file transfer failed", .{}),
-                    };
+                    try reader.discardAll(@intCast(receive_file.size));
 
                     try host.mutex.lock(io);
                     defer host.mutex.unlock(io);
@@ -1037,7 +1106,7 @@ pub const Host = struct {
                     txs.items(.direction)[index] = .outgoing;
                     host.incrementOutgoingTxCount(io);
                 },
-                else => panic("invalid action", .{}),
+                else => return error.InvalidAction,
             },
             .send_decision, .send_result => unreachable,
         }
