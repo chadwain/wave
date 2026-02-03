@@ -184,7 +184,7 @@ pub const Database = struct {
             }
         }
 
-        pub fn hostTransferFile(debug: *const Debug, io: Io, host: *Host, index: usize) !void {
+        pub fn hostTransferFile(debug: *const Debug, index: usize, io: Io, q: *Host.TxQueue) !void {
             const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
             const entry = blk: {
                 var it = db.all_known_files.iterator();
@@ -199,7 +199,7 @@ pub const Database = struct {
                     .hash = entry.value_ptr.hash,
                 },
             };
-            try host.addSendTransaction(io, transaction_data, .new);
+            try q.putOne(io, transaction_data);
         }
     };
 };
@@ -662,6 +662,8 @@ pub const Host = struct {
         };
     };
 
+    pub const TxQueue = Io.Queue(Transaction.Data);
+
     pub fn init(db: *const Database, allocator: Allocator, debug: Debug) Host {
         return .{
             .next_tx_id = 0,
@@ -685,14 +687,14 @@ pub const Host = struct {
         host.* = undefined;
     }
 
-    pub const AddSendTransactionError = error{NoMoreTransactions} || Allocator.Error || Io.Cancelable;
+    const AddOutgoingTxError = error{NoMoreTransactions} || Allocator.Error || Io.Cancelable;
 
-    pub fn addSendTransaction(
+    fn addOutgoingTx(
         host: *Host,
         io: Io,
         data: Transaction.Data,
         peer_tx_id: network.TransactionId,
-    ) AddSendTransactionError!void {
+    ) AddOutgoingTxError!void {
         try host.mutex.lock(io);
         defer host.mutex.unlock(io);
 
@@ -753,10 +755,18 @@ pub const Host = struct {
 
     pub const RunError = Io.ConcurrentError || Io.Cancelable;
 
-    pub fn run(host: *Host, io: Io, reader: *Io.Reader, writer: *Io.Writer) RunError!void {
+    pub fn run(
+        host: *Host,
+        io: Io,
+        tx_queue: *TxQueue,
+        reader: *Io.Reader,
+        writer: *Io.Writer,
+    ) RunError!void {
         host.outgoing_error = null;
         host.incoming_error = null;
 
+        var read_queue = try io.concurrent(readQueue, .{ host, io, tx_queue });
+        defer read_queue.cancel(io) catch {}; // TODO: Handle the error
         var outgoing = try io.concurrent(sendOutgoingTxs, .{ host, io, writer });
         defer outgoing.cancel(io) catch |err| {
             host.outgoing_error = err;
@@ -770,9 +780,18 @@ pub const Host = struct {
 
         host.log("started", .{});
         _ = try io.select(.{
+            .read_queue = &read_queue,
             .outgoing = &outgoing,
             .incoming = &incoming,
         });
+    }
+
+    fn readQueue(host: *Host, io: Io, tx_queue: *TxQueue) !void {
+        defer tx_queue.close(io);
+        while (true) {
+            const data = try tx_queue.getOne(io);
+            try host.addOutgoingTx(io, data, .new);
+        }
     }
 
     pub const OutgoingError = Io.Writer.Error || Io.Cancelable || w.WaitForSingleObjectError;
@@ -969,7 +988,7 @@ pub const Host = struct {
         WrongTxId,
         WrongPeerTxId,
         InvalidAction,
-    } || Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddSendTransactionError;
+    } || Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddOutgoingTxError;
 
     fn receiveIncomingTxs(host: *Host, io: Io, reader: *Io.Reader) IncomingError!void {
         errdefer {
@@ -1046,7 +1065,7 @@ pub const Host = struct {
                 .hash = metadata.hash,
             },
         };
-        try host.addSendTransaction(io, data, peer_tx_id);
+        try host.addOutgoingTx(io, data, peer_tx_id);
     }
 
     fn incomingSendFile(

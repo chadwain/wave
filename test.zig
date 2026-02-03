@@ -22,17 +22,20 @@ pub fn main(init: std.process.Init) !void {
     const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.peerSyncDir());
     defer allocator.free(peer_sync_dir);
 
-    var host: ?*wave.windows.Host = null;
+    var tx_queue_buffer: [1]wave.windows.Host.Transaction.Data = undefined;
+    var tx_queue: wave.windows.Host.TxQueue = .init(&tx_queue_buffer);
+    defer tx_queue.close(io);
+
     var host_pair_task = try io.concurrent(
         startHostPair,
-        .{ io, &db, .wtf16ZCast(peer_sync_dir), args.peerSyncDir(), &host },
+        .{ io, &db, .wtf16ZCast(peer_sync_dir), args.peerSyncDir(), &tx_queue },
     );
     defer host_pair_task.cancel(io) catch {};
 
-    try runCli(io, &db, &host, allocator);
+    try runCli(io, &db, &tx_queue, allocator);
 }
 
-fn runCli(io: Io, db: *wave.windows.Database, host: *?*wave.windows.Host, allocator: Allocator) !void {
+fn runCli(io: Io, db: *wave.windows.Database, tx_queue: *wave.windows.Host.TxQueue, allocator: Allocator) !void {
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
     const reader = &stdin.interface;
@@ -66,10 +69,7 @@ fn runCli(io: Io, db: *wave.windows.Database, host: *?*wave.windows.Host, alloca
             },
             '0'...'9' => |c| {
                 const index = c - '0';
-                if (host.*) |h| try db.debug.hostTransferFile(io, h, index) else {
-                    try stdout.interface.writeAll("host not ready\n");
-                    try stdout.interface.flush();
-                }
+                try db.debug.hostTransferFile(index, io, tx_queue);
             },
             'q' => break,
             else => continue,
@@ -103,7 +103,7 @@ fn startHostPair(
     db: *wave.windows.Database,
     peer_sync_dir: wave.windows.Wtf16Z,
     peer_sync_dir_wtf8: []const u8,
-    out_host: *?*wave.windows.Host,
+    tx_queue: *wave.windows.Host.TxQueue,
 ) !void {
     const addr = Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
     var server = try addr.listen(io, .{});
@@ -127,8 +127,7 @@ fn startHostPair(
     var host = wave.windows.Host.init(db, allocator, .{ .name = "A" });
     defer host.deinit();
     std.debug.print("connected\n", .{});
-    out_host.* = &host;
-    try host.run(io, &reader.interface, &writer.interface);
+    try host.run(io, tx_queue, &reader.interface, &writer.interface);
 }
 
 fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16Z, sync_dir_wtf8: []const u8) !void {
@@ -147,7 +146,10 @@ fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16Z, sync
     var db = try wave.windows.Database.init(sync_dir, io, sync_dir_wtf8, allocator);
     defer db.deinit(io);
 
+    var tx_queue: wave.windows.Host.TxQueue = .init(&.{});
+    defer tx_queue.close(io);
+
     var host = wave.windows.Host.init(&db, allocator, .{ .name = "B" });
     defer host.deinit();
-    try host.run(io, &reader.interface, &writer.interface);
+    try host.run(io, &tx_queue, &reader.interface, &writer.interface);
 }
