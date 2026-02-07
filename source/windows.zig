@@ -22,6 +22,10 @@ pub const Wtf16 = struct {
         return self.slice.len * @sizeOf(w.WCHAR);
     }
 
+    pub fn dupe(self: Wtf16, allocator: Allocator) !Wtf16 {
+        return .{ .slice = try allocator.dupe(u16, self.slice) };
+    }
+
     /// Does a potentially lossy conversion from WTF-16 to UTF-8.
     pub fn formatUtf8(self: Wtf16) std.fmt.Alt([]const w.WCHAR, formatWtf16AsUtf8) {
         return .{ .data = self.slice };
@@ -52,14 +56,13 @@ fn formatWtf16AsUtf8(slice: []const w.WCHAR, writer: *Io.Writer) Io.Writer.Error
 pub const Database = struct {
     sync_dir: w.HANDLE,
     sync_dir_io: Io.Dir,
-    currently_opened_file: struct {
-        handle: Io.File,
-        size: w.LARGE_INTEGER,
-    },
-    allocator: Allocator,
+
     file_path_arena: std.heap.ArenaAllocator.State = .{},
     all_known_files: FileHashMap(Entry) = .empty,
     files_needing_sync: FileHashMap(void) = .empty,
+
+    allocator: Allocator,
+    mutex: Io.Mutex, // TODO: Replace with RwLock
     debug: Debug,
 
     pub const Entry = struct {
@@ -98,11 +101,13 @@ pub const Database = struct {
         return .{
             .sync_dir = sync_dir,
             .sync_dir_io = sync_dir_io,
-            .currently_opened_file = undefined,
-            .allocator = allocator,
+
             .file_path_arena = .{},
             .all_known_files = .empty,
             .files_needing_sync = .empty,
+
+            .allocator = allocator,
+            .mutex = .init,
             .debug = .{},
         };
     }
@@ -110,27 +115,16 @@ pub const Database = struct {
     pub fn deinit(db: *Database, io: Io) void {
         w.CloseHandle(db.sync_dir);
         db.sync_dir_io.close(io);
+
         db.all_known_files.deinit(db.allocator);
         db.files_needing_sync.deinit(db.allocator);
         var file_path_arena = db.file_path_arena.promote(db.allocator);
         file_path_arena.deinit();
+
         db.* = undefined;
     }
 
-    fn openFile(db: *Database, io: Io, path: Wtf16) !Io.File {
-        var wtf8_buffer: [w.PATH_MAX_WIDE * 2]u8 = undefined; // TODO: Hope this buffer is big enough
-        const len = std.unicode.wtf16LeToWtf8(&wtf8_buffer, path.slice);
-        db.currently_opened_file = try db.sync_dir_io.openFile(io, (&wtf8_buffer)[0..len], .{
-            .mode = .read_only,
-            .allow_directory = false,
-            .follow_symlinks = false,
-        });
-    }
-
-    fn closeFile(db: *Database, io: Io) void {
-        db.currently_opened_file.handle.close(io);
-    }
-
+    /// Must be called with a lock.
     fn createOrUpdateEntry(
         db: *Database,
         path: Wtf16,
@@ -159,9 +153,159 @@ pub const Database = struct {
         if (need_sync) try db.files_needing_sync.put(db.allocator, gop.key_ptr.*, {});
     }
 
+    fn checkMetadata(
+        db: *Database,
+        metadata: *const network.IncomingFileMetadata,
+        file_path_buffer: *align(@alignOf(w.WCHAR)) const network.FilePathBuffer,
+        io: Io,
+    ) !struct {
+        Wtf16,
+        enum { equals, differs },
+    } {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        // TODO: normalize path
+        const path: Wtf16 = switch (metadata.path_encoding) {
+            .wtf16le => switch (cpu_endian) {
+                .little => .wtf16Cast(@ptrCast(file_path_buffer[0..metadata.path_len_bytes])),
+                .big => @compileError("TODO big endian"),
+            },
+        };
+
+        var file_path_arena = db.file_path_arena.promote(db.allocator);
+        defer db.file_path_arena = file_path_arena.state;
+        const path_copied = try path.dupe(file_path_arena.allocator());
+
+        const entry = db.all_known_files.getPtr(path);
+        if (entry != null and
+            entry.?.size == metadata.file_size and
+            std.mem.eql(u8, &entry.?.hash.blake3, &metadata.hash.blake3))
+        {
+            return .{ path_copied, .equals };
+        } else {
+            return .{ path_copied, .differs };
+        }
+    }
+
+    pub const SendFileError = w.WaitForSingleObjectError;
+
+    fn sendFile(
+        _: *const Database,
+        handle: w.HANDLE,
+        send_file: *const Host.Transaction.Data.SendFile,
+        writer: *Io.Writer,
+    ) !void {
+        var iosb: w.IO_STATUS_BLOCK = undefined;
+        var written: w.LARGE_INTEGER = 0;
+        while (written < send_file.size) {
+            const buffer = buffer: {
+                const slice = try writer.writableSliceGreedy(1);
+                break :buffer slice[0..@min(slice.len, std.math.maxInt(w.ULONG))];
+            };
+            const status = w.ntdll.NtReadFile(
+                handle,
+                null,
+                null,
+                null,
+                &iosb,
+                buffer.ptr,
+                @intCast(buffer.len),
+                &written,
+                null,
+            );
+            sw: switch (status) {
+                .SUCCESS => {
+                    writer.advance(iosb.Information);
+                    written += @intCast(iosb.Information);
+                },
+                .PENDING => {
+                    try w.WaitForSingleObject(handle, w.INFINITE);
+                    continue :sw iosb.u.Status;
+                },
+                else => return w.unexpectedStatus(status),
+            }
+        }
+        assert(written == send_file.size);
+    }
+
+    pub const ReceiveFileError = w.WaitForSingleObjectError;
+
+    fn receiveFile(
+        db: *Database,
+        receive_file: *const Host.Transaction.Data.ReceiveFile,
+        reader: *Io.Reader,
+        io: Io,
+    ) !void {
+        const handle = try openFile(db.sync_dir, receive_file.path, .creating);
+        defer w.CloseHandle(handle);
+
+        var read: w.LARGE_INTEGER = 0;
+        var iosb: w.IO_STATUS_BLOCK = undefined;
+        while (read < receive_file.size) {
+            const buffer = buffer: {
+                const slice = try reader.peekGreedy(1);
+                break :buffer slice[0..@min(slice.len, std.math.maxInt(w.ULONG))];
+            };
+            const status = w.ntdll.NtWriteFile(
+                handle,
+                null,
+                null,
+                null,
+                &iosb,
+                buffer.ptr,
+                @intCast(buffer.len),
+                &read,
+                null,
+            );
+            sw: switch (status) {
+                .SUCCESS => {
+                    reader.toss(iosb.Information);
+                    read += @intCast(iosb.Information);
+                },
+                .PENDING => {
+                    try w.WaitForSingleObject(handle, w.INFINITE);
+                    continue :sw iosb.u.Status;
+                },
+                else => return w.unexpectedStatus(status),
+            }
+        }
+        assert(read == receive_file.size);
+
+        const information = blk: {
+            var information: w.FILE.BASIC_INFORMATION = undefined;
+            const status = w.ntdll.NtQueryInformationFile(
+                handle,
+                &iosb,
+                &information,
+                @sizeOf(@TypeOf(information)),
+                .Basic,
+            );
+            sw: switch (status) {
+                .SUCCESS => break :blk information,
+                .PENDING => {
+                    try w.WaitForSingleObject(handle, w.INFINITE);
+                    continue :sw iosb.u.Status;
+                },
+                else => return w.unexpectedStatus(status),
+            }
+        };
+
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        try db.all_known_files.putNoClobber(db.allocator, receive_file.path, .{
+            .hash = receive_file.hash,
+            .modified_time = information.ChangeTime,
+            .size = receive_file.size,
+        });
+    }
+
     pub const Debug = struct {
+        /// Must be called with a lock.
         pub fn printKnownFiles(debug: *const Debug, writer: *Io.Writer) !void {
             const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
+
             var it = db.all_known_files.iterator();
             while (it.next()) |entry| {
                 try writer.print(
@@ -176,16 +320,20 @@ pub const Database = struct {
             }
         }
 
+        /// Must be called with a lock.
         pub fn printFilesNeedingSync(debug: *const Debug, writer: *Io.Writer) !void {
             const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
+
             var it = db.files_needing_sync.iterator();
             while (it.next()) |entry| {
                 try writer.print("{f}\n", .{entry.key_ptr.formatUtf8()});
             }
         }
 
+        /// Must be called with a lock.
         pub fn hostTransferFile(debug: *const Debug, index: usize, io: Io, q: *Host.TxQueue) !void {
             const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
+
             const entry = blk: {
                 var it = db.all_known_files.iterator();
                 for (0..index) |_| _ = it.next().?;
@@ -290,7 +438,7 @@ const FullScanContext = struct {
             try ctx.sub_path.appendSlice(allocator, name.slice);
 
             const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
-            const file = try openFile(dir, name);
+            const file = try openFile(dir, name, .reading);
             defer w.CloseHandle(file);
             const hash = try computeFileHash(file, information.EndOfFile);
 
@@ -324,7 +472,10 @@ const NtQueryInformation = extern struct {
     const CCHAR = w.CHAR;
 };
 
-pub fn completeScan(db: *Database, allocator: Allocator) !void {
+pub fn completeScan(db: *Database, io: Io, allocator: Allocator) !void {
+    try db.mutex.lock(io);
+    defer db.mutex.unlock(io);
+
     var ctx = try FullScanContext.init(db, allocator);
     defer ctx.deinit(allocator);
 
@@ -397,7 +548,7 @@ fn scanOneDirectory(db: *Database, allocator: Allocator, ctx: *FullScanContext) 
 }
 
 /// Opens a directory capable of async operations and being waited on.
-pub fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
+fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     var handle: w.HANDLE = undefined;
     const path_len_bytes: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
     var unicode_string: w.UNICODE_STRING = .{
@@ -455,7 +606,7 @@ pub fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     }
 }
 
-pub fn openFile(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
+fn openFile(parent: ?w.HANDLE, path: Wtf16, purpose: enum { reading, creating }) !w.HANDLE {
     var handle: w.HANDLE = undefined;
     const path_len_bytes: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
     var unicode_string: w.UNICODE_STRING = .{
@@ -477,7 +628,10 @@ pub fn openFile(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     const status = w.ntdll.NtCreateFile(
         &handle,
         .{
-            .GENERIC = .{ .READ = true },
+            .GENERIC = switch (purpose) {
+                .reading => .{ .READ = true },
+                .creating => .{ .READ = true, .WRITE = true },
+            },
         },
         &object_attributes,
         &iosb,
@@ -488,7 +642,10 @@ pub fn openFile(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
             .WRITE = true,
             .DELETE = true,
         },
-        .OPEN,
+        switch (purpose) {
+            .reading => .OPEN,
+            .creating => .OVERWRITE_IF,
+        },
         .{},
         null,
         0,
@@ -608,14 +765,7 @@ pub const Host = struct {
     allocator: Allocator,
     mutex: Io.Mutex,
 
-    /// The error returned by the outgoing data task, if any.
-    /// This is set to null when the run function begins and is filled in before it returns.
-    outgoing_error: ?OutgoingError,
-    /// The error returned by the incoming data task, if any.
-    /// This is set to null when the run function begins and is filled in before it returns.
-    incoming_error: ?IncomingError,
-
-    db: *const Database,
+    db: *Database,
     debug: Debug,
 
     pub const Debug = struct {
@@ -654,9 +804,12 @@ pub const Host = struct {
                 hash: network.FileHash,
 
                 pub const State = union(enum) {
-                    send_decision: enum { accept, decline },
+                    send_decision: SendDecision,
                     receive_file_contents,
-                    send_result,
+                    send_result: SendResult,
+
+                    pub const SendDecision = enum { accept, decline };
+                    pub const SendResult = enum { success, failure };
                 };
             };
         };
@@ -664,7 +817,7 @@ pub const Host = struct {
 
     pub const TxQueue = Io.Queue(Transaction.Data);
 
-    pub fn init(db: *const Database, allocator: Allocator, debug: Debug) Host {
+    pub fn init(db: *Database, allocator: Allocator, debug: Debug) Host {
         return .{
             .next_tx_id = 0,
             .tx_id_index_map = .empty,
@@ -672,9 +825,6 @@ pub const Host = struct {
             .outgoing_tx_count = .init(0),
             .allocator = allocator,
             .mutex = .init,
-
-            .outgoing_error = null,
-            .incoming_error = null,
 
             .db = db,
             .debug = debug,
@@ -721,6 +871,40 @@ pub const Host = struct {
         if (previous_send_count == 0) io.futexWake(u32, &host.outgoing_tx_count.raw, 1);
     }
 
+    fn flipTransaction(
+        host: *Host,
+        comptime to: Transaction.Direction,
+        tx_id: network.TransactionId,
+        comptime tag: std.meta.FieldEnum(Transaction.Data),
+        new_state: @FieldType(Transaction.Data, @tagName(tag)).State,
+        /// If non-null, the peer tx id will be replaced with this value.
+        peer_tx_id: ?network.TransactionId,
+        io: Io,
+    ) !void {
+        try host.mutex.lock(io);
+        defer host.mutex.unlock(io);
+
+        const index = host.tx_id_index_map.getIndex(tx_id).?;
+        const txs = host.txs.slice();
+        const data = &txs.items(.data)[index];
+        @field(data, @tagName(tag)).state = new_state;
+        if (peer_tx_id) |id| txs.items(.peer_tx_id)[index] = id;
+
+        const from = &txs.items(.direction)[index];
+        switch (to) {
+            .outgoing => {
+                assert(from.* == .incoming);
+                from.* = .outgoing;
+                host.incrementOutgoingTxCount(io);
+            },
+            .incoming => {
+                assert(from.* == .outgoing);
+                from.* = .incoming;
+                _ = host.outgoing_tx_count.fetchSub(1, .seq_cst);
+            },
+        }
+    }
+
     fn deleteTransaction(
         host: *Host,
         io: Io,
@@ -740,7 +924,7 @@ pub const Host = struct {
         }
     }
 
-    fn log(host: *const Host, comptime fmt: []const u8, args: anytype) void {
+    fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {
         if (host.debug.name) |name| {
             wave.log.debug("(host:{s}) " ++ fmt, .{name} ++ args);
         } else {
@@ -748,12 +932,32 @@ pub const Host = struct {
         }
     }
 
-    fn logAction(host: *const Host, action: network.Action) network.Action {
-        host.log("action: {s}", .{@tagName(action)});
-        return action;
+    fn logMessage(
+        host: *const Host,
+        direction: Transaction.Direction,
+        tx_id: network.TransactionId,
+        action: network.Action,
+        peer_tx_id: network.TransactionId,
+    ) void {
+        switch (direction) {
+            .outgoing => host.debugLog(
+                "{s} tx#{f} {s} -> peer tx#{f}",
+                .{ @tagName(direction), tx_id, @tagName(action), peer_tx_id },
+            ),
+            .incoming => host.debugLog(
+                "{s} tx#{f} <- peer tx#{f} {s}",
+                .{ @tagName(direction), tx_id, peer_tx_id, @tagName(action) },
+            ),
+        }
     }
 
     pub const RunError = Io.ConcurrentError || Io.Cancelable;
+
+    pub const RunResult = struct {
+        read_tx_queue_result: ReadTxQueueError!void,
+        outgoing_result: OutgoingError!void,
+        incoming_result: IncomingError!void,
+    };
 
     pub fn run(
         host: *Host,
@@ -761,45 +965,45 @@ pub const Host = struct {
         tx_queue: *TxQueue,
         reader: *Io.Reader,
         writer: *Io.Writer,
-    ) RunError!void {
-        host.outgoing_error = null;
-        host.incoming_error = null;
+    ) RunError!RunResult {
+        defer tx_queue.close(io);
 
-        var read_queue = try io.concurrent(readQueue, .{ host, io, tx_queue });
-        defer read_queue.cancel(io) catch {}; // TODO: Handle the error
+        var read_queue = try io.concurrent(readTxQueue, .{ host, io, tx_queue });
+        defer read_queue.cancel(io) catch {};
         var outgoing = try io.concurrent(sendOutgoingTxs, .{ host, io, writer });
-        defer outgoing.cancel(io) catch |err| {
-            host.outgoing_error = err;
-            host.log("outgoing error: {s}", .{@errorName(err)});
-        };
+        defer outgoing.cancel(io) catch {};
         var incoming = try io.concurrent(receiveIncomingTxs, .{ host, io, reader });
-        defer incoming.cancel(io) catch |err| {
-            host.incoming_error = err;
-            host.log("incoming error: {s}", .{@errorName(err)});
-        };
+        defer incoming.cancel(io) catch {};
 
-        host.log("started", .{});
+        host.debugLog("started", .{});
         _ = try io.select(.{
             .read_queue = &read_queue,
             .outgoing = &outgoing,
             .incoming = &incoming,
         });
+
+        return .{
+            .read_tx_queue_result = read_queue.await(io),
+            .outgoing_result = outgoing.await(io),
+            .incoming_result = incoming.await(io),
+        };
     }
 
-    fn readQueue(host: *Host, io: Io, tx_queue: *TxQueue) !void {
-        defer tx_queue.close(io);
+    pub const ReadTxQueueError = Io.QueueClosedError || AddOutgoingTxError;
+
+    fn readTxQueue(host: *Host, io: Io, tx_queue: *TxQueue) ReadTxQueueError!void {
         while (true) {
             const data = try tx_queue.getOne(io);
             try host.addOutgoingTx(io, data, .new);
         }
     }
 
-    pub const OutgoingError = Io.Writer.Error || Io.Cancelable || w.WaitForSingleObjectError;
+    pub const OutgoingError = Io.Writer.Error || Io.Cancelable || Database.SendFileError;
 
     fn sendOutgoingTxs(host: *Host, io: Io, writer: *Io.Writer) OutgoingError!void {
         errdefer {
             if (@errorReturnTrace()) |trace| {
-                host.log("{f}", .{std.debug.FormatStackTrace{ .stack_trace = trace.* }});
+                host.debugLog("{f}", .{std.debug.FormatStackTrace{ .stack_trace = trace.* }});
             }
         }
 
@@ -809,7 +1013,7 @@ pub const Host = struct {
                 try io.futexWait(u32, &host.outgoing_tx_count.raw, 0);
             }
 
-            const data, const tx_id, const peer_tx_id, const index = blk: {
+            const data, const tx_id, const peer_tx_id = blk: {
                 try host.mutex.lock(io);
                 defer host.mutex.unlock(io);
 
@@ -819,12 +1023,10 @@ pub const Host = struct {
                         txs.items(.data)[index],
                         host.tx_id_index_map.keys()[index],
                         txs.items(.peer_tx_id)[index],
-                        index,
                     };
                 }
                 unreachable;
             };
-            host.log("send tx {}@{}", .{ @intFromEnum(tx_id), index });
 
             switch (data) {
                 .send_file => |*send_file| try host.outgoingSendFile(
@@ -855,6 +1057,8 @@ pub const Host = struct {
     ) !void {
         const next_state: Transaction.Data.SendFile.State = blk: switch (send_file.state) {
             .send_metadata => {
+                host.logMessage(.outgoing, tx_id, .transfer_file_metadata, peer_tx_id);
+
                 const file_size = std.math.cast(network.FileSize, send_file.size) orelse
                     std.debug.panic(
                         "TODO: File too large to transfer: '{f}' with size {}",
@@ -862,8 +1066,8 @@ pub const Host = struct {
                     );
                 try network.sendTransactionId(writer, peer_tx_id);
                 try network.sendTransactionId(writer, tx_id);
-                try network.sendAction(writer, host.logAction(.transfer_file_metadata));
-                try network.sendTransferFileMetadata(
+                try network.sendAction(writer, .transfer_file_metadata);
+                try network.sendFileMetadata(
                     writer,
                     switch (cpu_endian) {
                         .big => @compileError("TODO big endian"),
@@ -877,59 +1081,22 @@ pub const Host = struct {
                 break :blk .receive_decision;
             },
             .send_file_contents => {
+                host.logMessage(.outgoing, tx_id, .transfer_file_contents, peer_tx_id);
+
                 // TODO: Probably a good idea to make Database act as a middleman for opening files
-                // TODO: Detect if the file contents have changed while sending it
-                const handle = try openFile(host.db.sync_dir, send_file.path);
+                const handle = try openFile(host.db.sync_dir, send_file.path, .reading);
                 defer w.CloseHandle(handle);
                 try network.sendTransactionId(writer, peer_tx_id);
                 try network.sendTransactionId(writer, tx_id);
-                try network.sendAction(writer, host.logAction(.transfer_file_contents));
-
-                var iosb: w.IO_STATUS_BLOCK = undefined;
-                var written: w.LARGE_INTEGER = 0;
-                while (written < send_file.size) {
-                    const buffer = buffer: {
-                        const slice = try writer.writableSliceGreedy(1);
-                        break :buffer slice[0..@min(slice.len, std.math.maxInt(w.ULONG))];
-                    };
-                    const status = w.ntdll.NtReadFile(
-                        handle,
-                        null,
-                        null,
-                        null,
-                        &iosb,
-                        buffer.ptr,
-                        @intCast(buffer.len),
-                        &written,
-                        null,
-                    );
-                    sw: switch (status) {
-                        .SUCCESS => {
-                            writer.advance(iosb.Information);
-                            written += @intCast(iosb.Information);
-                        },
-                        .PENDING => {
-                            try w.WaitForSingleObject(handle, w.INFINITE);
-                            continue :sw iosb.u.Status;
-                        },
-                        else => return w.unexpectedStatus(status),
-                    }
-                }
-                assert(written == send_file.size);
+                try network.sendAction(writer, .transfer_file_contents);
+                try host.db.sendFile(handle, send_file, writer);
                 try writer.flush();
                 break :blk .receive_result;
             },
             .receive_decision, .receive_result => unreachable,
         };
 
-        try host.mutex.lock(io);
-        defer host.mutex.unlock(io);
-
-        const index = host.tx_id_index_map.getIndex(tx_id).?;
-        const txs = host.txs.slice();
-        txs.items(.data)[index].send_file.state = next_state;
-        txs.items(.direction)[index] = .incoming;
-        _ = host.outgoing_tx_count.fetchSub(1, .seq_cst);
+        try host.flipTransaction(.incoming, tx_id, .send_file, next_state, null, io);
     }
 
     fn outgoingReceiveFile(
@@ -942,38 +1109,34 @@ pub const Host = struct {
     ) !void {
         switch (receive_file.state) {
             .send_decision => |send_decision| {
+                const actual_tx_id: network.TransactionId, const action: network.Action = switch (send_decision) {
+                    .accept => .{ tx_id, .transfer_file_accept },
+                    .decline => .{ .new, .transfer_file_decline },
+                };
+                host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+
                 try network.sendTransactionId(writer, peer_tx_id);
-                try network.sendTransactionId(writer, switch (send_decision) {
-                    .accept => tx_id,
-                    .decline => .new,
-                });
-                try network.sendAction(writer, host.logAction(switch (send_decision) {
-                    .accept => .transfer_file_accept,
-                    .decline => .transfer_file_decline,
-                }));
+                try network.sendTransactionId(writer, actual_tx_id);
+                try network.sendAction(writer, action);
                 try writer.flush();
 
                 switch (send_decision) {
                     .accept => {
-                        try host.mutex.lock(io);
-                        defer host.mutex.unlock(io);
-
-                        const index = host.tx_id_index_map.getIndex(tx_id).?;
-                        const txs = host.txs.slice();
-                        txs.items(.data)[index].receive_file.state = .receive_file_contents;
-                        txs.items(.direction)[index] = .incoming;
-                        _ = host.outgoing_tx_count.fetchSub(1, .seq_cst);
+                        try host.flipTransaction(.incoming, tx_id, .receive_file, .receive_file_contents, null, io);
                     },
                     .decline => try host.deleteTransaction(io, tx_id, .outgoing),
                 }
             },
-            .send_result => {
+            .send_result => |send_result| {
+                const action: network.Action = switch (send_result) { // TODO
+                    .success => .transfer_file_success,
+                    .failure => .transfer_file_failure,
+                };
+                host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+
                 try network.sendTransactionId(writer, peer_tx_id);
                 try network.sendTransactionId(writer, tx_id);
-                try network.sendAction(writer, host.logAction(switch (@intFromEnum(tx_id) % 2 == 0) {
-                    true => .transfer_file_success,
-                    false => .transfer_file_failure,
-                }));
+                try network.sendAction(writer, action);
                 try writer.flush();
 
                 try host.deleteTransaction(io, tx_id, .outgoing);
@@ -988,12 +1151,12 @@ pub const Host = struct {
         WrongTxId,
         WrongPeerTxId,
         InvalidAction,
-    } || Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddOutgoingTxError;
+    } || Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddOutgoingTxError || Database.ReceiveFileError;
 
     fn receiveIncomingTxs(host: *Host, io: Io, reader: *Io.Reader) IncomingError!void {
         errdefer {
             if (@errorReturnTrace()) |trace| {
-                host.log("{f}", .{std.debug.FormatStackTrace{ .stack_trace = trace.* }});
+                host.debugLog("{f}", .{std.debug.FormatStackTrace{ .stack_trace = trace.* }});
             }
         }
 
@@ -1001,7 +1164,7 @@ pub const Host = struct {
             const tx_id = try network.receiveTransactionId(reader) orelse break;
             const peer_tx_id = try network.receiveTransactionId(reader) orelse return error.InvalidPeerTxId;
             const action = try network.receiveAction(reader);
-            host.log("incoming action {}", .{action});
+            host.logMessage(.incoming, tx_id, action, peer_tx_id);
 
             switch (action) {
                 .transfer_file_metadata => {
@@ -1025,7 +1188,6 @@ pub const Host = struct {
                 const expected_peer_tx_id = txs.items(.peer_tx_id)[index];
                 if (expected_peer_tx_id != .new and expected_peer_tx_id != peer_tx_id) return error.WrongPeerTxId;
 
-                host.log("receive tx {}@{} peer tx {}", .{ @intFromEnum(tx_id), index, @intFromEnum(peer_tx_id) });
                 break :blk txs.items(.data)[index];
             };
 
@@ -1054,13 +1216,20 @@ pub const Host = struct {
         io: Io,
         reader: *Io.Reader,
     ) !void {
-        var file_path_buffer: [256]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&file_path_buffer);
-        const metadata = try network.receiveTransferFileMetadata(reader, fba.allocator());
+        var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
+        const metadata = try network.receiveFileMetadata(reader, &file_path_buffer);
+        const file_path, const comparison = try host.db.checkMetadata(&metadata, &file_path_buffer, io);
+
+        const decision: Transaction.Data.ReceiveFile.State.SendDecision =
+            switch (comparison) {
+                .equals => .decline,
+                .differs => .accept,
+            };
+
         const data: Transaction.Data = .{
             .receive_file = .{
-                .state = .{ .send_decision = .accept }, // TODO
-                .path = .wtf16Cast(&.{}), // TODO
+                .state = .{ .send_decision = decision },
+                .path = file_path,
                 .size = @as(w.LARGE_INTEGER, @intCast(metadata.file_size)),
                 .hash = metadata.hash,
             },
@@ -1079,15 +1248,7 @@ pub const Host = struct {
         switch (send_file.state) {
             .receive_decision => switch (action) {
                 .transfer_file_accept => {
-                    try host.mutex.lock(io);
-                    defer host.mutex.unlock(io);
-
-                    const index = host.tx_id_index_map.getIndex(tx_id).?;
-                    const txs = host.txs.slice();
-                    txs.items(.data)[index].send_file.state = .send_file_contents;
-                    txs.items(.peer_tx_id)[index] = peer_tx_id;
-                    txs.items(.direction)[index] = .outgoing;
-                    host.incrementOutgoingTxCount(io);
+                    try host.flipTransaction(.outgoing, tx_id, .send_file, .send_file_contents, peer_tx_id, io);
                 },
                 .transfer_file_decline => try host.deleteTransaction(io, tx_id, .incoming),
                 else => return error.InvalidAction,
@@ -1113,17 +1274,9 @@ pub const Host = struct {
         switch (receive_file.state) {
             .receive_file_contents => switch (action) {
                 .transfer_file_contents => {
-                    // TODO: Check the hash
-                    try reader.discardAll(@intCast(receive_file.size));
+                    try host.db.receiveFile(receive_file, reader, io);
 
-                    try host.mutex.lock(io);
-                    defer host.mutex.unlock(io);
-
-                    const index = host.tx_id_index_map.getIndex(tx_id).?;
-                    const txs = host.txs.slice();
-                    txs.items(.data)[index].receive_file.state = .send_result;
-                    txs.items(.direction)[index] = .outgoing;
-                    host.incrementOutgoingTxCount(io);
+                    try host.flipTransaction(.outgoing, tx_id, .receive_file, .{ .send_result = .success }, null, io);
                 },
                 else => return error.InvalidAction,
             },

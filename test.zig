@@ -55,20 +55,26 @@ fn runCli(io: Io, db: *wave.windows.Database, tx_queue: *wave.windows.Host.TxQue
         if (line.len != 1) continue;
         switch (line[0]) {
             'a' => {
+                try db.mutex.lock(io);
+                defer db.mutex.unlock(io);
                 try db.debug.printKnownFiles(&stdout.interface);
                 try stdout.interface.flush();
             },
             'n' => {
+                try db.mutex.lock(io);
+                defer db.mutex.unlock(io);
                 try db.debug.printFilesNeedingSync(&stdout.interface);
                 try stdout.interface.flush();
             },
             's' => {
-                try wave.windows.completeScan(db, allocator);
+                try wave.windows.completeScan(db, io, allocator);
                 try stdout.interface.writeAll("scan complete\n");
                 try stdout.interface.flush();
             },
             '0'...'9' => |c| {
                 const index = c - '0';
+                try db.mutex.lock(io);
+                defer db.mutex.unlock(io);
                 try db.debug.hostTransferFile(index, io, tx_queue);
             },
             'q' => break,
@@ -127,7 +133,7 @@ fn startHostPair(
     var host = wave.windows.Host.init(db, allocator, .{ .name = "A" });
     defer host.deinit();
     std.debug.print("connected\n", .{});
-    try host.run(io, tx_queue, &reader.interface, &writer.interface);
+    _ = try host.run(io, tx_queue, &reader.interface, &writer.interface);
 }
 
 fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16Z, sync_dir_wtf8: []const u8) !void {
@@ -151,5 +157,5 @@ fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16Z, sync
 
     var host = wave.windows.Host.init(&db, allocator, .{ .name = "B" });
     defer host.deinit();
-    try host.run(io, &tx_queue, &reader.interface, &writer.interface);
+    _ = try host.run(io, &tx_queue, &reader.interface, &writer.interface);
 }

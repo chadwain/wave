@@ -10,6 +10,14 @@ pub const TransactionId = enum(u32) {
     new = 0xfffffffe,
     disconnect = 0xffffffff,
     _,
+
+    pub fn format(tx_id: TransactionId, writer: *Io.Writer) Io.Writer.Error!void {
+        if (std.enums.tagName(TransactionId, tx_id)) |name| {
+            try writer.writeAll(name);
+        } else {
+            try writer.print("{}", .{@intFromEnum(tx_id)});
+        }
+    }
 };
 
 pub const Action = enum(u8) {
@@ -39,6 +47,8 @@ pub const PathEncoding = enum(u8) {
 
 pub const PathLenInBytes = u16;
 
+pub const FilePathBuffer = [1 << @bitSizeOf(PathLenInBytes)]u8;
+
 /// Asserts a writer buffer size of at least `@sizeOf(TransactionId)`.
 pub fn sendTransactionId(writer: *Io.Writer, id: TransactionId) !void {
     try writer.writeInt(std.meta.Tag(TransactionId), @intFromEnum(id), endian);
@@ -50,7 +60,7 @@ pub fn sendAction(writer: *Io.Writer, action: Action) !void {
 }
 
 /// Asserts a writer buffer size of at least `@sizeOf(FileSize)`.
-pub fn sendTransferFileMetadata(
+pub fn sendFileMetadata(
     writer: *Io.Writer,
     path_encoding: PathEncoding,
     path: []const u8, // TODO: Make a Path struct
@@ -79,13 +89,15 @@ pub fn receiveAction(reader: *Io.Reader) !Action {
     return @enumFromInt(try reader.takeByte());
 }
 
-/// Asserts a reader buffer size of at least `FileHash.byte_size`.
-pub fn receiveTransferFileMetadata(reader: *Io.Reader, allocator: Allocator) !struct {
+pub const IncomingFileMetadata = struct {
     path_encoding: PathEncoding,
-    path: []const u8,
+    path_len_bytes: PathLenInBytes,
     file_size: FileSize,
     hash: FileHash,
-} {
+};
+
+/// Asserts a reader buffer size of at least `FileHash.byte_size`.
+pub fn receiveFileMetadata(reader: *Io.Reader, file_path_buffer: *FilePathBuffer) !IncomingFileMetadata {
     const path_encoding: PathEncoding = @enumFromInt(try reader.takeByte());
     const path_len_bytes = try reader.takeInt(PathLenInBytes, endian);
     const file_size = try reader.takeInt(FileSize, endian);
@@ -93,16 +105,13 @@ pub fn receiveTransferFileMetadata(reader: *Io.Reader, allocator: Allocator) !st
     const hash_bytes = try reader.takeArray(FileHash.byte_size);
     const hash: FileHash = .{ .blake3 = hash_bytes.* };
 
-    var dest: Io.Writer.Allocating = try .initCapacity(allocator, path_len_bytes);
-    defer dest.deinit();
-    try reader.streamExact(&dest.writer, path_len_bytes);
-    const path = try dest.toOwnedSlice();
-    errdefer comptime unreachable;
+    var file_path_writer: Io.Writer = .fixed(file_path_buffer);
+    try reader.streamExact(&file_path_writer, path_len_bytes);
 
     return .{
         .path_encoding = path_encoding,
+        .path_len_bytes = path_len_bytes,
         .file_size = file_size,
         .hash = hash,
-        .path = path,
     };
 }
