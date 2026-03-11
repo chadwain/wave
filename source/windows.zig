@@ -18,10 +18,6 @@ pub const Wtf16 = struct {
         return .{ .slice = slice };
     }
 
-    pub fn byteLen(self: Wtf16) usize {
-        return self.slice.len * @sizeOf(w.WCHAR);
-    }
-
     pub fn dupe(self: Wtf16, allocator: Allocator) !Wtf16 {
         return .{ .slice = try allocator.dupe(u16, self.slice) };
     }
@@ -168,7 +164,7 @@ pub const Database = struct {
         // TODO: normalize path
         const path: Wtf16 = switch (metadata.path_encoding) {
             .wtf16le => switch (cpu_endian) {
-                .little => .wtf16Cast(@ptrCast(file_path_buffer[0..metadata.path_len_bytes])),
+                .little => .wtf16Cast(@ptrCast(file_path_buffer[0..metadata.path_byte_count])),
                 .big => @compileError("TODO big endian"),
             },
         };
@@ -550,10 +546,10 @@ fn scanOneDirectory(db: *Database, allocator: Allocator, ctx: *FullScanContext) 
 /// Opens a directory capable of async operations and being waited on.
 fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     var handle: w.HANDLE = undefined;
-    const path_len_bytes: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
+    const path_byte_count: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
     var unicode_string: w.UNICODE_STRING = .{
-        .Length = path_len_bytes,
-        .MaximumLength = path_len_bytes,
+        .Length = path_byte_count,
+        .MaximumLength = path_byte_count,
         .Buffer = @constCast(path.slice.ptr),
     };
     const object_attributes: w.OBJECT_ATTRIBUTES = .{
@@ -607,11 +603,13 @@ fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
 }
 
 fn openFile(parent: ?w.HANDLE, path: Wtf16, purpose: enum { reading, creating }) !w.HANDLE {
+    errdefer wave.log.err("Failed to open file: {f}\n", .{path.formatUtf8()});
+
     var handle: w.HANDLE = undefined;
-    const path_len_bytes: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
+    const path_byte_count: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
     var unicode_string: w.UNICODE_STRING = .{
-        .Length = path_len_bytes,
-        .MaximumLength = path_len_bytes,
+        .Length = path_byte_count,
+        .MaximumLength = path_byte_count,
         .Buffer = @constCast(path.slice.ptr),
     };
     const object_attributes: w.OBJECT_ATTRIBUTES = .{
@@ -1151,7 +1149,8 @@ pub const Host = struct {
         WrongTxId,
         WrongPeerTxId,
         InvalidAction,
-    } || Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddOutgoingTxError || Database.ReceiveFileError;
+    } || wave.network.ReceiveActionError || wave.network.ReceiveFileMetadataError ||
+        Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddOutgoingTxError || Database.ReceiveFileError;
 
     fn receiveIncomingTxs(host: *Host, io: Io, reader: *Io.Reader) IncomingError!void {
         errdefer {

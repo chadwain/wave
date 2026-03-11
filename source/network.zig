@@ -45,9 +45,9 @@ pub const PathEncoding = enum(u8) {
     wtf16le,
 };
 
-pub const PathLenInBytes = u16;
+pub const PathByteCount = u16;
 
-pub const FilePathBuffer = [1 << @bitSizeOf(PathLenInBytes)]u8;
+pub const FilePathBuffer = [1 << @bitSizeOf(PathByteCount)]u8;
 
 /// Asserts a writer buffer size of at least `@sizeOf(TransactionId)`.
 pub fn sendTransactionId(writer: *Io.Writer, id: TransactionId) !void {
@@ -60,6 +60,7 @@ pub fn sendAction(writer: *Io.Writer, action: Action) !void {
 }
 
 /// Asserts a writer buffer size of at least `@sizeOf(FileSize)`.
+/// Asserts that `path.len` can fit into a `PathByteCount`.
 pub fn sendFileMetadata(
     writer: *Io.Writer,
     path_encoding: PathEncoding,
@@ -68,7 +69,7 @@ pub fn sendFileMetadata(
     hash: *const FileHash,
 ) !void {
     try writer.writeByte(@intFromEnum(path_encoding));
-    try writer.writeInt(PathLenInBytes, @intCast(path.len), endian);
+    try writer.writeInt(PathByteCount, @intCast(path.len), endian);
     try writer.writeInt(FileSize, file_size, endian);
     try writer.writeAll(&hash.blake3);
     try writer.writeAll(path);
@@ -76,7 +77,7 @@ pub fn sendFileMetadata(
 
 /// Asserts a reader buffer size of at least `@sizeOf(TransactionId)`.
 /// `null` means disconnect.
-pub fn receiveTransactionId(reader: *Io.Reader) !?TransactionId {
+pub fn receiveTransactionId(reader: *Io.Reader) Io.Reader.Error!?TransactionId {
     const id: TransactionId = @enumFromInt(try reader.takeInt(std.meta.Tag(TransactionId), endian));
     switch (id) {
         .disconnect => return null,
@@ -84,33 +85,41 @@ pub fn receiveTransactionId(reader: *Io.Reader) !?TransactionId {
     }
 }
 
+pub const ReceiveActionError = error{UnknownAction} || Io.Reader.Error;
+
 /// Asserts a reader buffer size of at least 1.
-pub fn receiveAction(reader: *Io.Reader) !Action {
-    return @enumFromInt(try reader.takeByte());
+pub fn receiveAction(reader: *Io.Reader) ReceiveActionError!Action {
+    return std.enums.fromInt(Action, try reader.takeByte()) orelse error.UnknownAction;
 }
 
 pub const IncomingFileMetadata = struct {
     path_encoding: PathEncoding,
-    path_len_bytes: PathLenInBytes,
+    path_byte_count: PathByteCount,
     file_size: FileSize,
     hash: FileHash,
 };
 
+pub const ReceiveFileMetadataError = error{UnknownPathEncoding} || Io.Reader.StreamError;
+
 /// Asserts a reader buffer size of at least `FileHash.byte_size`.
-pub fn receiveFileMetadata(reader: *Io.Reader, file_path_buffer: *FilePathBuffer) !IncomingFileMetadata {
-    const path_encoding: PathEncoding = @enumFromInt(try reader.takeByte());
-    const path_len_bytes = try reader.takeInt(PathLenInBytes, endian);
+pub fn receiveFileMetadata(
+    reader: *Io.Reader,
+    file_path_buffer: *FilePathBuffer,
+) ReceiveFileMetadataError!IncomingFileMetadata {
+    const path_encoding = std.enums.fromInt(PathEncoding, try reader.takeByte()) orelse
+        return error.UnknownPathEncoding;
+    const path_byte_count = try reader.takeInt(PathByteCount, endian);
     const file_size = try reader.takeInt(FileSize, endian);
 
     const hash_bytes = try reader.takeArray(FileHash.byte_size);
     const hash: FileHash = .{ .blake3 = hash_bytes.* };
 
     var file_path_writer: Io.Writer = .fixed(file_path_buffer);
-    try reader.streamExact(&file_path_writer, path_len_bytes);
+    try reader.streamExact(&file_path_writer, path_byte_count);
 
     return .{
         .path_encoding = path_encoding,
-        .path_len_bytes = path_len_bytes,
+        .path_byte_count = path_byte_count,
         .file_size = file_size,
         .hash = hash,
     };
