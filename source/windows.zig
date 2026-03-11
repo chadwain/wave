@@ -184,91 +184,38 @@ pub const Database = struct {
         }
     }
 
-    pub const SendFileError = w.WaitForSingleObjectError;
-
-    fn sendFile(
-        _: *const Database,
-        handle: w.HANDLE,
-        send_file: *const Host.Transaction.Data.SendFile,
-        writer: *Io.Writer,
-    ) !void {
-        var iosb: w.IO_STATUS_BLOCK = undefined;
-        var written: w.LARGE_INTEGER = 0;
-        while (written < send_file.size) {
-            const buffer = buffer: {
-                const slice = try writer.writableSliceGreedy(1);
-                break :buffer slice[0..@min(slice.len, std.math.maxInt(w.ULONG))];
-            };
-            const status = w.ntdll.NtReadFile(
-                handle,
-                null,
-                null,
-                null,
-                &iosb,
-                buffer.ptr,
-                @intCast(buffer.len),
-                &written,
-                null,
-            );
-            sw: switch (status) {
-                .SUCCESS => {
-                    writer.advance(iosb.Information);
-                    written += @intCast(iosb.Information);
-                },
-                .PENDING => {
-                    try w.WaitForSingleObject(handle, w.INFINITE);
-                    continue :sw iosb.u.Status;
-                },
-                else => return w.unexpectedStatus(status),
-            }
-        }
-        assert(written == send_file.size);
+    fn openFileReadOnly(db: *const Database, io: Io, path: Wtf16) !w.HANDLE {
+        // try db.mutex.lock(io);
+        // defer db.mutex.unlock(io);
+        _ = .{ db, io };
+        return openFile(db.sync_dir, path, .read);
     }
 
-    pub const ReceiveFileError = w.WaitForSingleObjectError;
+    fn createFile(db: *const Database, io: Io, path: Wtf16, file_size: w.LARGE_INTEGER) !w.HANDLE {
+        // try db.mutex.lock(io);
+        // defer db.mutex.unlock(io);
+        _ = .{ db, io };
+        return openFile(
+            db.sync_dir,
+            path,
+            .{ .create = .{ .initial_size = file_size } },
+        );
+    }
 
-    fn receiveFile(
+    fn closeFile(_: *const Database, file: w.HANDLE) void {
+        w.CloseHandle(file);
+    }
+
+    fn updateReceivedFile(
         db: *Database,
-        receive_file: *const Host.Transaction.Data.ReceiveFile,
-        reader: *Io.Reader,
         io: Io,
+        handle: w.HANDLE,
+        path: Wtf16,
+        hash: *const network.FileHash,
+        file_size: w.LARGE_INTEGER,
     ) !void {
-        const handle = try openFile(db.sync_dir, receive_file.path, .creating);
-        defer w.CloseHandle(handle);
-
-        var read: w.LARGE_INTEGER = 0;
-        var iosb: w.IO_STATUS_BLOCK = undefined;
-        while (read < receive_file.size) {
-            const buffer = buffer: {
-                const slice = try reader.peekGreedy(1);
-                break :buffer slice[0..@min(slice.len, std.math.maxInt(w.ULONG))];
-            };
-            const status = w.ntdll.NtWriteFile(
-                handle,
-                null,
-                null,
-                null,
-                &iosb,
-                buffer.ptr,
-                @intCast(buffer.len),
-                &read,
-                null,
-            );
-            sw: switch (status) {
-                .SUCCESS => {
-                    reader.toss(iosb.Information);
-                    read += @intCast(iosb.Information);
-                },
-                .PENDING => {
-                    try w.WaitForSingleObject(handle, w.INFINITE);
-                    continue :sw iosb.u.Status;
-                },
-                else => return w.unexpectedStatus(status),
-            }
-        }
-        assert(read == receive_file.size);
-
         const information = blk: {
+            var iosb: w.IO_STATUS_BLOCK = undefined;
             var information: w.FILE.BASIC_INFORMATION = undefined;
             const status = w.ntdll.NtQueryInformationFile(
                 handle,
@@ -277,12 +224,8 @@ pub const Database = struct {
                 @sizeOf(@TypeOf(information)),
                 .Basic,
             );
-            sw: switch (status) {
+            switch (status) {
                 .SUCCESS => break :blk information,
-                .PENDING => {
-                    try w.WaitForSingleObject(handle, w.INFINITE);
-                    continue :sw iosb.u.Status;
-                },
                 else => return w.unexpectedStatus(status),
             }
         };
@@ -290,10 +233,10 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        try db.all_known_files.putNoClobber(db.allocator, receive_file.path, .{
-            .hash = receive_file.hash,
+        try db.all_known_files.put(db.allocator, path, .{
+            .hash = hash.*,
             .modified_time = information.ChangeTime,
-            .size = receive_file.size,
+            .size = file_size,
         });
     }
 
@@ -434,7 +377,7 @@ const FullScanContext = struct {
             try ctx.sub_path.appendSlice(allocator, name.slice);
 
             const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
-            const file = try openFile(dir, name, .reading);
+            const file = try openFile(dir, name, .read);
             defer w.CloseHandle(file);
             const hash = try computeFileHash(file, information.EndOfFile);
 
@@ -602,7 +545,14 @@ fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     }
 }
 
-fn openFile(parent: ?w.HANDLE, path: Wtf16, purpose: enum { reading, creating }) !w.HANDLE {
+const OpenFileOptions = union(enum) {
+    read,
+    create: struct {
+        initial_size: w.LARGE_INTEGER,
+    },
+};
+
+fn openFile(parent: ?w.HANDLE, path: Wtf16, options: OpenFileOptions) !w.HANDLE {
     errdefer wave.log.err("Failed to open file: {f}\n", .{path.formatUtf8()});
 
     var handle: w.HANDLE = undefined;
@@ -623,37 +573,129 @@ fn openFile(parent: ?w.HANDLE, path: Wtf16, purpose: enum { reading, creating })
         .SecurityQualityOfService = null,
     };
     var iosb: w.IO_STATUS_BLOCK = undefined;
-    const status = w.ntdll.NtCreateFile(
-        &handle,
-        .{
-            .GENERIC = switch (purpose) {
-                .reading => .{ .READ = true },
-                .creating => .{ .READ = true, .WRITE = true },
+
+    const status = switch (options) {
+        .read => w.ntdll.NtOpenFile(
+            &handle,
+            .{
+                .STANDARD = .{ .SYNCHRONIZE = true },
+                .GENERIC = .{ .READ = true },
             },
-        },
-        &object_attributes,
-        &iosb,
-        null,
-        .{ .NORMAL = true },
-        .{
-            .READ = true,
-            .WRITE = true,
-            .DELETE = true,
-        },
-        switch (purpose) {
-            .reading => .OPEN,
-            .creating => .OVERWRITE_IF,
-        },
-        .{},
-        null,
-        0,
-    );
-    // TODO: Do I need to wait?
+            &object_attributes,
+            &iosb,
+            .{ .READ = true },
+            .{
+                .NON_DIRECTORY_FILE = true,
+                .IO = .SYNCHRONOUS_NONALERT,
+            },
+        ),
+        .create => |*create| w.ntdll.NtCreateFile(
+            &handle,
+            .{
+                .STANDARD = .{ .SYNCHRONIZE = true },
+                .GENERIC = .{ .READ = true, .WRITE = true },
+            },
+            &object_attributes,
+            &iosb,
+            &create.initial_size,
+            .{ .NORMAL = true },
+            .{},
+            .OVERWRITE_IF,
+            .{
+                .NON_DIRECTORY_FILE = true,
+                .IO = .SYNCHRONOUS_NONALERT,
+            },
+            null,
+            0,
+        ),
+    };
 
     switch (status) {
         .SUCCESS => return handle,
         else => return w.unexpectedStatus(status),
     }
+}
+
+const SendFileError = Io.Writer.Error || Io.UnexpectedError;
+
+fn sendFile(
+    writer: *Io.Writer,
+    handle: w.HANDLE,
+    file_size: w.LARGE_INTEGER,
+) SendFileError!void {
+    // TODO: Actually use sendfile or whatever it is on Windows
+    var iosb: w.IO_STATUS_BLOCK = undefined;
+    var written: w.LARGE_INTEGER = 0;
+    while (written < file_size) {
+        const buffer = buffer: {
+            const slice = try writer.writableSliceGreedy(1);
+            break :buffer slice[0..@min(
+                slice.len,
+                @as(w.ULARGE_INTEGER, @intCast(file_size - written)),
+                std.math.maxInt(w.ULONG),
+            )];
+        };
+        const status = w.ntdll.NtReadFile(
+            handle,
+            null,
+            null,
+            null,
+            &iosb,
+            buffer.ptr,
+            @intCast(buffer.len),
+            &written,
+            null,
+        );
+        switch (status) {
+            .SUCCESS => {
+                writer.advance(iosb.Information);
+                written += @intCast(iosb.Information);
+            },
+            else => return w.unexpectedStatus(status),
+        }
+    }
+    if (written != file_size) return error.Unexpected;
+}
+
+const ReceiveFileError = Io.Reader.Error || Io.UnexpectedError;
+
+fn receiveFile(
+    reader: *Io.Reader,
+    handle: w.HANDLE,
+    file_size: w.LARGE_INTEGER,
+) ReceiveFileError!void {
+    // TODO: Actually use sendfile or whatever it is on Windows
+    var read: w.LARGE_INTEGER = 0;
+    var iosb: w.IO_STATUS_BLOCK = undefined;
+    while (read < file_size) {
+        const buffer = buffer: {
+            const slice = try reader.peekGreedy(1);
+            break :buffer slice[0..@min(
+                slice.len,
+                @as(w.ULARGE_INTEGER, @intCast(file_size - read)),
+                std.math.maxInt(w.ULONG),
+            )];
+        };
+        const status = w.ntdll.NtWriteFile(
+            handle,
+            null,
+            null,
+            null,
+            &iosb,
+            buffer.ptr,
+            @intCast(buffer.len),
+            &read,
+            null,
+        );
+        switch (status) {
+            .SUCCESS => {
+                reader.toss(iosb.Information);
+                read += @intCast(iosb.Information);
+            },
+            else => return w.unexpectedStatus(status),
+        }
+    }
+    if (read != file_size) return error.Unexpected;
 }
 
 fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash {
@@ -664,14 +706,10 @@ fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash
 
     while (written < file_size) {
         const status = w.ntdll.NtReadFile(file, null, null, null, &iosb, &buffer, buffer.len, &written, null);
-        sw: switch (status) {
+        switch (status) {
             .SUCCESS => {
                 hash.update((&buffer)[0..iosb.Information]);
                 written += @intCast(iosb.Information);
-            },
-            .PENDING => {
-                try w.WaitForSingleObject(file, w.INFINITE);
-                continue :sw iosb.u.Status;
             },
             else => return w.unexpectedStatus(status),
         }
@@ -996,7 +1034,7 @@ pub const Host = struct {
         }
     }
 
-    pub const OutgoingError = Io.Writer.Error || Io.Cancelable || Database.SendFileError;
+    pub const OutgoingError = Io.Writer.Error || Io.Cancelable || SendFileError;
 
     fn sendOutgoingTxs(host: *Host, io: Io, writer: *Io.Writer) OutgoingError!void {
         errdefer {
@@ -1081,13 +1119,13 @@ pub const Host = struct {
             .send_file_contents => {
                 host.logMessage(.outgoing, tx_id, .transfer_file_contents, peer_tx_id);
 
-                // TODO: Probably a good idea to make Database act as a middleman for opening files
-                const handle = try openFile(host.db.sync_dir, send_file.path, .reading);
-                defer w.CloseHandle(handle);
+                const handle = try host.db.openFileReadOnly(io, send_file.path);
+                defer host.db.closeFile(handle);
+
                 try network.sendTransactionId(writer, peer_tx_id);
                 try network.sendTransactionId(writer, tx_id);
                 try network.sendAction(writer, .transfer_file_contents);
-                try host.db.sendFile(handle, send_file, writer);
+                try sendFile(writer, handle, send_file.size);
                 try writer.flush();
                 break :blk .receive_result;
             },
@@ -1150,7 +1188,7 @@ pub const Host = struct {
         WrongPeerTxId,
         InvalidAction,
     } || wave.network.ReceiveActionError || wave.network.ReceiveFileMetadataError ||
-        Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddOutgoingTxError || Database.ReceiveFileError;
+        Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddOutgoingTxError || ReceiveFileError;
 
     fn receiveIncomingTxs(host: *Host, io: Io, reader: *Io.Reader) IncomingError!void {
         errdefer {
@@ -1273,7 +1311,16 @@ pub const Host = struct {
         switch (receive_file.state) {
             .receive_file_contents => switch (action) {
                 .transfer_file_contents => {
-                    try host.db.receiveFile(receive_file, reader, io);
+                    const handle = try host.db.createFile(io, receive_file.path, receive_file.size);
+                    defer host.db.closeFile(handle);
+                    try receiveFile(reader, handle, receive_file.size);
+                    try host.db.updateReceivedFile(
+                        io,
+                        handle,
+                        receive_file.path,
+                        &receive_file.hash,
+                        receive_file.size,
+                    );
 
                     try host.flipTransaction(.outgoing, tx_id, .receive_file, .{ .send_result = .success }, null, io);
                 },

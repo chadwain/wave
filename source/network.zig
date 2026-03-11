@@ -114,6 +114,7 @@ pub fn receiveFileMetadata(
     const hash_bytes = try reader.takeArray(FileHash.byte_size);
     const hash: FileHash = .{ .blake3 = hash_bytes.* };
 
+    // TODO: Do path encoding verification here
     var file_path_writer: Io.Writer = .fixed(file_path_buffer);
     try reader.streamExact(&file_path_writer, path_byte_count);
 
