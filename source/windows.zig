@@ -793,14 +793,7 @@ fn processChanges(buffer_complete: []align(@alignOf(w.DWORD)) w.BYTE) void {
 }
 
 pub const Host = struct {
-    next_tx_id: ?std.meta.Tag(network.TransactionId),
-    /// Maps transaction IDs to indeces with `txs`.
-    tx_id_index_map: std.AutoArrayHashMapUnmanaged(network.TransactionId, void),
-    txs: std.MultiArrayList(Transaction),
-    outgoing_tx_count: std.atomic.Value(u32),
-    allocator: Allocator,
-    mutex: Io.Mutex,
-
+    tx: Transaction,
     db: *Database,
     debug: Debug,
 
@@ -809,11 +802,11 @@ pub const Host = struct {
     };
 
     pub const Transaction = struct {
-        direction: Direction,
+        direction: std.atomic.Value(Direction) align(4),
         data: Data,
         peer_tx_id: network.TransactionId,
 
-        pub const Direction = enum { outgoing, incoming };
+        pub const Direction = enum(u32) { not_in_use, init, outgoing, incoming };
 
         pub const Data = union(enum) {
             send_file: SendFile,
@@ -853,27 +846,23 @@ pub const Host = struct {
 
     pub const TxQueue = Io.Queue(Transaction.Data);
 
-    pub fn init(db: *Database, allocator: Allocator, debug: Debug) Host {
+    pub fn init(db: *Database, debug: Debug) Host {
         return .{
-            .next_tx_id = 0,
-            .tx_id_index_map = .empty,
-            .txs = .empty,
-            .outgoing_tx_count = .init(0),
-            .allocator = allocator,
-            .mutex = .init,
-
+            .tx = .{
+                .direction = .init(.not_in_use),
+                .data = undefined,
+                .peer_tx_id = undefined,
+            },
             .db = db,
             .debug = debug,
         };
     }
 
     pub fn deinit(host: *Host) void {
-        host.tx_id_index_map.deinit(host.allocator);
-        host.txs.deinit(host.allocator);
         host.* = undefined;
     }
 
-    const AddOutgoingTxError = error{NoMoreTransactions} || Allocator.Error || Io.Cancelable;
+    const AddOutgoingTxError = error{NoTxSlotsAvailable};
 
     fn addOutgoingTx(
         host: *Host,
@@ -881,30 +870,13 @@ pub const Host = struct {
         data: Transaction.Data,
         peer_tx_id: network.TransactionId,
     ) AddOutgoingTxError!void {
-        try host.mutex.lock(io);
-        defer host.mutex.unlock(io);
-
-        const next_tx_id = host.next_tx_id orelse return error.NoMoreTransactions;
-        host.next_tx_id = std.math.add(std.meta.Tag(network.TransactionId), next_tx_id, 1) catch null;
-        errdefer host.next_tx_id = next_tx_id;
-
-        const gop = try host.tx_id_index_map.getOrPut(host.allocator, @enumFromInt(next_tx_id));
-        assert(!gop.found_existing);
-        errdefer host.tx_id_index_map.orderedRemoveAt(gop.index);
-
-        try host.txs.insert(host.allocator, gop.index, .{
-            .direction = .outgoing,
-            .data = data,
-            .peer_tx_id = peer_tx_id,
-        });
-        errdefer comptime unreachable;
-
-        host.incrementOutgoingTxCount(io);
-    }
-
-    fn incrementOutgoingTxCount(host: *Host, io: Io) void {
-        const previous_send_count = host.outgoing_tx_count.fetchAdd(1, .seq_cst);
-        if (previous_send_count == 0) io.futexWake(u32, &host.outgoing_tx_count.raw, 1);
+        if (host.tx.direction.cmpxchgStrong(.not_in_use, .init, .acquire, .monotonic) != null) {
+            return error.NoTxSlotsAvailable;
+        }
+        host.tx.data = data;
+        host.tx.peer_tx_id = peer_tx_id;
+        host.tx.direction.store(.outgoing, .release);
+        io.futexWake(Transaction.Direction, &host.tx.direction.raw, 1);
     }
 
     fn flipTransaction(
@@ -916,48 +888,31 @@ pub const Host = struct {
         /// If non-null, the peer tx id will be replaced with this value.
         peer_tx_id: ?network.TransactionId,
         io: Io,
-    ) !void {
-        try host.mutex.lock(io);
-        defer host.mutex.unlock(io);
+    ) void {
+        assert(@intFromEnum(tx_id) == 0); // TODO
 
-        const index = host.tx_id_index_map.getIndex(tx_id).?;
-        const txs = host.txs.slice();
-        const data = &txs.items(.data)[index];
+        const data = &host.tx.data;
         @field(data, @tagName(tag)).state = new_state;
-        if (peer_tx_id) |id| txs.items(.peer_tx_id)[index] = id;
+        if (peer_tx_id) |id| host.tx.peer_tx_id = id;
 
-        const from = &txs.items(.direction)[index];
+        const from = &host.tx.direction;
         switch (to) {
+            .not_in_use, .init => unreachable,
             .outgoing => {
-                assert(from.* == .incoming);
-                from.* = .outgoing;
-                host.incrementOutgoingTxCount(io);
+                assert(from.swap(to, .release) == .incoming);
+                io.futexWake(Transaction.Direction, &from.raw, 1);
             },
             .incoming => {
-                assert(from.* == .outgoing);
-                from.* = .incoming;
-                _ = host.outgoing_tx_count.fetchSub(1, .seq_cst);
+                assert(from.swap(to, .release) == .outgoing);
             },
         }
     }
 
-    fn deleteTransaction(
-        host: *Host,
-        io: Io,
-        tx_id: network.TransactionId,
-        expected_direction: Transaction.Direction,
-    ) !void {
-        try host.mutex.lock(io);
-        defer host.mutex.unlock(io);
-
-        const index = host.tx_id_index_map.getIndex(tx_id).?;
-        assert(host.txs.items(.direction)[index] == expected_direction);
-        host.tx_id_index_map.orderedRemoveAt(index);
-        host.txs.orderedRemove(index);
-
-        if (expected_direction == .outgoing) {
-            _ = host.outgoing_tx_count.fetchSub(1, .seq_cst);
-        }
+    fn deleteTransaction(host: *Host, tx_id: network.TransactionId, expected_direction: Transaction.Direction) void {
+        assert(@intFromEnum(tx_id) == 0); // TODO
+        host.tx.data = undefined;
+        host.tx.peer_tx_id = undefined;
+        assert(host.tx.direction.swap(.not_in_use, .release) == expected_direction);
     }
 
     fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {
@@ -976,6 +931,7 @@ pub const Host = struct {
         peer_tx_id: network.TransactionId,
     ) void {
         switch (direction) {
+            .not_in_use, .init => unreachable,
             .outgoing => host.debugLog(
                 "{s} tx#{f} {s} -> peer tx#{f}",
                 .{ @tagName(direction), tx_id, @tagName(action), peer_tx_id },
@@ -1025,7 +981,7 @@ pub const Host = struct {
         };
     }
 
-    pub const ReadTxQueueError = Io.QueueClosedError || AddOutgoingTxError;
+    pub const ReadTxQueueError = Io.QueueClosedError || Io.Cancelable || AddOutgoingTxError;
 
     fn readTxQueue(host: *Host, io: Io, tx_queue: *TxQueue) ReadTxQueueError!void {
         while (true) {
@@ -1044,38 +1000,25 @@ pub const Host = struct {
         }
 
         while (true) {
-            // TODO: Learn a thing or two about atomic orderings and pick something other than seq_cst
-            while (host.outgoing_tx_count.load(.seq_cst) == 0) {
-                try io.futexWait(u32, &host.outgoing_tx_count.raw, 0);
+            var direction = host.tx.direction.load(.monotonic);
+            while (direction != .outgoing) {
+                try io.futexWait(Transaction.Direction, &host.tx.direction.raw, direction);
+                direction = host.tx.direction.load(.monotonic);
             }
 
-            const data, const tx_id, const peer_tx_id = blk: {
-                try host.mutex.lock(io);
-                defer host.mutex.unlock(io);
-
-                const txs = host.txs.slice();
-                for (txs.items(.direction), 0..) |direction, index| {
-                    if (direction == .outgoing) break :blk .{
-                        txs.items(.data)[index],
-                        host.tx_id_index_map.keys()[index],
-                        txs.items(.peer_tx_id)[index],
-                    };
-                }
-                unreachable;
-            };
-
-            switch (data) {
+            const tx_id: network.TransactionId = @enumFromInt(0); // TODO
+            switch (host.tx.data) {
                 .send_file => |*send_file| try host.outgoingSendFile(
                     send_file,
                     tx_id,
-                    peer_tx_id,
+                    host.tx.peer_tx_id,
                     io,
                     writer,
                 ),
                 .receive_file => |*receive_file| try host.outgoingReceiveFile(
                     receive_file,
                     tx_id,
-                    peer_tx_id,
+                    host.tx.peer_tx_id,
                     io,
                     writer,
                 ),
@@ -1132,7 +1075,7 @@ pub const Host = struct {
             .receive_decision, .receive_result => unreachable,
         };
 
-        try host.flipTransaction(.incoming, tx_id, .send_file, next_state, null, io);
+        host.flipTransaction(.incoming, tx_id, .send_file, next_state, null, io);
     }
 
     fn outgoingReceiveFile(
@@ -1158,9 +1101,9 @@ pub const Host = struct {
 
                 switch (send_decision) {
                     .accept => {
-                        try host.flipTransaction(.incoming, tx_id, .receive_file, .receive_file_contents, null, io);
+                        host.flipTransaction(.incoming, tx_id, .receive_file, .receive_file_contents, null, io);
                     },
-                    .decline => try host.deleteTransaction(io, tx_id, .outgoing),
+                    .decline => host.deleteTransaction(tx_id, .outgoing),
                 }
             },
             .send_result => |send_result| {
@@ -1175,7 +1118,7 @@ pub const Host = struct {
                 try network.sendAction(writer, action);
                 try writer.flush();
 
-                try host.deleteTransaction(io, tx_id, .outgoing);
+                host.deleteTransaction(tx_id, .outgoing);
             },
             .receive_file_contents => unreachable,
         }
@@ -1212,23 +1155,11 @@ pub const Host = struct {
                 else => {},
             }
 
-            const data = blk: {
-                try host.mutex.lock(io);
-                defer host.mutex.unlock(io);
+            if (@intFromEnum(tx_id) != 0) return error.WrongTxId; // TODO
+            if (host.tx.direction.load(.monotonic) != .incoming) return error.InvalidTxId;
+            if (host.tx.peer_tx_id != .new and host.tx.peer_tx_id != peer_tx_id) return error.WrongPeerTxId;
 
-                const index = host.tx_id_index_map.getIndex(tx_id) orelse return error.WrongTxId;
-                const txs = host.txs.slice();
-                switch (txs.items(.direction)[index]) {
-                    .outgoing => return error.InvalidTxId,
-                    .incoming => {},
-                }
-                const expected_peer_tx_id = txs.items(.peer_tx_id)[index];
-                if (expected_peer_tx_id != .new and expected_peer_tx_id != peer_tx_id) return error.WrongPeerTxId;
-
-                break :blk txs.items(.data)[index];
-            };
-
-            switch (data) {
+            switch (host.tx.data) {
                 .send_file => |*send_file| try host.incomingSendFile(
                     send_file,
                     tx_id,
@@ -1285,14 +1216,14 @@ pub const Host = struct {
         switch (send_file.state) {
             .receive_decision => switch (action) {
                 .transfer_file_accept => {
-                    try host.flipTransaction(.outgoing, tx_id, .send_file, .send_file_contents, peer_tx_id, io);
+                    host.flipTransaction(.outgoing, tx_id, .send_file, .send_file_contents, peer_tx_id, io);
                 },
-                .transfer_file_decline => try host.deleteTransaction(io, tx_id, .incoming),
+                .transfer_file_decline => host.deleteTransaction(tx_id, .incoming),
                 else => return error.InvalidAction,
             },
             .receive_result => {
                 switch (action) {
-                    .transfer_file_success, .transfer_file_failure => try host.deleteTransaction(io, tx_id, .incoming),
+                    .transfer_file_success, .transfer_file_failure => host.deleteTransaction(tx_id, .incoming),
                     else => return error.InvalidAction,
                 }
             },
@@ -1322,7 +1253,7 @@ pub const Host = struct {
                         receive_file.size,
                     );
 
-                    try host.flipTransaction(.outgoing, tx_id, .receive_file, .{ .send_result = .success }, null, io);
+                    host.flipTransaction(.outgoing, tx_id, .receive_file, .{ .send_result = .success }, null, io);
                 },
                 else => return error.InvalidAction,
             },

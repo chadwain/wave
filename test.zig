@@ -126,11 +126,7 @@ fn startHostPair(
     var write_buffer: [64]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
 
-    var dbg_allocator = std.heap.DebugAllocator(.{}).init;
-    defer assert(dbg_allocator.deinit() == .ok);
-    const allocator = dbg_allocator.allocator();
-
-    var host = wave.windows.Host.init(db, allocator, .{ .name = "A" });
+    var host = wave.windows.Host.init(db, .{ .name = "A" });
     defer host.deinit();
     std.debug.print("connected\n", .{});
     _ = try host.run(io, tx_queue, &reader.interface, &writer.interface);
@@ -155,7 +151,7 @@ fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16Z, sync
     var tx_queue: wave.windows.Host.TxQueue = .init(&.{});
     defer tx_queue.close(io);
 
-    var host = wave.windows.Host.init(&db, allocator, .{ .name = "B" });
+    var host = wave.windows.Host.init(&db, .{ .name = "B" });
     defer host.deinit();
     _ = try host.run(io, &tx_queue, &reader.interface, &writer.interface);
 }
