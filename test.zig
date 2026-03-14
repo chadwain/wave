@@ -16,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
     const sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
     defer allocator.free(sync_dir);
 
-    var db = try wave.windows.Database.init(.wtf16ZCast(sync_dir), io, args.syncDir(), allocator);
+    var db = try wave.windows.Database.init(.wtf16Cast(sync_dir), io, args.syncDir(), allocator);
     defer db.deinit(io);
 
     // var watch_task = try io.concurrent(wave.windows.watch, .{ db.sync_dir, io });
@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
 
     var host_pair_task = try io.concurrent(
         startHostPair,
-        .{ io, &db, .wtf16ZCast(peer_sync_dir), args.peerSyncDir(), &tx_queue },
+        .{ io, &db, .wtf16Cast(peer_sync_dir), args.peerSyncDir(), &tx_queue },
     );
     defer host_pair_task.cancel(io) catch {};
 
@@ -110,7 +110,7 @@ const Args = struct {
 fn startHostPair(
     io: Io,
     db: *wave.windows.Database,
-    peer_sync_dir: wave.windows.Wtf16Z,
+    peer_sync_dir: wave.windows.Wtf16,
     peer_sync_dir_wtf8: []const u8,
     tx_queue: *wave.windows.Host.TxQueue,
 ) !void {
@@ -135,7 +135,7 @@ fn startHostPair(
     _ = try host.run(io, tx_queue, &reader.interface, &writer.interface);
 }
 
-fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16Z, sync_dir_wtf8: []const u8) !void {
+fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16, sync_dir_wtf8: []const u8) !void {
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 

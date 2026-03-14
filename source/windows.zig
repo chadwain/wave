@@ -85,10 +85,12 @@ pub const Database = struct {
         return std.HashMapUnmanaged(Wtf16, V, Context, std.hash_map.default_max_load_percentage);
     }
 
-    pub fn init(sync_dir_path: Wtf16Z, io: Io, sync_dir_path_wtf8: []const u8, allocator: Allocator) !Database {
+    pub fn init(sync_dir_path: Wtf16, io: Io, sync_dir_path_wtf8: []const u8, allocator: Allocator) !Database {
         if (!std.fs.path.isAbsoluteWindowsWtf16(sync_dir_path.slice)) return error.NonAbsoluteSyncDirPath;
-        const normalized = try w.wToPrefixedFileW(null, sync_dir_path.slice);
-        const sync_dir = try openDir(null, .wtf16Cast(normalized.span()));
+        // TODO: Proper Win32 -> NT path conversion
+        const normalized = try std.mem.concat(allocator, w.WCHAR, &.{ wtf16("\\??\\"), sync_dir_path.slice });
+        defer allocator.free(normalized);
+        const sync_dir = try openDir(null, .wtf16Cast(normalized));
         errdefer w.CloseHandle(sync_dir);
 
         const sync_dir_io = try Io.Dir.cwd().openDir(io, sync_dir_path_wtf8, .{});
@@ -460,17 +462,10 @@ fn scanOneDirectory(db: *Database, allocator: Allocator, ctx: *FullScanContext) 
             null,
             restart_scan,
         );
-        sw: switch (status) {
+        switch (status) {
             .NO_MORE_FILES => break,
             .BUFFER_OVERFLOW => return error.NtBufferOverflow,
             .SUCCESS => if (io_status_block.Information == 0) return error.NtBufferOverflow,
-            .PENDING => {
-                w.WaitForSingleObject(dir, w.INFINITE) catch |err| switch (err) {
-                    error.WaitAbandoned, error.WaitTimeOut => unreachable,
-                    error.Unexpected => |e| return e,
-                };
-                continue :sw io_status_block.u.Status;
-            },
             else => return w.unexpectedStatus(status),
         }
         restart_scan = w.FALSE;
@@ -501,8 +496,8 @@ fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
         .MaximumLength = path_byte_count,
         .Buffer = @constCast(path.slice.ptr),
     };
-    const object_attributes: w.OBJECT_ATTRIBUTES = .{
-        .Length = @sizeOf(w.OBJECT_ATTRIBUTES),
+    const object_attributes: w.OBJECT.ATTRIBUTES = .{
+        .Length = @sizeOf(w.OBJECT.ATTRIBUTES),
         .RootDirectory = parent,
         .ObjectName = &unicode_string,
         .Attributes = .{
@@ -537,13 +532,13 @@ fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
         },
         .OPEN,
         .{
+            .IO = .SYNCHRONOUS_NONALERT,
             .DIRECTORY_FILE = true,
             .OPEN_FOR_BACKUP_INTENT = true,
         },
         null,
         0,
     );
-    // TODO: Do I need to wait?
 
     switch (status) {
         .SUCCESS => return handle,
@@ -568,8 +563,8 @@ fn openFile(parent: ?w.HANDLE, path: Wtf16, options: OpenFileOptions) !w.HANDLE 
         .MaximumLength = path_byte_count,
         .Buffer = @constCast(path.slice.ptr),
     };
-    const object_attributes: w.OBJECT_ATTRIBUTES = .{
-        .Length = @sizeOf(w.OBJECT_ATTRIBUTES),
+    const object_attributes: w.OBJECT.ATTRIBUTES = .{
+        .Length = @sizeOf(w.OBJECT.ATTRIBUTES),
         .RootDirectory = parent,
         .ObjectName = &unicode_string,
         .Attributes = .{
@@ -986,32 +981,36 @@ pub const Host = struct {
         reader: *Io.Reader,
         writer: *Io.Writer,
     ) RunError!RunResult {
-        defer tx_queue.close(io);
+        const U = union(enum) {
+            read_queue: ReadTxQueueError!void,
+            outgoing: OutgoingError!void,
+            incoming: IncomingError!void,
+        };
+        var select_buffer: [3]U = undefined;
+        var select = Io.Select(U).init(io, &select_buffer);
+        defer select.cancelDiscard();
 
-        var read_queue = try io.concurrent(readTxQueue, .{ host, io, tx_queue });
-        defer read_queue.cancel(io) catch {};
-        var outgoing = try io.concurrent(sendOutgoingTxs, .{ host, io, writer });
-        defer outgoing.cancel(io) catch {};
-        var incoming = try io.concurrent(receiveIncomingTxs, .{ host, io, reader });
-        defer incoming.cancel(io) catch {};
+        try select.concurrent(.read_queue, readTxQueue, .{ host, io, tx_queue });
+        try select.concurrent(.outgoing, sendOutgoingTxs, .{ host, io, writer });
+        try select.concurrent(.incoming, receiveIncomingTxs, .{ host, io, reader });
 
         host.debugLog("started", .{});
-        _ = try io.select(.{
-            .read_queue = &read_queue,
-            .outgoing = &outgoing,
-            .incoming = &incoming,
-        });
 
-        return .{
-            .read_tx_queue_result = read_queue.await(io),
-            .outgoing_result = outgoing.await(io),
-            .incoming_result = incoming.await(io),
-        };
+        var result: RunResult = undefined;
+        for (0..3) |_| {
+            switch (try select.await()) {
+                .read_queue => |read_queue| result.read_tx_queue_result = read_queue,
+                .outgoing => |outgoing| result.outgoing_result = outgoing,
+                .incoming => |incoming| result.incoming_result = incoming,
+            }
+        }
+        return result;
     }
 
     pub const ReadTxQueueError = Io.QueueClosedError || Io.Cancelable || AddOutgoingTxError;
 
     fn readTxQueue(host: *Host, io: Io, tx_queue: *TxQueue) ReadTxQueueError!void {
+        defer tx_queue.close(io);
         while (true) {
             const data = try tx_queue.getOne(io);
             try host.addOutgoingTx(io, data, .new);
