@@ -21,6 +21,11 @@ pub const TransactionId = enum(u32) {
 };
 
 pub const Action = enum(u8) {
+    /// A client has seen a new file on its local filesystem.
+    new_file_init,
+    /// The server responds to a new file message.
+    new_file_response,
+
     transfer_file_metadata,
     transfer_file_accept,
     transfer_file_decline,
@@ -38,6 +43,8 @@ pub const FileHash = struct {
         try writer.print("{x}", .{std.mem.nativeToBig(@Int(.unsigned, byte_size * 8), @bitCast(hash.blake3))});
     }
 };
+
+pub const FileId = u32;
 
 pub const FileSize = u64;
 
@@ -57,6 +64,22 @@ pub fn sendTransactionId(writer: *Io.Writer, id: TransactionId) !void {
 /// Asserts a writer buffer size of at least 1.
 pub fn sendAction(writer: *Io.Writer, action: Action) !void {
     try writer.writeByte(@intFromEnum(action));
+}
+
+/// Asserts a writer buffer size of at least `@sizeOf(FileId)`.
+pub fn sendFileId(writer: *Io.Writer, id: FileId) !void {
+    try writer.writeInt(FileId, id, endian);
+}
+
+/// Asserts a writer buffer size of at least `@sizeOf(PathByteCount)`.
+pub fn sendNewFilePath(
+    writer: *Io.Writer,
+    path_encoding: PathEncoding,
+    path: []const u8, // TODO: Make a Path struct
+) !void {
+    try writer.writeByte(@intFromEnum(path_encoding));
+    try writer.writeInt(PathByteCount, @intCast(path.len), endian);
+    try writer.writeAll(path);
 }
 
 /// Asserts a writer buffer size of at least `@sizeOf(FileSize)`.
@@ -90,6 +113,37 @@ pub const ReceiveActionError = error{UnknownAction} || Io.Reader.Error;
 /// Asserts a reader buffer size of at least 1.
 pub fn receiveAction(reader: *Io.Reader) ReceiveActionError!Action {
     return std.enums.fromInt(Action, try reader.takeByte()) orelse error.UnknownAction;
+}
+
+/// Asserts a reader buffer size of at least `@sizeOf(FileId)`.
+pub fn receiveFileId(reader: *Io.Reader) Io.Reader.Error!FileId {
+    return reader.takeInt(FileId, endian);
+}
+
+pub const IncomingNewFilePath = struct {
+    path_encoding: PathEncoding,
+    path_byte_count: PathByteCount,
+};
+
+pub const ReceiveNewFilePathError = error{UnknownPathEncoding} || Io.Reader.StreamError;
+
+/// Asserts a reader buffer size of at least `FileHash.byte_size`.
+pub fn receiveNewFilePath(
+    reader: *Io.Reader,
+    file_path_buffer: *FilePathBuffer,
+) ReceiveNewFilePathError!IncomingNewFilePath {
+    const path_encoding = std.enums.fromInt(PathEncoding, try reader.takeByte()) orelse
+        return error.UnknownPathEncoding;
+    const path_byte_count = try reader.takeInt(PathByteCount, endian);
+
+    // TODO: Do path encoding verification here
+    var file_path_writer: Io.Writer = .fixed(file_path_buffer);
+    try reader.streamExact(&file_path_writer, path_byte_count);
+
+    return .{
+        .path_encoding = path_encoding,
+        .path_byte_count = path_byte_count,
+    };
 }
 
 pub const IncomingFileMetadata = struct {

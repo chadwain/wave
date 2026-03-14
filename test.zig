@@ -5,6 +5,9 @@ const Io = std.Io;
 
 const wave = @import("wave");
 
+// TODO: Become long-path aware on Windows
+// https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;

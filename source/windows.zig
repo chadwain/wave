@@ -278,12 +278,18 @@ pub const Database = struct {
                 for (0..index) |_| _ = it.next().?;
                 break :blk it.next().?;
             };
+            // const transaction_data: Host.Transaction.Data = .{
+            //     .send_file = .{
+            //         .state = .send_metadata,
+            //         .path = entry.key_ptr.*,
+            //         .size = entry.value_ptr.size,
+            //         .hash = entry.value_ptr.hash,
+            //     },
+            // };
             const transaction_data: Host.Transaction.Data = .{
-                .send_file = .{
-                    .state = .send_metadata,
+                .send_new_file = .{
+                    .state = .send_path,
                     .path = entry.key_ptr.*,
-                    .size = entry.value_ptr.size,
-                    .hash = entry.value_ptr.hash,
                 },
             };
             try q.putOne(io, transaction_data);
@@ -802,6 +808,7 @@ pub const Host = struct {
     };
 
     pub const Transaction = struct {
+        // This is align(4) so that we can `futexWait` on it.
         direction: std.atomic.Value(Direction) align(4),
         data: Data,
         peer_tx_id: network.TransactionId,
@@ -809,8 +816,25 @@ pub const Host = struct {
         pub const Direction = enum(u32) { not_in_use, init, outgoing, incoming };
 
         pub const Data = union(enum) {
+            send_new_file: SendNewFile,
+            receive_new_file: ReceiveNewFile,
+
             send_file: SendFile,
             receive_file: ReceiveFile,
+
+            pub const SendNewFile = struct {
+                state: State,
+                path: Wtf16,
+
+                pub const State = enum {
+                    send_path,
+                    receive_decision,
+                };
+            };
+
+            pub const ReceiveNewFile = struct {
+                file_id: network.FileId,
+            };
 
             pub const SendFile = struct {
                 state: State,
@@ -886,6 +910,7 @@ pub const Host = struct {
         comptime tag: std.meta.FieldEnum(Transaction.Data),
         new_state: @FieldType(Transaction.Data, @tagName(tag)).State,
         /// If non-null, the peer tx id will be replaced with this value.
+        // TODO: Stop using nullable TX ids
         peer_tx_id: ?network.TransactionId,
         io: Io,
     ) void {
@@ -893,7 +918,10 @@ pub const Host = struct {
 
         const data = &host.tx.data;
         @field(data, @tagName(tag)).state = new_state;
-        if (peer_tx_id) |id| host.tx.peer_tx_id = id;
+        if (peer_tx_id) |id| {
+            assert(host.tx.peer_tx_id == .new);
+            host.tx.peer_tx_id = id;
+        }
 
         const from = &host.tx.direction;
         switch (to) {
@@ -1008,6 +1036,20 @@ pub const Host = struct {
 
             const tx_id: network.TransactionId = @enumFromInt(0); // TODO
             switch (host.tx.data) {
+                .send_new_file => |*send_new_file| try host.outgoingSendNewFile(
+                    send_new_file,
+                    tx_id,
+                    host.tx.peer_tx_id,
+                    io,
+                    writer,
+                ),
+                .receive_new_file => |*receive_new_file| try host.outgoingReceiveNewFile(
+                    receive_new_file,
+                    tx_id,
+                    host.tx.peer_tx_id,
+                    io,
+                    writer,
+                ),
                 .send_file => |*send_file| try host.outgoingSendFile(
                     send_file,
                     tx_id,
@@ -1024,6 +1066,56 @@ pub const Host = struct {
                 ),
             }
         }
+    }
+
+    fn outgoingSendNewFile(
+        host: *Host,
+        send_new_file: *const Transaction.Data.SendNewFile,
+        tx_id: network.TransactionId,
+        peer_tx_id: network.TransactionId,
+        io: Io,
+        writer: *Io.Writer,
+    ) !void {
+        switch (send_new_file.state) {
+            .send_path => {
+                host.logMessage(.outgoing, tx_id, .new_file_init, peer_tx_id);
+
+                try network.sendTransactionId(writer, peer_tx_id);
+                try network.sendTransactionId(writer, tx_id);
+                try network.sendAction(writer, .new_file_init);
+                try network.sendNewFilePath(
+                    writer,
+                    switch (cpu_endian) {
+                        .big => @compileError("TODO big endian"),
+                        .little => .wtf16le,
+                    },
+                    @ptrCast(send_new_file.path.slice),
+                );
+                try writer.flush();
+
+                host.flipTransaction(.incoming, tx_id, .send_new_file, .receive_decision, null, io);
+            },
+            .receive_decision => unreachable,
+        }
+    }
+
+    fn outgoingReceiveNewFile(
+        host: *Host,
+        receive_new_file: *const Transaction.Data.ReceiveNewFile,
+        tx_id: network.TransactionId,
+        peer_tx_id: network.TransactionId,
+        _: Io,
+        writer: *Io.Writer,
+    ) !void {
+        host.logMessage(.outgoing, tx_id, .new_file_response, peer_tx_id);
+
+        try network.sendTransactionId(writer, peer_tx_id);
+        try network.sendTransactionId(writer, tx_id);
+        try network.sendAction(writer, .new_file_response);
+        try network.sendFileId(writer, receive_new_file.file_id);
+        try writer.flush();
+
+        host.deleteTransaction(tx_id, .outgoing);
     }
 
     fn outgoingSendFile(
@@ -1149,7 +1241,12 @@ pub const Host = struct {
             switch (action) {
                 .transfer_file_metadata => {
                     if (tx_id != .new) return error.InvalidTxId;
-                    try host.newIncomingReceiveFile(peer_tx_id, io, reader);
+                    try host.incomingTransferFileMetadataAction(peer_tx_id, io, reader);
+                    continue;
+                },
+                .new_file_init => {
+                    if (tx_id != .new) return error.InvalidTxId;
+                    try host.incomingNewFileInitAction(peer_tx_id, io, reader);
                     continue;
                 },
                 else => {},
@@ -1160,6 +1257,12 @@ pub const Host = struct {
             if (host.tx.peer_tx_id != .new and host.tx.peer_tx_id != peer_tx_id) return error.WrongPeerTxId;
 
             switch (host.tx.data) {
+                .send_new_file => try host.incomingSendNewFile(
+                    reader,
+                    tx_id,
+                    action,
+                ),
+                .receive_new_file => unreachable,
                 .send_file => |*send_file| try host.incomingSendFile(
                     send_file,
                     tx_id,
@@ -1178,7 +1281,7 @@ pub const Host = struct {
         }
     }
 
-    fn newIncomingReceiveFile(
+    fn incomingTransferFileMetadataAction(
         host: *Host,
         peer_tx_id: network.TransactionId,
         io: Io,
@@ -1203,6 +1306,40 @@ pub const Host = struct {
             },
         };
         try host.addOutgoingTx(io, data, peer_tx_id);
+    }
+
+    fn incomingNewFileInitAction(
+        host: *Host,
+        peer_tx_id: network.TransactionId,
+        io: Io,
+        reader: *Io.Reader,
+    ) !void {
+        var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
+        const path_info = try network.receiveNewFilePath(reader, &file_path_buffer);
+        _ = path_info;
+
+        const data: Transaction.Data = .{
+            .receive_new_file = .{
+                .file_id = 0, // TODO
+            },
+        };
+        try host.addOutgoingTx(io, data, peer_tx_id);
+    }
+
+    fn incomingSendNewFile(
+        host: *Host,
+        reader: *Io.Reader,
+        tx_id: network.TransactionId,
+        action: network.Action,
+    ) !void {
+        switch (action) {
+            .new_file_response => {
+                const file_id = try network.receiveFileId(reader);
+                host.debugLog("received file id: {}\n", .{file_id});
+                host.deleteTransaction(tx_id, .incoming);
+            },
+            else => return error.InvalidAction,
+        }
     }
 
     fn incomingSendFile(
