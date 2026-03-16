@@ -6,9 +6,15 @@ const Io = std.Io;
 /// The endianness of message contents, except for file paths, which have their own encoding.
 pub const endian: std.builtin.Endian = .little;
 
-pub const TransactionId = enum(u32) {
-    new = 0xfffffffe,
-    disconnect = 0xffffffff,
+pub const MessageHeaderTag = enum(u2) {
+    disconnect,
+    new_tx,
+    new_tx_reply,
+    existing_tx,
+};
+
+pub const TransactionId = enum(u3) {
+    invalid = 7,
     _,
 
     pub fn format(tx_id: TransactionId, writer: *Io.Writer) Io.Writer.Error!void {
@@ -18,6 +24,16 @@ pub const TransactionId = enum(u32) {
             try writer.print("{}", .{@intFromEnum(tx_id)});
         }
     }
+};
+
+pub const MessageHeader = packed struct(u8) {
+    tag: MessageHeaderTag,
+    /// The transaction ID of the destination peer.
+    /// Not valid when tag is `new_tx`.
+    tx_id: TransactionId,
+    /// The transaction ID of the source peer.
+    /// Only valid when `tag` is `new_tx` or `new_tx_reply`.
+    peer_tx_id: TransactionId,
 };
 
 pub const Action = enum(u8) {
@@ -56,9 +72,34 @@ pub const PathByteCount = u16;
 
 pub const FilePathBuffer = [1 << @bitSizeOf(PathByteCount)]u8;
 
-/// Asserts a writer buffer size of at least `@sizeOf(TransactionId)`.
-pub fn sendTransactionId(writer: *Io.Writer, id: TransactionId) !void {
-    try writer.writeInt(std.meta.Tag(TransactionId), @intFromEnum(id), endian);
+/// Asserts a writer buffer size of at least 1.
+pub fn sendMessageHeaderExistingTx(writer: *Io.Writer, peer_tx_id: TransactionId) !void {
+    const header = MessageHeader{
+        .tag = .existing_tx,
+        .tx_id = peer_tx_id,
+        .peer_tx_id = .invalid,
+    };
+    try writer.writeByte(@bitCast(header));
+}
+
+/// Asserts a writer buffer size of at least 1.
+pub fn sendMessageHeaderNewTx(writer: *Io.Writer, tx_id: TransactionId) !void {
+    const header = MessageHeader{
+        .tag = .new_tx,
+        .tx_id = .invalid,
+        .peer_tx_id = tx_id,
+    };
+    try writer.writeByte(@bitCast(header));
+}
+
+/// Asserts a writer buffer size of at least 1.
+pub fn sendMessageHeaderNewTxReply(writer: *Io.Writer, tx_id: TransactionId, peer_tx_id: TransactionId) !void {
+    const header = MessageHeader{
+        .tag = .new_tx_reply,
+        .tx_id = peer_tx_id,
+        .peer_tx_id = tx_id,
+    };
+    try writer.writeByte(@bitCast(header));
 }
 
 /// Asserts a writer buffer size of at least 1.
@@ -98,14 +139,9 @@ pub fn sendFileMetadata(
     try writer.writeAll(path);
 }
 
-/// Asserts a reader buffer size of at least `@sizeOf(TransactionId)`.
-/// `null` means disconnect.
-pub fn receiveTransactionId(reader: *Io.Reader) Io.Reader.Error!?TransactionId {
-    const id: TransactionId = @enumFromInt(try reader.takeInt(std.meta.Tag(TransactionId), endian));
-    switch (id) {
-        .disconnect => return null,
-        .new, _ => return id,
-    }
+/// Asserts a reader buffer size of at least 1.
+pub fn receiveMessageHeader(reader: *Io.Reader) Io.Reader.Error!MessageHeader {
+    return @bitCast(try reader.takeByte());
 }
 
 pub const ReceiveActionError = error{UnknownAction} || Io.Reader.Error;

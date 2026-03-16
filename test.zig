@@ -132,7 +132,8 @@ fn startHostPair(
     var host = wave.windows.Host.init(db, .{ .name = "A" });
     defer host.deinit();
     std.debug.print("connected\n", .{});
-    _ = try host.run(io, tx_queue, &reader.interface, &writer.interface);
+    const result = try host.run(io, tx_queue, &reader.interface, &writer.interface);
+    std.debug.print("A result: {any}\n", .{result});
 }
 
 fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16, sync_dir_wtf8: []const u8) !void {
@@ -156,5 +157,6 @@ fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16, sync_
 
     var host = wave.windows.Host.init(&db, .{ .name = "B" });
     defer host.deinit();
-    _ = try host.run(io, &tx_queue, &reader.interface, &writer.interface);
+    const result = try host.run(io, &tx_queue, &reader.interface, &writer.interface);
+    std.debug.print("B result: {any}\n", .{result});
 }
