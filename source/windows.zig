@@ -282,20 +282,20 @@ pub const Database = struct {
                 for (0..index) |_| _ = it.next().?;
                 break :blk it.next().?;
             };
-            const transaction_data: Host.Transaction.Data = .{
-                .send_file = .{
-                    .state = .send_metadata,
-                    .path = entry.key_ptr.*,
-                    .size = entry.value_ptr.size,
-                    .hash = entry.value_ptr.hash,
-                },
-            };
-            // const transaction_data: Host.Transaction.Data = .{
-            //     .send_new_file = .{
-            //         .state = .send_path,
+            // const transaction_data: TxData = .{
+            //     .send_file = .{
+            //         .state = .send_metadata,
             //         .path = entry.key_ptr.*,
+            //         .size = entry.value_ptr.size,
+            //         .hash = entry.value_ptr.hash,
             //     },
             // };
+            const transaction_data: TxData = .{
+                .send_new_file = .{
+                    .state = .send_path,
+                    .path = entry.key_ptr.*,
+                },
+            };
             try q.putOne(io, transaction_data);
         }
     };
@@ -807,65 +807,13 @@ pub const Host = struct {
     pub const Transaction = struct {
         // This is align(4) so that we can `futexWait` on it.
         direction: std.atomic.Value(Direction) align(4),
-        data: Data,
+        data: TxData,
         peer_tx_id: network.TransactionId,
 
         pub const Direction = enum(u32) { not_in_use, init, outgoing, incoming };
-
-        pub const Data = union(enum) {
-            send_new_file: SendNewFile,
-            receive_new_file: ReceiveNewFile,
-
-            send_file: SendFile,
-            receive_file: ReceiveFile,
-
-            pub const SendNewFile = struct {
-                state: State,
-                path: Wtf16,
-
-                pub const State = enum {
-                    send_path,
-                    receive_decision,
-                };
-            };
-
-            pub const ReceiveNewFile = struct {
-                file_id: network.FileId,
-            };
-
-            pub const SendFile = struct {
-                state: State,
-                path: Wtf16,
-                size: w.LARGE_INTEGER,
-                hash: network.FileHash,
-
-                pub const State = enum {
-                    send_metadata,
-                    receive_decision,
-                    send_file_contents,
-                    receive_result,
-                };
-            };
-
-            pub const ReceiveFile = struct {
-                state: State,
-                path: Wtf16,
-                size: w.LARGE_INTEGER,
-                hash: network.FileHash,
-
-                pub const State = union(enum) {
-                    send_decision: SendDecision,
-                    receive_file_contents,
-                    send_result: SendResult,
-
-                    pub const SendDecision = enum { accept, decline };
-                    pub const SendResult = enum { success, failure };
-                };
-            };
-        };
     };
 
-    pub const TxQueue = Io.Queue(Transaction.Data);
+    pub const TxQueue = Io.Queue(TxData);
 
     pub fn init(db: *Database, debug: Debug) Host {
         return .{
@@ -883,12 +831,203 @@ pub const Host = struct {
         host.* = undefined;
     }
 
+    pub const RunError = Io.ConcurrentError || Io.Cancelable;
+
+    pub const Diagnostics = struct {
+        read_tx_queue: ?ReadTxQueueError = null,
+        outgoing: ?OutgoingError = null,
+        incoming: ?IncomingError = null,
+    };
+
+    /// Blocks until the `Host` is finished running.
+    pub fn run(
+        host: *Host,
+        diag: ?*Diagnostics,
+        io: Io,
+        tx_queue: *TxQueue,
+        reader: *Io.Reader,
+        writer: *Io.Writer,
+    ) RunError!void {
+        const ns = struct {
+            const SelectUnion = union(enum) {
+                read_tx_queue: ReadTxQueueError!void,
+                outgoing: OutgoingError!void,
+                incoming: IncomingError!void,
+            };
+
+            fn addToDiagnostics(d: ?*Diagnostics, u: SelectUnion) void {
+                const ptr = d orelse return;
+                switch (u) {
+                    inline else => |payload, tag| {
+                        @field(ptr, @tagName(tag)) = if (payload) |_| null else |err| err;
+                    },
+                }
+            }
+        };
+
+        var select_buffer: [3]ns.SelectUnion = undefined;
+        var select = Io.Select(ns.SelectUnion).init(io, &select_buffer);
+        defer while (select.cancel()) |result| ns.addToDiagnostics(diag, result);
+
+        try select.concurrent(.read_tx_queue, readTxQueue, .{ host, tx_queue, io });
+        try select.concurrent(.outgoing, sendOutgoingTxs, .{ host, writer, io });
+        try select.concurrent(.incoming, receiveIncomingTxs, .{ host, reader, io });
+
+        host.debugLog("started", .{});
+        ns.addToDiagnostics(diag, try select.await());
+    }
+
+    pub const ReadTxQueueError = Io.QueueClosedError || Io.Cancelable || AddOutgoingTxError;
+
+    fn readTxQueue(host: *Host, tx_queue: *TxQueue, io: Io) ReadTxQueueError!void {
+        defer tx_queue.close(io);
+        while (true) {
+            const data = try tx_queue.getOne(io);
+            try host.addOutgoingTx(io, data, null);
+        }
+    }
+
+    pub const OutgoingError = Io.Writer.Error || Io.Cancelable || SendFileError;
+
+    fn sendOutgoingTxs(host: *Host, writer: *Io.Writer, io: Io) OutgoingError!void {
+        while (true) {
+            var direction = host.tx.direction.load(.monotonic);
+            while (direction != .outgoing) {
+                try io.futexWait(Transaction.Direction, &host.tx.direction.raw, direction);
+                direction = host.tx.direction.load(.monotonic);
+            }
+
+            const tx_id: network.TransactionId = @enumFromInt(0); // TODO hardcoded value
+            switch (host.tx.data) {
+                .send_new_file => |*send_new_file| switch (send_new_file.state) {
+                    .send_path => try send_new_file.sendPath(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .receive_decision => unreachable,
+                },
+                .receive_new_file => |*receive_new_file| {
+                    try receive_new_file.sendDecision(host, tx_id, host.tx.peer_tx_id, io, writer);
+                },
+                .send_file => |*send_file| switch (send_file.state) {
+                    .send_metadata => try send_file.sendMetadata(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .send_file_contents => try send_file.sendFileContents(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .receive_decision, .receive_result => unreachable,
+                },
+                .receive_file => |*receive_file| switch (receive_file.state) {
+                    .send_decision => try receive_file.sendDecision(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .send_result => try receive_file.sendResult(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .receive_file_contents => unreachable,
+                },
+            }
+        }
+    }
+
+    pub const IncomingError = error{
+        InvalidTxId,
+        InvalidPeerTxId,
+        WrongTxId,
+        WrongPeerTxId,
+        InvalidAction,
+        InvalidHeader,
+    } || wave.network.ReceiveActionError || wave.network.ReceiveFileMetadataError || Io.Reader.StreamError ||
+        Io.Cancelable || Allocator.Error || AddOutgoingTxError || ReceiveFileError;
+
+    fn receiveIncomingTxs(host: *Host, reader: *Io.Reader, io: Io) IncomingError!void {
+        while (true) {
+            const header = try network.receiveMessageHeader(reader);
+            if (header.tag == .disconnect) break;
+            const action = try network.receiveAction(reader);
+            host.logMessage(.incoming, header.tx_id, action, header.peer_tx_id);
+
+            switch (header.tag) {
+                .disconnect => unreachable,
+                .new_tx => {
+                    if (header.tx_id != .invalid) return error.InvalidTxId;
+                    if (header.peer_tx_id == .invalid) return error.InvalidPeerTxId;
+                    switch (action) {
+                        .new_file_init => {
+                            try TxData.ReceiveNewFile.newTx(host, header.peer_tx_id, io, reader);
+                        },
+                        .transfer_file_metadata => {
+                            try TxData.ReceiveFile.newTx(host, header.peer_tx_id, io, reader);
+                        },
+                        else => return error.InvalidAction,
+                    }
+                },
+                .new_tx_reply => {
+                    if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
+                    if (host.tx.direction.load(.monotonic) != .incoming) return error.InvalidTxId;
+                    if (host.tx.peer_tx_id != .invalid) return error.WrongPeerTxId;
+
+                    switch (host.tx.data) {
+                        .send_new_file => |*send_new_file| switch (send_new_file.state) {
+                            .receive_decision => {
+                                try send_new_file.receiveDecision(
+                                    host,
+                                    reader,
+                                    io,
+                                    header.tx_id,
+                                    header.peer_tx_id,
+                                    action,
+                                );
+                            },
+                            .send_path => unreachable,
+                        },
+                        .receive_new_file => unreachable,
+                        .send_file => |*send_file| switch (send_file.state) {
+                            .receive_decision => {
+                                try send_file.receiveDecision(
+                                    host,
+                                    reader,
+                                    io,
+                                    header.tx_id,
+                                    header.peer_tx_id,
+                                    action,
+                                );
+                            },
+                            .receive_result => return error.InvalidHeader,
+                            .send_metadata, .send_file_contents => unreachable,
+                        },
+                        .receive_file => |*receive_file| switch (receive_file.state) {
+                            .receive_file_contents => return error.InvalidHeader,
+                            .send_decision, .send_result => unreachable,
+                        },
+                    }
+                },
+                .existing_tx => {
+                    if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
+                    if (host.tx.direction.load(.monotonic) != .incoming) return error.InvalidTxId;
+                    if (header.peer_tx_id != .invalid) return error.WrongPeerTxId;
+
+                    switch (host.tx.data) {
+                        .send_new_file => |*send_new_file| switch (send_new_file.state) {
+                            .receive_decision => return error.InvalidHeader,
+                            .send_path => unreachable,
+                        },
+                        .receive_new_file => unreachable,
+                        .send_file => |*send_file| switch (send_file.state) {
+                            .receive_decision => return error.InvalidHeader,
+                            .receive_result => {
+                                try send_file.receiveResult(host, reader, io, header.tx_id, action);
+                            },
+                            .send_metadata, .send_file_contents => unreachable,
+                        },
+                        .receive_file => |*receive_file| switch (receive_file.state) {
+                            .receive_file_contents => {
+                                try receive_file.receiveFileContents(host, reader, io, header.tx_id, action);
+                            },
+                            .send_decision, .send_result => unreachable,
+                        },
+                    }
+                },
+            }
+        }
+    }
+
     const AddOutgoingTxError = error{NoTxSlotsAvailable};
 
     fn addOutgoingTx(
         host: *Host,
         io: Io,
-        data: Transaction.Data,
+        data: TxData,
         peer_tx_id: ?network.TransactionId,
     ) AddOutgoingTxError!void {
         if (host.tx.direction.cmpxchgStrong(.not_in_use, .init, .acquire, .monotonic) != null) {
@@ -954,409 +1093,186 @@ pub const Host = struct {
             ),
         }
     }
+};
 
-    pub const RunError = Io.ConcurrentError || Io.Cancelable;
+pub const TxData = union(enum) {
+    send_new_file: SendNewFile,
+    receive_new_file: ReceiveNewFile,
 
-    pub const Diagnostics = struct {
-        read_tx_queue: ?ReadTxQueueError = null,
-        outgoing: ?OutgoingError = null,
-        incoming: ?IncomingError = null,
+    send_file: SendFile,
+    receive_file: ReceiveFile,
+
+    pub const SendNewFile = struct {
+        state: State,
+        path: Wtf16,
+
+        pub const State = enum {
+            send_path,
+            receive_decision,
+        };
+
+        fn sendPath(
+            send_new_file: *SendNewFile,
+            host: *Host,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            writer: *Io.Writer,
+        ) !void {
+            assert(send_new_file.state == .send_path);
+            assert(peer_tx_id == .invalid);
+
+            const action: network.Action = .new_file_init;
+            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+
+            try network.sendMessageHeaderNewTx(writer, tx_id);
+            try network.sendAction(writer, action);
+            try network.sendNewFilePath(
+                writer,
+                switch (cpu_endian) {
+                    .big => @compileError("TODO big endian"),
+                    .little => .wtf16le,
+                },
+                @ptrCast(send_new_file.path.slice),
+            );
+            try writer.flush();
+
+            send_new_file.state = .receive_decision;
+            host.flipTransaction(.incoming, tx_id, io);
+        }
+
+        fn receiveDecision(
+            send_new_file: *const SendNewFile,
+            host: *Host,
+            reader: *Io.Reader,
+            _: Io,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            action: network.Action,
+        ) !void {
+            assert(send_new_file.state == .receive_decision);
+            if (peer_tx_id != .invalid) return error.InvalidPeerTxId;
+
+            switch (action) {
+                .new_file_response => {
+                    const file_id = try network.receiveFileId(reader);
+                    host.debugLog("received file id: {}\n", .{file_id});
+                    host.deleteTransaction(tx_id, .incoming);
+                },
+                else => return error.InvalidAction,
+            }
+        }
     };
 
-    pub fn run(
-        host: *Host,
-        diag: ?*Diagnostics,
-        io: Io,
-        tx_queue: *TxQueue,
-        reader: *Io.Reader,
-        writer: *Io.Writer,
-    ) RunError!void {
-        const ns = struct {
-            const SelectUnion = union(enum) {
-                read_tx_queue: ReadTxQueueError!void,
-                outgoing: OutgoingError!void,
-                incoming: IncomingError!void,
-            };
+    pub const ReceiveNewFile = struct {
+        file_id: network.FileId,
 
-            fn addToDiagnostics(d: ?*Diagnostics, u: SelectUnion) void {
-                const ptr = d orelse return;
-                switch (u) {
-                    inline else => |payload, tag| {
-                        @field(ptr, @tagName(tag)) = if (payload) |_| null else |err| err;
-                    },
-                }
-            }
-        };
+        fn newTx(
+            host: *Host,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            reader: *Io.Reader,
+        ) !void {
+            var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
+            const path_info = try network.receiveNewFilePath(reader, &file_path_buffer);
+            _ = path_info;
 
-        var select_buffer: [3]ns.SelectUnion = undefined;
-        var select = Io.Select(ns.SelectUnion).init(io, &select_buffer);
-        defer while (select.cancel()) |result| ns.addToDiagnostics(diag, result);
-
-        try select.concurrent(.read_tx_queue, readTxQueue, .{ host, io, tx_queue });
-        try select.concurrent(.outgoing, sendOutgoingTxs, .{ host, io, writer });
-        try select.concurrent(.incoming, receiveIncomingTxs, .{ host, io, reader });
-
-        host.debugLog("started", .{});
-        ns.addToDiagnostics(diag, try select.await());
-    }
-
-    pub const ReadTxQueueError = Io.QueueClosedError || Io.Cancelable || AddOutgoingTxError;
-
-    fn readTxQueue(host: *Host, io: Io, tx_queue: *TxQueue) ReadTxQueueError!void {
-        defer tx_queue.close(io);
-        while (true) {
-            const data = try tx_queue.getOne(io);
-            try host.addOutgoingTx(io, data, null);
-        }
-    }
-
-    pub const OutgoingError = Io.Writer.Error || Io.Cancelable || SendFileError;
-
-    fn sendOutgoingTxs(host: *Host, io: Io, writer: *Io.Writer) OutgoingError!void {
-        while (true) {
-            var direction = host.tx.direction.load(.monotonic);
-            while (direction != .outgoing) {
-                try io.futexWait(Transaction.Direction, &host.tx.direction.raw, direction);
-                direction = host.tx.direction.load(.monotonic);
-            }
-
-            const tx_id: network.TransactionId = @enumFromInt(0); // TODO hardcoded value
-            switch (host.tx.data) {
-                .send_new_file => |*send_new_file| try host.outgoingSendNewFile(
-                    send_new_file,
-                    tx_id,
-                    host.tx.peer_tx_id,
-                    io,
-                    writer,
-                ),
-                .receive_new_file => |*receive_new_file| try host.outgoingReceiveNewFile(
-                    receive_new_file,
-                    tx_id,
-                    host.tx.peer_tx_id,
-                    io,
-                    writer,
-                ),
-                .send_file => |*send_file| try host.outgoingSendFile(
-                    send_file,
-                    tx_id,
-                    host.tx.peer_tx_id,
-                    io,
-                    writer,
-                ),
-                .receive_file => |*receive_file| try host.outgoingReceiveFile(
-                    receive_file,
-                    tx_id,
-                    host.tx.peer_tx_id,
-                    io,
-                    writer,
-                ),
-            }
-        }
-    }
-
-    fn outgoingSendNewFile(
-        host: *Host,
-        send_new_file: *Transaction.Data.SendNewFile,
-        tx_id: network.TransactionId,
-        peer_tx_id: network.TransactionId,
-        io: Io,
-        writer: *Io.Writer,
-    ) !void {
-        assert(peer_tx_id == .invalid);
-        switch (send_new_file.state) {
-            .send_path => {
-                const action: network.Action = .new_file_init;
-                host.logMessage(.outgoing, tx_id, action, peer_tx_id);
-
-                try network.sendMessageHeaderNewTx(writer, tx_id);
-                try network.sendAction(writer, action);
-                try network.sendNewFilePath(
-                    writer,
-                    switch (cpu_endian) {
-                        .big => @compileError("TODO big endian"),
-                        .little => .wtf16le,
-                    },
-                    @ptrCast(send_new_file.path.slice),
-                );
-                try writer.flush();
-
-                send_new_file.state = .receive_decision;
-                host.flipTransaction(.incoming, tx_id, io);
-            },
-            .receive_decision => unreachable,
-        }
-    }
-
-    fn outgoingReceiveNewFile(
-        host: *Host,
-        receive_new_file: *const Transaction.Data.ReceiveNewFile,
-        tx_id: network.TransactionId,
-        peer_tx_id: network.TransactionId,
-        _: Io,
-        writer: *Io.Writer,
-    ) !void {
-        assert(peer_tx_id != .invalid);
-
-        const action: network.Action = .new_file_response;
-        const outgoing_tx_id: network.TransactionId = .invalid;
-        host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
-
-        try network.sendMessageHeaderNewTxReply(writer, outgoing_tx_id, peer_tx_id);
-        try network.sendAction(writer, action);
-        try network.sendFileId(writer, receive_new_file.file_id);
-        try writer.flush();
-
-        host.deleteTransaction(tx_id, .outgoing);
-    }
-
-    fn outgoingSendFile(
-        host: *Host,
-        send_file: *Transaction.Data.SendFile,
-        tx_id: network.TransactionId,
-        peer_tx_id: network.TransactionId,
-        io: Io,
-        writer: *Io.Writer,
-    ) !void {
-        const next_state: Transaction.Data.SendFile.State = blk: switch (send_file.state) {
-            .send_metadata => {
-                assert(peer_tx_id == .invalid);
-
-                const action: network.Action = .transfer_file_metadata;
-                host.logMessage(.outgoing, tx_id, action, peer_tx_id);
-
-                const file_size = std.math.cast(network.FileSize, send_file.size) orelse
-                    std.debug.panic(
-                        "TODO: File too large to transfer: '{f}' with size {}",
-                        .{ send_file.path.formatUtf8(), send_file.size },
-                    );
-                try network.sendMessageHeaderNewTx(writer, tx_id);
-                try network.sendAction(writer, action);
-                try network.sendFileMetadata(
-                    writer,
-                    switch (cpu_endian) {
-                        .big => @compileError("TODO big endian"),
-                        .little => .wtf16le,
-                    },
-                    @ptrCast(send_file.path.slice),
-                    file_size,
-                    &send_file.hash,
-                );
-                try writer.flush();
-                break :blk .receive_decision;
-            },
-            .send_file_contents => {
-                assert(peer_tx_id != .invalid);
-
-                const action: network.Action = .transfer_file_contents;
-                host.logMessage(.outgoing, tx_id, action, peer_tx_id);
-
-                const handle = try host.db.openFileReadOnly(io, send_file.path);
-                defer host.db.closeFile(handle);
-
-                try network.sendMessageHeaderExistingTx(writer, peer_tx_id);
-                try network.sendAction(writer, action);
-                try sendFile(writer, handle, send_file.size);
-                try writer.flush();
-                break :blk .receive_result;
-            },
-            .receive_decision, .receive_result => unreachable,
-        };
-
-        send_file.state = next_state;
-        host.flipTransaction(.incoming, tx_id, io);
-    }
-
-    fn outgoingReceiveFile(
-        host: *Host,
-        receive_file: *Transaction.Data.ReceiveFile,
-        tx_id: network.TransactionId,
-        peer_tx_id: network.TransactionId,
-        io: Io,
-        writer: *Io.Writer,
-    ) !void {
-        assert(peer_tx_id != .invalid);
-        switch (receive_file.state) {
-            .send_decision => |send_decision| {
-                const actual_tx_id: network.TransactionId, const action: network.Action = switch (send_decision) {
-                    .accept => .{ tx_id, .transfer_file_accept },
-                    .decline => .{ .invalid, .transfer_file_decline },
-                };
-                host.logMessage(.outgoing, tx_id, action, peer_tx_id);
-
-                try network.sendMessageHeaderNewTxReply(writer, actual_tx_id, peer_tx_id);
-                try network.sendAction(writer, action);
-                try writer.flush();
-
-                switch (send_decision) {
-                    .accept => {
-                        receive_file.state = .receive_file_contents;
-                        host.flipTransaction(.incoming, tx_id, io);
-                    },
-                    .decline => host.deleteTransaction(tx_id, .outgoing),
-                }
-            },
-            .send_result => |send_result| {
-                const action: network.Action = switch (send_result) {
-                    .success => .transfer_file_success,
-                    .failure => .transfer_file_failure,
-                };
-                host.logMessage(.outgoing, tx_id, action, peer_tx_id);
-
-                try network.sendMessageHeaderExistingTx(writer, peer_tx_id);
-                try network.sendAction(writer, action);
-                try writer.flush();
-
-                host.deleteTransaction(tx_id, .outgoing);
-            },
-            .receive_file_contents => unreachable,
-        }
-    }
-
-    pub const IncomingError = error{
-        InvalidTxId,
-        InvalidPeerTxId,
-        WrongTxId,
-        WrongPeerTxId,
-        InvalidAction,
-    } || wave.network.ReceiveActionError || wave.network.ReceiveFileMetadataError ||
-        Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddOutgoingTxError || ReceiveFileError;
-
-    fn receiveIncomingTxs(host: *Host, io: Io, reader: *Io.Reader) IncomingError!void {
-        while (true) {
-            const header = try network.receiveMessageHeader(reader);
-            if (header.tag == .disconnect) break;
-            const action = try network.receiveAction(reader);
-            host.logMessage(.incoming, header.tx_id, action, header.peer_tx_id);
-
-            switch (header.tag) {
-                .disconnect => unreachable,
-                .new_tx => {
-                    if (header.tx_id != .invalid) return error.InvalidTxId;
-                    if (header.peer_tx_id == .invalid) return error.InvalidPeerTxId;
-                    switch (action) {
-                        .new_file_init => {
-                            try host.incomingNewFileInitAction(header.peer_tx_id, io, reader);
-                        },
-                        .transfer_file_metadata => {
-                            try host.incomingTransferFileMetadataAction(header.peer_tx_id, io, reader);
-                        },
-                        else => return error.InvalidAction,
-                    }
+            const data: TxData = .{
+                .receive_new_file = .{
+                    .file_id = 0, // TODO hardcoded value
                 },
-                .new_tx_reply, .existing_tx => {
-                    // TODO: Create a new message header tag that places more restrictions on the peer tx id
-                    //       for the first response to a new transaction
-                    if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
-                    if (host.tx.direction.load(.monotonic) != .incoming) return error.InvalidTxId;
-                    if (header.tag == .new_tx_reply) {
-                        if (host.tx.peer_tx_id != .invalid) return error.WrongPeerTxId;
-                    } else {
-                        if (header.peer_tx_id != .invalid) return error.WrongPeerTxId;
-                    }
-                    switch (host.tx.data) {
-                        .send_new_file => try host.incomingSendNewFile(
-                            reader,
-                            header.tx_id,
-                            header.peer_tx_id,
-                            action,
-                        ),
-                        .receive_new_file => unreachable,
-                        .send_file => |*send_file| try host.incomingSendFile(
-                            send_file,
-                            header.tx_id,
-                            header.peer_tx_id,
-                            action,
-                            io,
-                        ),
-                        .receive_file => |*receive_file| try host.incomingReceiveFile(
-                            receive_file,
-                            header.tx_id,
-                            action,
-                            io,
-                            reader,
-                        ),
-                    }
-                },
-            }
-        }
-    }
-
-    fn incomingTransferFileMetadataAction(
-        host: *Host,
-        peer_tx_id: network.TransactionId,
-        io: Io,
-        reader: *Io.Reader,
-    ) !void {
-        var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
-        const metadata = try network.receiveFileMetadata(reader, &file_path_buffer);
-        const file_path, const comparison = try host.db.checkMetadata(&metadata, &file_path_buffer, io);
-
-        const decision: Transaction.Data.ReceiveFile.State.SendDecision =
-            switch (comparison) {
-                .equals => .decline,
-                .differs => .accept,
             };
-
-        const data: Transaction.Data = .{
-            .receive_file = .{
-                .state = .{ .send_decision = decision },
-                .path = file_path,
-                .size = @as(w.LARGE_INTEGER, @intCast(metadata.file_size)),
-                .hash = metadata.hash,
-            },
-        };
-        try host.addOutgoingTx(io, data, peer_tx_id);
-    }
-
-    fn incomingNewFileInitAction(
-        host: *Host,
-        peer_tx_id: network.TransactionId,
-        io: Io,
-        reader: *Io.Reader,
-    ) !void {
-        var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
-        const path_info = try network.receiveNewFilePath(reader, &file_path_buffer);
-        _ = path_info;
-
-        const data: Transaction.Data = .{
-            .receive_new_file = .{
-                .file_id = 0, // TODO
-            },
-        };
-        try host.addOutgoingTx(io, data, peer_tx_id);
-    }
-
-    fn incomingSendNewFile(
-        host: *Host,
-        reader: *Io.Reader,
-        tx_id: network.TransactionId,
-        peer_tx_id: network.TransactionId,
-        action: network.Action,
-    ) !void {
-        if (peer_tx_id != .invalid) return error.WrongPeerTxId;
-        switch (action) {
-            .new_file_response => {
-                const file_id = try network.receiveFileId(reader);
-                host.debugLog("received file id: {}\n", .{file_id});
-                host.deleteTransaction(tx_id, .incoming);
-            },
-            else => return error.InvalidAction,
+            try host.addOutgoingTx(io, data, peer_tx_id);
         }
-    }
 
-    fn incomingSendFile(
-        host: *Host,
-        send_file: *Transaction.Data.SendFile,
-        tx_id: network.TransactionId,
-        peer_tx_id: network.TransactionId,
-        action: network.Action,
-        io: Io,
-    ) !void {
-        switch (send_file.state) {
-            .receive_decision => switch (action) {
+        fn sendDecision(
+            receive_new_file: *const ReceiveNewFile,
+            host: *Host,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            _: Io,
+            writer: *Io.Writer,
+        ) !void {
+            assert(peer_tx_id != .invalid);
+
+            const action: network.Action = .new_file_response;
+            const outgoing_tx_id: network.TransactionId = .invalid;
+            host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+
+            try network.sendMessageHeaderNewTxReply(writer, outgoing_tx_id, peer_tx_id);
+            try network.sendAction(writer, action);
+            try network.sendFileId(writer, receive_new_file.file_id);
+            try writer.flush();
+
+            host.deleteTransaction(tx_id, .outgoing);
+        }
+    };
+
+    pub const SendFile = struct {
+        state: State,
+        path: Wtf16,
+        size: w.LARGE_INTEGER,
+        hash: network.FileHash,
+
+        pub const State = enum {
+            send_metadata,
+            receive_decision,
+            send_file_contents,
+            receive_result,
+        };
+
+        fn sendMetadata(
+            send_file: *SendFile,
+            host: *Host,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            writer: *Io.Writer,
+        ) !void {
+            assert(send_file.state == .send_metadata);
+            assert(peer_tx_id == .invalid);
+
+            const action: network.Action = .transfer_file_metadata;
+            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+
+            const file_size = std.math.cast(network.FileSize, send_file.size) orelse
+                std.debug.panic(
+                    "TODO: File too large to transfer: '{f}' with size {}",
+                    .{ send_file.path.formatUtf8(), send_file.size },
+                );
+            try network.sendMessageHeaderNewTx(writer, tx_id);
+            try network.sendAction(writer, action);
+            try network.sendFileMetadata(
+                writer,
+                switch (cpu_endian) {
+                    .big => @compileError("TODO big endian"),
+                    .little => .wtf16le,
+                },
+                @ptrCast(send_file.path.slice),
+                file_size,
+                &send_file.hash,
+            );
+            try writer.flush();
+
+            send_file.state = .receive_decision;
+            host.flipTransaction(.incoming, tx_id, io);
+        }
+
+        fn receiveDecision(
+            send_file: *SendFile,
+            host: *Host,
+            _: *Io.Reader,
+            io: Io,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            action: network.Action,
+        ) !void {
+            assert(send_file.state == .receive_decision);
+
+            switch (action) {
                 .transfer_file_accept => {
-                    send_file.state = .send_file_contents;
                     if (peer_tx_id == .invalid) return error.WrongPeerTxId;
+                    send_file.state = .send_file_contents;
                     host.tx.peer_tx_id = peer_tx_id;
                     host.flipTransaction(.outgoing, tx_id, io);
                 },
@@ -1365,27 +1281,132 @@ pub const Host = struct {
                     host.deleteTransaction(tx_id, .incoming);
                 },
                 else => return error.InvalidAction,
-            },
-            .receive_result => {
-                switch (action) {
-                    .transfer_file_success, .transfer_file_failure => host.deleteTransaction(tx_id, .incoming),
-                    else => return error.InvalidAction,
-                }
-            },
-            else => unreachable,
+            }
         }
-    }
 
-    fn incomingReceiveFile(
-        host: *Host,
-        receive_file: *Transaction.Data.ReceiveFile,
-        tx_id: network.TransactionId,
-        action: network.Action,
-        io: Io,
-        reader: *Io.Reader,
-    ) !void {
-        switch (receive_file.state) {
-            .receive_file_contents => switch (action) {
+        fn sendFileContents(
+            send_file: *SendFile,
+            host: *Host,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            writer: *Io.Writer,
+        ) !void {
+            assert(send_file.state == .send_file_contents);
+
+            const action: network.Action = .transfer_file_contents;
+            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+
+            const handle = try host.db.openFileReadOnly(io, send_file.path);
+            defer host.db.closeFile(handle);
+
+            try network.sendMessageHeaderExistingTx(writer, peer_tx_id);
+            try network.sendAction(writer, action);
+            try sendFile(writer, handle, send_file.size);
+            try writer.flush();
+
+            send_file.state = .receive_result;
+            host.flipTransaction(.incoming, tx_id, io);
+        }
+
+        fn receiveResult(
+            _: *const SendFile,
+            host: *Host,
+            _: *Io.Reader,
+            _: Io,
+            tx_id: network.TransactionId,
+            action: network.Action,
+        ) !void {
+            switch (action) {
+                .transfer_file_success, .transfer_file_failure => host.deleteTransaction(tx_id, .incoming),
+                else => return error.InvalidAction,
+            }
+        }
+    };
+
+    pub const ReceiveFile = struct {
+        state: State,
+        path: Wtf16,
+        size: w.LARGE_INTEGER,
+        hash: network.FileHash,
+
+        pub const State = union(enum) {
+            send_decision: SendDecision,
+            receive_file_contents,
+            send_result: SendResult,
+
+            pub const SendDecision = enum { accept, decline };
+            pub const SendResult = enum { success, failure };
+        };
+
+        fn newTx(
+            host: *Host,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            reader: *Io.Reader,
+        ) !void {
+            var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
+            const metadata = try network.receiveFileMetadata(reader, &file_path_buffer);
+            const file_path, const comparison = try host.db.checkMetadata(&metadata, &file_path_buffer, io);
+
+            const decision: State.SendDecision =
+                switch (comparison) {
+                    .equals => .decline,
+                    .differs => .accept,
+                };
+
+            const data: TxData = .{
+                .receive_file = .{
+                    .state = .{ .send_decision = decision },
+                    .path = file_path,
+                    .size = @as(w.LARGE_INTEGER, @intCast(metadata.file_size)),
+                    .hash = metadata.hash,
+                },
+            };
+            try host.addOutgoingTx(io, data, peer_tx_id);
+        }
+
+        fn sendDecision(
+            receive_file: *ReceiveFile,
+            host: *Host,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            writer: *Io.Writer,
+        ) !void {
+            assert(receive_file.state == .send_decision);
+            assert(peer_tx_id != .invalid);
+
+            const actual_tx_id: network.TransactionId, const action: network.Action =
+                switch (receive_file.state.send_decision) {
+                    .accept => .{ tx_id, .transfer_file_accept },
+                    .decline => .{ .invalid, .transfer_file_decline },
+                };
+            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+
+            try network.sendMessageHeaderNewTxReply(writer, actual_tx_id, peer_tx_id);
+            try network.sendAction(writer, action);
+            try writer.flush();
+
+            switch (receive_file.state.send_decision) {
+                .accept => {
+                    receive_file.state = .receive_file_contents;
+                    host.flipTransaction(.incoming, tx_id, io);
+                },
+                .decline => host.deleteTransaction(tx_id, .outgoing),
+            }
+        }
+
+        fn receiveFileContents(
+            receive_file: *ReceiveFile,
+            host: *Host,
+            reader: *Io.Reader,
+            io: Io,
+            tx_id: network.TransactionId,
+            action: network.Action,
+        ) !void {
+            assert(receive_file.state == .receive_file_contents);
+            switch (action) {
                 .transfer_file_contents => {
                     const handle = try host.db.createFile(io, receive_file.path, receive_file.size);
                     defer host.db.closeFile(handle);
@@ -1402,8 +1423,31 @@ pub const Host = struct {
                     host.flipTransaction(.outgoing, tx_id, io);
                 },
                 else => return error.InvalidAction,
-            },
-            .send_decision, .send_result => unreachable,
+            }
         }
-    }
+
+        fn sendResult(
+            receive_file: *const ReceiveFile,
+            host: *Host,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            _: Io,
+            writer: *Io.Writer,
+        ) !void {
+            assert(receive_file.state == .send_result);
+            assert(peer_tx_id != .invalid);
+
+            const action: network.Action = switch (receive_file.state.send_result) {
+                .success => .transfer_file_success,
+                .failure => .transfer_file_failure,
+            };
+            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+
+            try network.sendMessageHeaderExistingTx(writer, peer_tx_id);
+            try network.sendAction(writer, action);
+            try writer.flush();
+
+            host.deleteTransaction(tx_id, .outgoing);
+        }
+    };
 };

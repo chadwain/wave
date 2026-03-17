@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
     const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.peerSyncDir());
     defer allocator.free(peer_sync_dir);
 
-    var tx_queue_buffer: [1]wave.windows.Host.Transaction.Data = undefined;
+    var tx_queue_buffer: [1]wave.windows.TxData = undefined;
     var tx_queue: wave.windows.Host.TxQueue = .init(&tx_queue_buffer);
     defer tx_queue.close(io);
 
