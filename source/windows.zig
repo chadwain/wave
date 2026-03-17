@@ -28,20 +28,6 @@ pub const Wtf16 = struct {
     }
 };
 
-/// A WTF-16 encoded zero-terminated string, with the endianness of the host system.
-pub const Wtf16Z = struct {
-    slice: [:0]const w.WCHAR,
-
-    pub fn wtf16ZCast(slice: [:0]const w.WCHAR) Wtf16Z {
-        return .{ .slice = slice };
-    }
-
-    /// Does a potentially lossy conversion from WTF-16 to UTF-8.
-    pub fn formatUtf8(self: Wtf16Z) std.fmt.Alt([]const w.WCHAR, formatWtf16AsUtf8) {
-        return .{ .data = self.slice };
-    }
-};
-
 fn formatWtf16AsUtf8(slice: []const w.WCHAR, writer: *Io.Writer) Io.Writer.Error!void {
     switch (cpu_endian) {
         .little => try writer.print("{f}", .{std.unicode.fmtUtf16Le(slice)}),
@@ -53,18 +39,20 @@ pub const Database = struct {
     sync_dir: w.HANDLE,
     sync_dir_io: Io.Dir,
 
-    file_path_arena: std.heap.ArenaAllocator.State = .{},
-    all_known_files: FileHashMap(Entry) = .empty,
-    files_needing_sync: FileHashMap(void) = .empty,
+    file_path_arena: std.heap.ArenaAllocator.State,
+    all_known_files: FileHashMap(Entry),
+    files_needing_sync: FileHashMap(void),
+    new_files: FileHashMap(void),
 
     allocator: Allocator,
     mutex: Io.Mutex, // TODO: Replace with RwLock
     debug: Debug,
 
     pub const Entry = struct {
+        local_file_id: w.LARGE_INTEGER,
         hash: network.FileHash,
         modified_time: w.LARGE_INTEGER,
-        size: w.LARGE_INTEGER, // TODO: Store as an unsigned integer
+        size: w.ULARGE_INTEGER,
     };
 
     pub fn FileHashMap(comptime V: type) type {
@@ -105,6 +93,7 @@ pub const Database = struct {
             .file_path_arena = .{},
             .all_known_files = .empty,
             .files_needing_sync = .empty,
+            .new_files = .empty,
 
             .allocator = allocator,
             .mutex = .init,
@@ -118,6 +107,7 @@ pub const Database = struct {
 
         db.all_known_files.deinit(db.allocator);
         db.files_needing_sync.deinit(db.allocator);
+        db.new_files.deinit(db.allocator);
         var file_path_arena = db.file_path_arena.promote(db.allocator);
         file_path_arena.deinit();
 
@@ -125,32 +115,43 @@ pub const Database = struct {
     }
 
     /// Must be called with a lock.
-    fn createOrUpdateEntry(
+    fn updateLocalFile(
         db: *Database,
         path: Wtf16,
         information: *const NtQueryInformation,
         hash: *const network.FileHash,
     ) !void {
-        const gop = try db.all_known_files.getOrPut(db.allocator, path);
-        errdefer db.all_known_files.removeByPtr(gop.key_ptr);
+        const new_entry = Entry{
+            .local_file_id = information.FileId,
+            .hash = hash.*,
+            .modified_time = information.ChangeTime,
+            .size = std.math.cast(w.ULARGE_INTEGER, information.EndOfFile) orelse return error.Unexpected,
+        };
 
-        const need_sync = !gop.found_existing or !std.mem.eql(u8, &gop.value_ptr.hash.blake3, &hash.blake3);
+        const gop = try db.all_known_files.getOrPut(db.allocator, path);
+        errdefer if (!gop.found_existing) db.all_known_files.removeByPtr(gop.key_ptr);
 
         var file_path_arena = db.file_path_arena.promote(db.allocator);
         defer db.file_path_arena = file_path_arena.state;
         const file_path_allocator = file_path_arena.allocator();
-        if (!gop.found_existing) {
-            const path_copied = try file_path_allocator.dupe(w.WCHAR, path.slice);
-            gop.key_ptr.* = .wtf16Cast(path_copied);
-        }
+
+        if (!gop.found_existing) gop.key_ptr.* = try path.dupe(file_path_allocator);
         errdefer if (!gop.found_existing) file_path_allocator.free(gop.key_ptr.slice);
 
-        gop.value_ptr.* = .{
-            .hash = hash.*,
-            .modified_time = information.ChangeTime,
-            .size = information.EndOfFile,
-        };
-        if (need_sync) try db.files_needing_sync.put(db.allocator, gop.key_ptr.*, {});
+        if (gop.found_existing and
+            gop.value_ptr.local_file_id == new_entry.local_file_id and
+            gop.value_ptr.size == new_entry.size and
+            gop.value_ptr.hash.eql(&new_entry.hash)) return;
+
+        if (!gop.found_existing) {
+            try db.new_files.ensureUnusedCapacity(db.allocator, 1);
+            gop.value_ptr.* = new_entry;
+            db.new_files.putAssumeCapacity(gop.key_ptr.*, {});
+        } else {
+            try db.files_needing_sync.ensureUnusedCapacity(db.allocator, 1);
+            gop.value_ptr.* = new_entry;
+            db.files_needing_sync.putAssumeCapacity(gop.key_ptr.*, {});
+        }
     }
 
     fn checkMetadata(
@@ -218,7 +219,7 @@ pub const Database = struct {
         hash: *const network.FileHash,
         file_size: w.LARGE_INTEGER,
     ) !void {
-        const information = blk: {
+        const basic_information = blk: {
             var iosb: w.IO_STATUS_BLOCK = undefined;
             var information: w.FILE.BASIC_INFORMATION = undefined;
             const status = w.ntdll.NtQueryInformationFile(
@@ -233,21 +234,38 @@ pub const Database = struct {
                 else => return w.unexpectedStatus(status),
             }
         };
+        const internal_information = blk: {
+            var iosb: w.IO_STATUS_BLOCK = undefined;
+            var information: w.FILE.INTERNAL_INFORMATION = undefined;
+            const status = w.ntdll.NtQueryInformationFile(
+                handle,
+                &iosb,
+                &information,
+                @sizeOf(@TypeOf(information)),
+                .Internal,
+            );
+            switch (status) {
+                .SUCCESS => break :blk information,
+                else => return w.unexpectedStatus(status),
+            }
+        };
 
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
         try db.all_known_files.put(db.allocator, path, .{
+            .local_file_id = internal_information.IndexNumber,
             .hash = hash.*,
-            .modified_time = information.ChangeTime,
-            .size = file_size,
+            .modified_time = basic_information.ChangeTime,
+            .size = @intCast(file_size),
         });
     }
 
     pub const Debug = struct {
-        /// Must be called with a lock.
-        pub fn printKnownFiles(debug: *const Debug, writer: *Io.Writer) !void {
-            const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
+        pub fn printKnownFiles(debug: *Debug, writer: *Io.Writer, io: Io) !void {
+            const db: *Database = @alignCast(@fieldParentPtr("debug", debug));
+            try db.mutex.lock(io);
+            defer db.mutex.unlock(io);
 
             var it = db.all_known_files.iterator();
             while (it.next()) |entry| {
@@ -263,19 +281,30 @@ pub const Database = struct {
             }
         }
 
-        /// Must be called with a lock.
-        pub fn printFilesNeedingSync(debug: *const Debug, writer: *Io.Writer) !void {
-            const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
+        pub fn printFilesNeedingSync(debug: *Debug, writer: *Io.Writer, io: Io) !void {
+            const db: *Database = @alignCast(@fieldParentPtr("debug", debug));
+            try db.mutex.lock(io);
+            defer db.mutex.unlock(io);
 
-            var it = db.files_needing_sync.iterator();
-            while (it.next()) |entry| {
-                try writer.print("{f}\n", .{entry.key_ptr.formatUtf8()});
+            try writer.writeAll("Locally new files\n");
+            var it1 = db.new_files.iterator();
+            while (it1.next()) |entry| {
+                try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()});
             }
+
+            try writer.writeAll("\nLocally updated files\n");
+            var it2 = db.files_needing_sync.iterator();
+            while (it2.next()) |entry| {
+                try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()});
+            }
+
+            try writer.writeAll("\n");
         }
 
-        /// Must be called with a lock.
-        pub fn hostTransferFile(debug: *const Debug, index: usize, io: Io, q: *Host.TxQueue) !void {
-            const db: *const Database = @alignCast(@fieldParentPtr("debug", debug));
+        pub fn hostTransferFile(debug: *Debug, index: usize, q: *Host.TxQueue, io: Io) !void {
+            const db: *Database = @alignCast(@fieldParentPtr("debug", debug));
+            try db.mutex.lock(io);
+            defer db.mutex.unlock(io);
 
             const entry = blk: {
                 var it = db.all_known_files.iterator();
@@ -369,10 +398,10 @@ const FullScanContext = struct {
             .ENCRYPTED = true,
         };
         if (@as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0) {
-            const component_delimeter_index = ctx.sub_path.items.len;
-            defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
-            try ctx.sub_path.appendSlice(allocator, name.slice);
-            std.debug.print("Not processing file: {f}\n", .{std.unicode.fmtUtf16Le(ctx.sub_path.items)});
+            std.debug.print("Not processing file because it has unwanted attributes: {f}{f}\n", .{
+                std.unicode.fmtUtf16Le(ctx.sub_path.items),
+                std.unicode.fmtUtf16Le(name.slice),
+            });
             return;
         }
 
@@ -386,12 +415,13 @@ const FullScanContext = struct {
             defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
             try ctx.sub_path.appendSlice(allocator, name.slice);
 
+            // TODO: Do not compute the hash right now
             const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
             const file = try openFile(dir, name, .read);
             defer w.CloseHandle(file);
             const hash = try computeFileHash(file, information.EndOfFile);
 
-            try db.createOrUpdateEntry(.wtf16Cast(ctx.sub_path.items), information, &hash);
+            try db.updateLocalFile(.wtf16Cast(ctx.sub_path.items), information, &hash);
         }
     }
 };
@@ -477,11 +507,13 @@ fn scanOneDirectory(db: *Database, allocator: Allocator, ctx: *FullScanContext) 
         while (next_entry_offset != 0) : (offset += next_entry_offset) {
             const info: *const NtQueryInformation = @ptrCast(@alignCast(&buffer[offset]));
             next_entry_offset = info.NextEntryOffset;
+
             const offset_of_file_name = @offsetOf(NtQueryInformation, "FileName");
             const file_name_bytes = buffer[offset + offset_of_file_name ..][0..info.FileNameLength];
             const file_name: Wtf16 = .wtf16Cast(@ptrCast(@alignCast(file_name_bytes)));
 
-            if (std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".")) or
+            if (info.FileNameLength > w.NAME_MAX or
+                std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".")) or
                 std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".."))) continue;
 
             try ctx.addObject(db, allocator, file_name, info);
@@ -492,7 +524,7 @@ fn scanOneDirectory(db: *Database, allocator: Allocator, ctx: *FullScanContext) 
 /// Opens a directory capable of async operations and being waited on.
 fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     var handle: w.HANDLE = undefined;
-    const path_byte_count: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
+    const path_byte_count: w.USHORT = @intCast(path.slice.len * @sizeOf(w.WCHAR));
     var unicode_string: w.UNICODE_STRING = .{
         .Length = path_byte_count,
         .MaximumLength = path_byte_count,
@@ -624,7 +656,7 @@ const SendFileError = Io.Writer.Error || Io.UnexpectedError;
 fn sendFile(
     writer: *Io.Writer,
     handle: w.HANDLE,
-    file_size: w.LARGE_INTEGER,
+    file_size: w.ULARGE_INTEGER,
 ) SendFileError!void {
     // TODO: Actually use sendfile or whatever it is on Windows
     var iosb: w.IO_STATUS_BLOCK = undefined;
@@ -634,7 +666,7 @@ fn sendFile(
             const slice = try writer.writableSliceGreedy(1);
             break :buffer slice[0..@min(
                 slice.len,
-                @as(w.ULARGE_INTEGER, @intCast(file_size - written)),
+                file_size - @as(w.ULARGE_INTEGER, @intCast(written)),
                 std.math.maxInt(w.ULONG),
             )];
         };
@@ -724,76 +756,89 @@ fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash
     return result;
 }
 
-pub fn watch(sync_dir: w.HANDLE, io: Io) !void {
-    const buffer_size = 64 * 1024;
-    var buffer align(@alignOf(w.DWORD)) = @as([buffer_size]w.BYTE, undefined);
-    const notify_filters: w.FileNotifyChangeFilter = .{ .file_name = true, .dir_name = true, .last_write = true };
-    var overlapped = std.mem.zeroes(w.OVERLAPPED);
-
-    main: while (true) {
-        { // TODO: Try to call ReadDirectoryChanges immediately after GetOverlappedResult so that we don't miss changes
-            var bytes_returned: w.DWORD = undefined;
-            const res = w.kernel32.ReadDirectoryChangesW(
-                sync_dir,
-                &buffer,
-                buffer_size,
-                w.TRUE,
-                notify_filters,
-                &bytes_returned,
-                &overlapped,
-                null,
-            );
-            if (res == 0) return error.ReadDirectoryChanges;
-        }
-
-        const bytes_transferred: w.DWORD = blk: while (true) {
-            try io.sleep(.fromSeconds(1), .cpu_thread);
-
-            var bytes_transferred: w.DWORD = undefined;
-            const res = w.kernel32.GetOverlappedResult(sync_dir, &overlapped, &bytes_transferred, w.FALSE);
-            switch (res) {
-                w.FALSE => switch (w.GetLastError()) {
-                    .IO_INCOMPLETE => continue,
-                    else => |err| {
-                        std.debug.print("Windows error: {s}\n", .{@tagName(err)});
-                        return error.GetOverlappedResult;
-                    },
-                },
-                else => {},
-            }
-            if (bytes_transferred == 0) {
-                std.debug.print("Couldn't read directory changes\n", .{});
-                continue :main;
-            }
-            break :blk bytes_transferred;
-        };
-
-        processChanges((&buffer)[0..bytes_transferred]);
-    }
-}
-
-fn processChanges(buffer_complete: []align(@alignOf(w.DWORD)) w.BYTE) void {
-    var ptr: [*]w.BYTE = buffer_complete.ptr;
+pub fn watch(db: *Database, io: Io, thread_safe_allocator: Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(thread_safe_allocator);
+    defer arena.deinit();
+    var stderr = Io.File.stderr().writer(io, &.{});
     while (true) {
-        const file_notify_info: *const w.FILE_NOTIFY_INFORMATION = @ptrCast(@alignCast(ptr));
-
-        const Action = enum(w.DWORD) {
-            added = w.FILE_ACTION_ADDED,
-            removed = w.FILE_ACTION_REMOVED,
-            modified = w.FILE_ACTION_MODIFIED,
-            renamed_old_name = w.FILE_ACTION_RENAMED_OLD_NAME,
-            renamed_new_name = w.FILE_ACTION_RENAMED_NEW_NAME,
-        };
-        const action: Action = @enumFromInt(file_notify_info.Action);
-
-        const file_name_begin = ptr + @sizeOf(w.FILE_NOTIFY_INFORMATION);
-        const file_name: []const w.WCHAR = @ptrCast(@alignCast(file_name_begin[0..file_notify_info.FileNameLength]));
-        std.debug.print("{s}: {f}\n", .{ @tagName(action), std.unicode.fmtUtf16Le(file_name) });
-
-        if (file_notify_info.NextEntryOffset == 0) break;
-        ptr += file_notify_info.NextEntryOffset;
+        _ = arena.reset(.retain_capacity);
+        try completeScan(db, io, arena.allocator());
+        try stderr.interface.writeAll("Scan complete\n");
+        try db.debug.printFilesNeedingSync(&stderr.interface, io);
+        try io.sleep(.fromSeconds(15), .boot);
     }
 }
+
+// pub fn watch(sync_dir: w.HANDLE, io: Io) !void {
+//     const buffer_size = 64 * 1024;
+//     var buffer align(@alignOf(w.DWORD)) = @as([buffer_size]w.BYTE, undefined);
+//     const notify_filters: w.FileNotifyChangeFilter = .{ .file_name = true, .dir_name = true, .last_write = true };
+//     var overlapped = std.mem.zeroes(w.OVERLAPPED);
+
+//     main: while (true) {
+//         { // TODO: Try to call ReadDirectoryChanges immediately after GetOverlappedResult so that we don't miss changes
+//             var bytes_returned: w.DWORD = undefined;
+//             const res = w.kernel32.ReadDirectoryChangesW(
+//                 sync_dir,
+//                 &buffer,
+//                 buffer_size,
+//                 w.TRUE,
+//                 notify_filters,
+//                 &bytes_returned,
+//                 &overlapped,
+//                 null,
+//             );
+//             if (res == 0) return error.ReadDirectoryChanges;
+//         }
+
+//         const bytes_transferred: w.DWORD = blk: while (true) {
+//             try io.sleep(.fromSeconds(1), .cpu_thread);
+
+//             var bytes_transferred: w.DWORD = undefined;
+//             const res = w.kernel32.GetOverlappedResult(sync_dir, &overlapped, &bytes_transferred, w.FALSE);
+//             switch (res) {
+//                 w.FALSE => switch (w.GetLastError()) {
+//                     .IO_INCOMPLETE => continue,
+//                     else => |err| {
+//                         std.debug.print("Windows error: {s}\n", .{@tagName(err)});
+//                         return error.GetOverlappedResult;
+//                     },
+//                 },
+//                 else => {},
+//             }
+//             if (bytes_transferred == 0) {
+//                 std.debug.print("Couldn't read directory changes\n", .{});
+//                 continue :main;
+//             }
+//             break :blk bytes_transferred;
+//         };
+
+//         processChanges((&buffer)[0..bytes_transferred]);
+//     }
+// }
+
+// fn processChanges(buffer_complete: []align(@alignOf(w.DWORD)) w.BYTE) void {
+//     var ptr: [*]w.BYTE = buffer_complete.ptr;
+//     while (true) {
+//         const file_notify_info: *const w.FILE_NOTIFY_INFORMATION = @ptrCast(@alignCast(ptr));
+
+//         const Action = enum(w.DWORD) {
+//             added = w.FILE_ACTION_ADDED,
+//             removed = w.FILE_ACTION_REMOVED,
+//             modified = w.FILE_ACTION_MODIFIED,
+//             renamed_old_name = w.FILE_ACTION_RENAMED_OLD_NAME,
+//             renamed_new_name = w.FILE_ACTION_RENAMED_NEW_NAME,
+//         };
+//         const action: Action = @enumFromInt(file_notify_info.Action);
+
+//         const file_name_begin = ptr + @sizeOf(w.FILE_NOTIFY_INFORMATION);
+//         const file_name: []const w.WCHAR = @ptrCast(@alignCast(file_name_begin[0..file_notify_info.FileNameLength]));
+//         std.debug.print("{s}: {f}\n", .{ @tagName(action), std.unicode.fmtUtf16Le(file_name) });
+
+//         if (file_notify_info.NextEntryOffset == 0) break;
+//         ptr += file_notify_info.NextEntryOffset;
+//     }
+// }
 
 pub const Host = struct {
     tx: Transaction,
@@ -1211,7 +1256,7 @@ pub const TxData = union(enum) {
     pub const SendFile = struct {
         state: State,
         path: Wtf16,
-        size: w.LARGE_INTEGER,
+        size: w.ULARGE_INTEGER,
         hash: network.FileHash,
 
         pub const State = enum {

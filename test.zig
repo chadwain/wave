@@ -19,8 +19,8 @@ pub fn main(init: std.process.Init) !void {
     var db = try wave.windows.Database.init(.wtf16Cast(sync_dir), io, args.syncDir(), allocator);
     defer db.deinit(io);
 
-    // var watch_task = try io.concurrent(wave.windows.watch, .{ db.sync_dir, io });
-    // defer watch_task.cancel(io) catch {};
+    var watch_task = try io.concurrent(wave.windows.watch, .{ &db, io, init.gpa });
+    defer watch_task.cancel(io) catch {};
 
     const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.peerSyncDir());
     defer allocator.free(peer_sync_dir);
@@ -58,15 +58,11 @@ fn runCli(io: Io, db: *wave.windows.Database, tx_queue: *wave.windows.Host.TxQue
         if (line.len != 1) continue;
         switch (line[0]) {
             'a' => {
-                try db.mutex.lock(io);
-                defer db.mutex.unlock(io);
-                try db.debug.printKnownFiles(&stdout.interface);
+                try db.debug.printKnownFiles(&stdout.interface, io);
                 try stdout.interface.flush();
             },
             'n' => {
-                try db.mutex.lock(io);
-                defer db.mutex.unlock(io);
-                try db.debug.printFilesNeedingSync(&stdout.interface);
+                try db.debug.printFilesNeedingSync(&stdout.interface, io);
                 try stdout.interface.flush();
             },
             's' => {
@@ -76,9 +72,7 @@ fn runCli(io: Io, db: *wave.windows.Database, tx_queue: *wave.windows.Host.TxQue
             },
             '0'...'9' => |c| {
                 const index = c - '0';
-                try db.mutex.lock(io);
-                defer db.mutex.unlock(io);
-                try db.debug.hostTransferFile(index, io, tx_queue);
+                try db.debug.hostTransferFile(index, tx_queue, io);
             },
             'q' => break,
             else => continue,

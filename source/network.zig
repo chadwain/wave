@@ -55,6 +55,10 @@ pub const FileHash = struct {
 
     pub const byte_size = 32;
 
+    pub fn eql(lhs: *const FileHash, rhs: *const FileHash) bool {
+        return std.mem.eql(u8, &lhs.blake3, &rhs.blake3);
+    }
+
     pub fn format(hash: FileHash, writer: *Io.Writer) Io.Writer.Error!void {
         try writer.print("{x}", .{std.mem.nativeToBig(@Int(.unsigned, byte_size * 8), @bitCast(hash.blake3))});
     }
