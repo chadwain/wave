@@ -957,43 +957,47 @@ pub const Host = struct {
 
     pub const RunError = Io.ConcurrentError || Io.Cancelable;
 
-    pub const RunResult = struct {
-        read_tx_queue_result: ReadTxQueueError!void,
-        outgoing_result: OutgoingError!void,
-        incoming_result: IncomingError!void,
+    pub const Diagnostics = struct {
+        read_tx_queue: ?ReadTxQueueError = null,
+        outgoing: ?OutgoingError = null,
+        incoming: ?IncomingError = null,
     };
 
     pub fn run(
         host: *Host,
+        diag: ?*Diagnostics,
         io: Io,
         tx_queue: *TxQueue,
         reader: *Io.Reader,
         writer: *Io.Writer,
-    ) RunError!RunResult {
-        const U = union(enum) {
-            read_queue: ReadTxQueueError!void,
-            outgoing: OutgoingError!void,
-            incoming: IncomingError!void,
-        };
-        var select_buffer: [3]U = undefined;
-        var select = Io.Select(U).init(io, &select_buffer);
-        defer select.cancelDiscard();
+    ) RunError!void {
+        const ns = struct {
+            const SelectUnion = union(enum) {
+                read_tx_queue: ReadTxQueueError!void,
+                outgoing: OutgoingError!void,
+                incoming: IncomingError!void,
+            };
 
-        try select.concurrent(.read_queue, readTxQueue, .{ host, io, tx_queue });
+            fn addToDiagnostics(d: ?*Diagnostics, u: SelectUnion) void {
+                const ptr = d orelse return;
+                switch (u) {
+                    inline else => |payload, tag| {
+                        @field(ptr, @tagName(tag)) = if (payload) |_| null else |err| err;
+                    },
+                }
+            }
+        };
+
+        var select_buffer: [3]ns.SelectUnion = undefined;
+        var select = Io.Select(ns.SelectUnion).init(io, &select_buffer);
+        defer while (select.cancel()) |result| ns.addToDiagnostics(diag, result);
+
+        try select.concurrent(.read_tx_queue, readTxQueue, .{ host, io, tx_queue });
         try select.concurrent(.outgoing, sendOutgoingTxs, .{ host, io, writer });
         try select.concurrent(.incoming, receiveIncomingTxs, .{ host, io, reader });
 
         host.debugLog("started", .{});
-
-        var result: RunResult = undefined;
-        for (0..3) |_| {
-            switch (try select.await()) {
-                .read_queue => |read_queue| result.read_tx_queue_result = read_queue,
-                .outgoing => |outgoing| result.outgoing_result = outgoing,
-                .incoming => |incoming| result.incoming_result = incoming,
-            }
-        }
-        return result;
+        ns.addToDiagnostics(diag, try select.await());
     }
 
     pub const ReadTxQueueError = Io.QueueClosedError || Io.Cancelable || AddOutgoingTxError;
@@ -1009,12 +1013,6 @@ pub const Host = struct {
     pub const OutgoingError = Io.Writer.Error || Io.Cancelable || SendFileError;
 
     fn sendOutgoingTxs(host: *Host, io: Io, writer: *Io.Writer) OutgoingError!void {
-        errdefer {
-            if (@errorReturnTrace()) |trace| {
-                host.debugLog("{f}", .{std.debug.FormatStackTrace{ .stack_trace = trace.* }});
-            }
-        }
-
         while (true) {
             var direction = host.tx.direction.load(.monotonic);
             while (direction != .outgoing) {
@@ -1224,12 +1222,6 @@ pub const Host = struct {
         Io.Reader.StreamError || Io.Cancelable || Allocator.Error || AddOutgoingTxError || ReceiveFileError;
 
     fn receiveIncomingTxs(host: *Host, io: Io, reader: *Io.Reader) IncomingError!void {
-        errdefer {
-            if (@errorReturnTrace()) |trace| {
-                host.debugLog("{f}", .{std.debug.FormatStackTrace{ .stack_trace = trace.* }});
-            }
-        }
-
         while (true) {
             const header = try network.receiveMessageHeader(reader);
             if (header.tag == .disconnect) break;

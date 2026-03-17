@@ -123,6 +123,7 @@ fn startHostPair(
 
     const stream = try server.accept(io);
     defer stream.close(io);
+    std.debug.print("connected\n", .{});
 
     var read_buffer: [64]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
@@ -131,9 +132,9 @@ fn startHostPair(
 
     var host = wave.windows.Host.init(db, .{ .name = "A" });
     defer host.deinit();
-    std.debug.print("connected\n", .{});
-    const result = try host.run(io, tx_queue, &reader.interface, &writer.interface);
-    std.debug.print("A result: {any}\n", .{result});
+    var diag: wave.windows.Host.Diagnostics = .{};
+    defer std.debug.print("A result: {any}\n", .{diag});
+    try host.run(&diag, io, tx_queue, &reader.interface, &writer.interface);
 }
 
 fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16, sync_dir_wtf8: []const u8) !void {
@@ -157,6 +158,7 @@ fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16, sync_
 
     var host = wave.windows.Host.init(&db, .{ .name = "B" });
     defer host.deinit();
-    const result = try host.run(io, &tx_queue, &reader.interface, &writer.interface);
-    std.debug.print("B result: {any}\n", .{result});
+    var diag: wave.windows.Host.Diagnostics = .{};
+    defer std.debug.print("B result: {any}\n", .{diag});
+    try host.run(&diag, io, &tx_queue, &reader.interface, &writer.interface);
 }
