@@ -64,7 +64,7 @@ pub const FileHash = struct {
     }
 };
 
-pub const FileId = u32;
+pub const FileId = enum(u32) { unknown, _ };
 
 pub const FileSize = u64;
 
@@ -113,7 +113,7 @@ pub fn sendAction(writer: *Io.Writer, action: Action) !void {
 
 /// Asserts a writer buffer size of at least `@sizeOf(FileId)`.
 pub fn sendFileId(writer: *Io.Writer, id: FileId) !void {
-    try writer.writeInt(FileId, id, endian);
+    try writer.writeInt(std.meta.Tag(FileId), @intFromEnum(id), endian);
 }
 
 /// Asserts a writer buffer size of at least `@sizeOf(PathByteCount)`.
@@ -157,7 +157,8 @@ pub fn receiveAction(reader: *Io.Reader) ReceiveActionError!Action {
 
 /// Asserts a reader buffer size of at least `@sizeOf(FileId)`.
 pub fn receiveFileId(reader: *Io.Reader) Io.Reader.Error!FileId {
-    return reader.takeInt(FileId, endian);
+    // All values of FileId are valid
+    return std.enums.fromInt(FileId, try reader.takeInt(std.meta.Tag(FileId), endian)).?;
 }
 
 pub const IncomingNewFilePath = struct {

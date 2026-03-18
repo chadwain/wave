@@ -44,11 +44,26 @@ pub const Database = struct {
     files_needing_sync: FileHashMap(void),
     new_files: FileHashMap(void),
 
+    // Database-Host synchronization fields (client only)
+    event: std.atomic.Value(Event),
+    host_state: std.atomic.Value(Host.State),
+    out_new_file_path: Wtf16,
+    in_new_file_path: Wtf16,
+    global_file_id: network.FileId,
+
     allocator: Allocator,
     mutex: Io.Mutex, // TODO: Replace with RwLock
     debug: Debug,
 
+    pub const Event = enum(u32) {
+        none,
+        acquired,
+        update_global_file_id,
+    };
+
     pub const Entry = struct {
+        global_file_id: network.FileId,
+
         local_file_id: w.LARGE_INTEGER,
         hash: network.FileHash,
         modified_time: w.LARGE_INTEGER,
@@ -95,6 +110,12 @@ pub const Database = struct {
             .files_needing_sync = .empty,
             .new_files = .empty,
 
+            .event = .init(.none),
+            .host_state = .init(.{}),
+            .out_new_file_path = undefined,
+            .in_new_file_path = undefined,
+            .global_file_id = undefined,
+
             .allocator = allocator,
             .mutex = .init,
             .debug = .{},
@@ -114,6 +135,66 @@ pub const Database = struct {
         db.* = undefined;
     }
 
+    pub fn run(db: *Database, io: Io, thread_safe_allocator: Allocator) !void {
+        var arena = std.heap.ArenaAllocator.init(thread_safe_allocator);
+        defer arena.deinit();
+        var stderr = Io.File.stderr().writer(io, &.{});
+
+        const max_wait_time = Io.Clock.Duration{ .clock = .boot, .raw = .fromSeconds(5) };
+        var start = Io.Clock.boot.now(io);
+        while (true) {
+            const now = Io.Clock.boot.now(io);
+            if (start.durationTo(now).nanoseconds > max_wait_time.raw.nanoseconds) {
+                _ = arena.reset(.retain_capacity);
+                try completeScan(db, io, arena.allocator());
+                try stderr.interface.writeAll("Scan complete\n");
+                try db.debug.printFilesNeedingSync(&stderr.interface, io);
+                start = Io.Clock.boot.now(io);
+                continue;
+            }
+
+            const event = db.event.load(.monotonic);
+            switch (event) {
+                .none => {
+                    if (db.new_files.count() != 0) blk: {
+                        var host_state = db.host_state.load(.monotonic);
+                        while (host_state.event == .none) {
+                            var new_host_state = host_state;
+                            new_host_state.event = .acquired;
+                            host_state = db.host_state.cmpxchgWeak(host_state, new_host_state, .acquire, .monotonic) orelse break;
+                        } else break :blk;
+
+                        {
+                            try db.mutex.lock(io);
+                            defer db.mutex.unlock(io);
+
+                            var it = db.new_files.keyIterator();
+                            db.out_new_file_path = it.next().?.*;
+                        }
+
+                        host_state = db.host_state.load(.monotonic);
+                        while (true) {
+                            assert(host_state.event == .acquired);
+                            var new_host_state = host_state;
+                            new_host_state.event = .get_global_file_id;
+                            host_state = db.host_state.cmpxchgWeak(host_state, new_host_state, .release, .monotonic) orelse break;
+                        }
+
+                        io.futexWake(Host.State, &db.host_state.raw, 1);
+                        continue;
+                    }
+
+                    try io.futexWaitTimeout(Database.Event, &db.event.raw, .none, .{ .duration = max_wait_time });
+                },
+                .acquired => try io.futexWaitTimeout(Database.Event, &db.event.raw, .acquired, .{ .duration = max_wait_time }),
+                .update_global_file_id => {
+                    try db.updateGlobalFileId(io);
+                    db.event.store(.none, .release);
+                },
+            }
+        }
+    }
+
     /// Must be called with a lock.
     fn updateLocalFile(
         db: *Database,
@@ -122,6 +203,7 @@ pub const Database = struct {
         hash: *const network.FileHash,
     ) !void {
         const new_entry = Entry{
+            .global_file_id = .unknown, // TODO wrong value
             .local_file_id = information.FileId,
             .hash = hash.*,
             .modified_time = information.ChangeTime,
@@ -152,6 +234,20 @@ pub const Database = struct {
             gop.value_ptr.* = new_entry;
             db.files_needing_sync.putAssumeCapacity(gop.key_ptr.*, {});
         }
+    }
+
+    fn updateGlobalFileId(db: *Database, io: Io) !void {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        const ptr = db.all_known_files.getPtr(db.in_new_file_path) orelse {
+            std.debug.print("Got global file id, but file is not in database: {f}", .{db.in_new_file_path.formatUtf8()});
+            return;
+        };
+        ptr.global_file_id = db.global_file_id;
+        assert(db.new_files.remove(db.in_new_file_path) == true);
+        db.in_new_file_path = undefined;
+        db.global_file_id = undefined;
     }
 
     fn checkMetadata(
@@ -254,6 +350,7 @@ pub const Database = struct {
         defer db.mutex.unlock(io);
 
         try db.all_known_files.put(db.allocator, path, .{
+            .global_file_id = .unknown, // TODO wrong value
             .local_file_id = internal_information.IndexNumber,
             .hash = hash.*,
             .modified_time = basic_information.ChangeTime,
@@ -756,19 +853,6 @@ fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash
     return result;
 }
 
-pub fn watch(db: *Database, io: Io, thread_safe_allocator: Allocator) !void {
-    var arena = std.heap.ArenaAllocator.init(thread_safe_allocator);
-    defer arena.deinit();
-    var stderr = Io.File.stderr().writer(io, &.{});
-    while (true) {
-        _ = arena.reset(.retain_capacity);
-        try completeScan(db, io, arena.allocator());
-        try stderr.interface.writeAll("Scan complete\n");
-        try db.debug.printFilesNeedingSync(&stderr.interface, io);
-        try io.sleep(.fromSeconds(15), .boot);
-    }
-}
-
 // pub fn watch(sync_dir: w.HANDLE, io: Io) !void {
 //     const buffer_size = 64 * 1024;
 //     var buffer align(@alignOf(w.DWORD)) = @as([buffer_size]w.BYTE, undefined);
@@ -842,6 +926,7 @@ pub fn watch(db: *Database, io: Io, thread_safe_allocator: Allocator) !void {
 
 pub const Host = struct {
     tx: Transaction,
+    // TODO: Don't store this here, instead make it an argument to `run`
     db: *Database,
     debug: Debug,
 
@@ -850,12 +935,31 @@ pub const Host = struct {
     };
 
     pub const Transaction = struct {
-        // This is align(4) so that we can `futexWait` on it.
-        direction: std.atomic.Value(Direction) align(4),
         data: TxData,
         peer_tx_id: network.TransactionId,
+    };
 
-        pub const Direction = enum(u32) { not_in_use, init, outgoing, incoming };
+    pub const State = packed struct(u32) {
+        tx: TxStatus = .init,
+        event: Event = .none,
+        padding: u28 = 0,
+
+        pub const TxStatus = enum(u2) {
+            /// The TX is free to use.
+            init,
+            /// The TX is locked and being initialized.
+            acquired,
+            /// The TX is locked and owned by the outgoing task.
+            outgoing,
+            /// The TX is locked and owned by the incoming task.
+            incoming,
+        };
+
+        pub const Event = enum(u2) {
+            none,
+            acquired,
+            get_global_file_id,
+        };
     };
 
     pub const TxQueue = Io.Queue(TxData);
@@ -863,7 +967,6 @@ pub const Host = struct {
     pub fn init(db: *Database, debug: Debug) Host {
         return .{
             .tx = .{
-                .direction = .init(.not_in_use),
                 .data = undefined,
                 .peer_tx_id = undefined,
             },
@@ -936,10 +1039,37 @@ pub const Host = struct {
 
     fn sendOutgoingTxs(host: *Host, writer: *Io.Writer, io: Io) OutgoingError!void {
         while (true) {
-            var direction = host.tx.direction.load(.monotonic);
-            while (direction != .outgoing) {
-                try io.futexWait(Transaction.Direction, &host.tx.direction.raw, direction);
-                direction = host.tx.direction.load(.monotonic);
+            while (true) {
+                const state = host.db.host_state.load(.monotonic);
+                if (state.tx == .outgoing) break;
+                sw: switch (state.event) {
+                    .none, .acquired => try io.futexWait(State, &host.db.host_state.raw, state),
+                    .get_global_file_id => {
+                        const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
+                            error.NoTxSlotsAvailable => continue :sw .none,
+                        };
+                        assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
+
+                        host.debugLog("getting global file id for new file: {f}", .{host.db.out_new_file_path.formatUtf8()});
+                        host.tx.data = .{
+                            .send_new_file = .{
+                                .state = .send_path,
+                                .path = host.db.out_new_file_path,
+                            },
+                        };
+                        host.tx.peer_tx_id = .invalid;
+                        host.db.out_new_file_path = undefined;
+
+                        var old_state = state;
+                        while (true) {
+                            var new_state = state;
+                            new_state.tx = .outgoing;
+                            new_state.event = .none;
+                            old_state = host.db.host_state.cmpxchgWeak(old_state, new_state, .release, .monotonic) orelse break;
+                        }
+                        break;
+                    },
+                }
             }
 
             const tx_id: network.TransactionId = @enumFromInt(0); // TODO hardcoded value
@@ -999,7 +1129,7 @@ pub const Host = struct {
                 },
                 .new_tx_reply => {
                     if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
-                    if (host.tx.direction.load(.monotonic) != .incoming) return error.InvalidTxId;
+                    if (host.db.host_state.load(.monotonic).tx != .incoming) return error.InvalidTxId;
                     if (host.tx.peer_tx_id != .invalid) return error.WrongPeerTxId;
 
                     switch (host.tx.data) {
@@ -1039,7 +1169,7 @@ pub const Host = struct {
                 },
                 .existing_tx => {
                     if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
-                    if (host.tx.direction.load(.monotonic) != .incoming) return error.InvalidTxId;
+                    if (host.db.host_state.load(.monotonic).tx != .incoming) return error.InvalidTxId;
                     if (header.peer_tx_id != .invalid) return error.WrongPeerTxId;
 
                     switch (host.tx.data) {
@@ -1073,42 +1203,62 @@ pub const Host = struct {
         host: *Host,
         io: Io,
         data: TxData,
+        // TODO Make non-nullable
         peer_tx_id: ?network.TransactionId,
     ) AddOutgoingTxError!void {
-        if (host.tx.direction.cmpxchgStrong(.not_in_use, .init, .acquire, .monotonic) != null) {
-            return error.NoTxSlotsAvailable;
-        }
+        _ = try host.acquireUnusedTx();
+
         host.tx.data = data;
         host.tx.peer_tx_id = peer_tx_id orelse .invalid;
-        host.tx.direction.store(.outgoing, .release);
-        io.futexWake(Transaction.Direction, &host.tx.direction.raw, 1);
+
+        host.releaseNewTxStatus(.acquired, .outgoing);
+        io.futexWake(State, &host.db.host_state.raw, 1);
     }
 
     fn flipTransaction(
         host: *Host,
-        comptime to: Transaction.Direction,
+        comptime to: State.TxStatus,
         tx_id: network.TransactionId,
         io: Io,
     ) void {
         assert(@intFromEnum(tx_id) == 0); // TODO: hardcoded value
-        const from = &host.tx.direction;
         switch (to) {
-            .not_in_use, .init => unreachable,
+            .init, .acquired => unreachable,
             .outgoing => {
-                assert(from.swap(to, .release) == .incoming);
-                io.futexWake(Transaction.Direction, &from.raw, 1);
+                host.releaseNewTxStatus(.incoming, to);
+                io.futexWake(State, &host.db.host_state.raw, 1);
             },
             .incoming => {
-                assert(from.swap(to, .release) == .outgoing);
+                host.releaseNewTxStatus(.outgoing, to);
             },
         }
     }
 
-    fn deleteTransaction(host: *Host, tx_id: network.TransactionId, expected_direction: Transaction.Direction) void {
-        assert(@intFromEnum(tx_id) == 0); // TODO
+    fn deleteTransaction(host: *Host, tx_id: network.TransactionId, expected_status: State.TxStatus) void {
+        assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
         host.tx.data = undefined;
         host.tx.peer_tx_id = undefined;
-        assert(host.tx.direction.swap(.not_in_use, .release) == expected_direction);
+        host.releaseNewTxStatus(expected_status, .init);
+    }
+
+    fn acquireUnusedTx(host: *Host) !network.TransactionId {
+        var old_state = host.db.host_state.load(.monotonic);
+        while (old_state.tx == .init) {
+            var new_state = old_state;
+            new_state.tx = .acquired;
+            old_state = host.db.host_state.cmpxchgWeak(old_state, new_state, .acquire, .monotonic) orelse break;
+        } else return error.NoTxSlotsAvailable;
+        return @enumFromInt(0); // TODO hardcoded value
+    }
+
+    fn releaseNewTxStatus(host: *Host, expected: State.TxStatus, new: State.TxStatus) void {
+        var old_state = host.db.host_state.load(.monotonic);
+        while (true) {
+            assert(old_state.tx == expected);
+            var new_state = old_state;
+            new_state.tx = new;
+            old_state = host.db.host_state.cmpxchgWeak(old_state, new_state, .release, .monotonic) orelse break;
+        }
     }
 
     fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {
@@ -1121,20 +1271,20 @@ pub const Host = struct {
 
     fn logMessage(
         host: *const Host,
-        direction: Transaction.Direction,
+        tx_status: Host.State.TxStatus,
         tx_id: network.TransactionId,
         action: network.Action,
         peer_tx_id: network.TransactionId,
     ) void {
-        switch (direction) {
-            .not_in_use, .init => unreachable,
+        switch (tx_status) {
+            .init, .acquired => unreachable,
             .outgoing => host.debugLog(
                 "{s} tx#{f} {s} -> peer tx#{f}",
-                .{ @tagName(direction), tx_id, @tagName(action), peer_tx_id },
+                .{ @tagName(tx_status), tx_id, @tagName(action), peer_tx_id },
             ),
             .incoming => host.debugLog(
                 "{s} tx#{f} <- peer tx#{f} {s}",
-                .{ @tagName(direction), tx_id, peer_tx_id, @tagName(action) },
+                .{ @tagName(tx_status), tx_id, peer_tx_id, @tagName(action) },
             ),
         }
     }
@@ -1190,7 +1340,7 @@ pub const TxData = union(enum) {
             send_new_file: *const SendNewFile,
             host: *Host,
             reader: *Io.Reader,
-            _: Io,
+            io: Io,
             tx_id: network.TransactionId,
             peer_tx_id: network.TransactionId,
             action: network.Action,
@@ -1201,7 +1351,15 @@ pub const TxData = union(enum) {
             switch (action) {
                 .new_file_response => {
                     const file_id = try network.receiveFileId(reader);
-                    host.debugLog("received file id: {}\n", .{file_id});
+                    host.debugLog("received file id {} for file {f}\n", .{ file_id, send_new_file.path.formatUtf8() });
+
+                    // TODO spin loop, maybe bad
+                    while (host.db.event.cmpxchgWeak(.none, .acquired, .acquire, .monotonic)) |_| {}
+                    host.db.in_new_file_path = send_new_file.path;
+                    host.db.global_file_id = file_id;
+                    assert(host.db.event.swap(.update_global_file_id, .release) == .acquired);
+                    io.futexWake(Database.Event, &host.db.event.raw, 1);
+
                     host.deleteTransaction(tx_id, .incoming);
                 },
                 else => return error.InvalidAction,
@@ -1224,7 +1382,7 @@ pub const TxData = union(enum) {
 
             const data: TxData = .{
                 .receive_new_file = .{
-                    .file_id = 0, // TODO hardcoded value
+                    .file_id = @enumFromInt(0), // TODO hardcoded value
                 },
             };
             try host.addOutgoingTx(io, data, peer_tx_id);

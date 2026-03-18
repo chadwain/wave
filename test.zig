@@ -19,15 +19,15 @@ pub fn main(init: std.process.Init) !void {
     var db = try wave.windows.Database.init(.wtf16Cast(sync_dir), io, args.syncDir(), allocator);
     defer db.deinit(io);
 
-    var watch_task = try io.concurrent(wave.windows.watch, .{ &db, io, init.gpa });
+    var tx_queue_buffer: [1]wave.windows.TxData = undefined;
+    var tx_queue: wave.windows.Host.TxQueue = .init(&tx_queue_buffer);
+    defer tx_queue.close(io);
+
+    var watch_task = try io.concurrent(wave.windows.Database.run, .{ &db, io, init.gpa });
     defer watch_task.cancel(io) catch {};
 
     const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.peerSyncDir());
     defer allocator.free(peer_sync_dir);
-
-    var tx_queue_buffer: [1]wave.windows.TxData = undefined;
-    var tx_queue: wave.windows.Host.TxQueue = .init(&tx_queue_buffer);
-    defer tx_queue.close(io);
 
     var host_pair_task = try io.concurrent(
         startHostPair,
