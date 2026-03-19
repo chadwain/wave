@@ -45,21 +45,16 @@ pub const Database = struct {
     new_files: FileHashMap(void),
 
     // Database-Host synchronization fields (client only)
-    event: std.atomic.Value(Event),
+    alert: std.atomic.Value(Alert),
     host_state: std.atomic.Value(Host.State),
-    out_new_file_path: Wtf16,
-    in_new_file_path: Wtf16,
-    global_file_id: network.FileId,
+    out_path: Wtf16,
+    out_entry: Entry,
 
     allocator: Allocator,
     mutex: Io.Mutex, // TODO: Replace with RwLock
     debug: Debug,
 
-    pub const Event = enum(u32) {
-        none,
-        acquired,
-        update_global_file_id,
-    };
+    pub const Alert = enum(u32) { off, on };
 
     pub const Entry = struct {
         global_file_id: network.FileId,
@@ -110,11 +105,10 @@ pub const Database = struct {
             .files_needing_sync = .empty,
             .new_files = .empty,
 
-            .event = .init(.none),
+            .alert = .init(.off),
             .host_state = .init(.{}),
-            .out_new_file_path = undefined,
-            .in_new_file_path = undefined,
-            .global_file_id = undefined,
+            .out_path = undefined,
+            .out_entry = undefined,
 
             .allocator = allocator,
             .mutex = .init,
@@ -140,7 +134,7 @@ pub const Database = struct {
         defer arena.deinit();
         var stderr = Io.File.stderr().writer(io, &.{});
 
-        const max_wait_time = Io.Clock.Duration{ .clock = .boot, .raw = .fromSeconds(5) };
+        const max_wait_time = Io.Clock.Duration{ .clock = .boot, .raw = .fromSeconds(8) };
         var start = Io.Clock.boot.now(io);
         while (true) {
             const now = Io.Clock.boot.now(io);
@@ -153,45 +147,55 @@ pub const Database = struct {
                 continue;
             }
 
-            const event = db.event.load(.monotonic);
-            switch (event) {
-                .none => {
-                    if (db.new_files.count() != 0) blk: {
-                        var host_state = db.host_state.load(.monotonic);
-                        while (host_state.event == .none) {
-                            var new_host_state = host_state;
-                            new_host_state.event = .acquired;
-                            host_state = db.host_state.cmpxchgWeak(host_state, new_host_state, .acquire, .monotonic) orelse break;
-                        } else break :blk;
+            {
+                try db.mutex.lock(io);
+                defer db.mutex.unlock(io);
 
-                        {
-                            try db.mutex.lock(io);
-                            defer db.mutex.unlock(io);
+                if (db.new_files.count() != 0 and db.acquireHostEvent() != null) {
+                    var it = db.new_files.keyIterator();
+                    db.out_path = it.next().?.*;
 
-                            var it = db.new_files.keyIterator();
-                            db.out_new_file_path = it.next().?.*;
-                        }
+                    db.releaseHostEvent(.get_global_file_id);
+                    io.futexWake(Host.State, &db.host_state.raw, 1);
+                    continue;
+                } else if (db.files_needing_sync.count() != 0 and db.acquireHostEvent() != null) {
+                    var it = db.files_needing_sync.keyIterator();
+                    const path = it.next().?.*;
+                    db.out_path = path;
+                    db.out_entry = db.all_known_files.get(path).?;
 
-                        host_state = db.host_state.load(.monotonic);
-                        while (true) {
-                            assert(host_state.event == .acquired);
-                            var new_host_state = host_state;
-                            new_host_state.event = .get_global_file_id;
-                            host_state = db.host_state.cmpxchgWeak(host_state, new_host_state, .release, .monotonic) orelse break;
-                        }
-
-                        io.futexWake(Host.State, &db.host_state.raw, 1);
-                        continue;
-                    }
-
-                    try io.futexWaitTimeout(Database.Event, &db.event.raw, .none, .{ .duration = max_wait_time });
-                },
-                .acquired => try io.futexWaitTimeout(Database.Event, &db.event.raw, .acquired, .{ .duration = max_wait_time }),
-                .update_global_file_id => {
-                    try db.updateGlobalFileId(io);
-                    db.event.store(.none, .release);
-                },
+                    db.releaseHostEvent(.sync_file);
+                    io.futexWake(Host.State, &db.host_state.raw, 1);
+                    continue;
+                }
             }
+
+            db.alert.store(.off, .release);
+            try io.futexWaitTimeout(Alert, &db.alert.raw, .off, .{ .duration = max_wait_time });
+        }
+    }
+
+    fn sendAlert(db: *Database, io: Io) void {
+        db.alert.store(.on, .release);
+        io.futexWake(Alert, &db.alert.raw, 1);
+    }
+
+    fn acquireHostEvent(db: *Database) ?void {
+        var host_state = db.host_state.load(.monotonic);
+        while (host_state.event == .none) {
+            var new_host_state = host_state;
+            new_host_state.event = .acquired;
+            host_state = db.host_state.cmpxchgWeak(host_state, new_host_state, .acquire, .monotonic) orelse break;
+        } else return null;
+    }
+
+    fn releaseHostEvent(db: *Database, event: Host.State.Event) void {
+        var host_state = db.host_state.load(.monotonic);
+        while (true) {
+            assert(host_state.event == .acquired);
+            var new_host_state = host_state;
+            new_host_state.event = event;
+            host_state = db.host_state.cmpxchgWeak(host_state, new_host_state, .release, .monotonic) orelse break;
         }
     }
 
@@ -236,18 +240,25 @@ pub const Database = struct {
         }
     }
 
-    fn updateGlobalFileId(db: *Database, io: Io) !void {
+    fn updateGlobalFileId(db: *Database, path: Wtf16, global_file_id: network.FileId, io: Io) !void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        const ptr = db.all_known_files.getPtr(db.in_new_file_path) orelse {
-            std.debug.print("Got global file id, but file is not in database: {f}", .{db.in_new_file_path.formatUtf8()});
+        const ptr = db.all_known_files.getPtr(path) orelse {
+            std.debug.print("Got global file id, but file is not in database: {f}", .{path.formatUtf8()});
             return;
         };
-        ptr.global_file_id = db.global_file_id;
-        assert(db.new_files.remove(db.in_new_file_path) == true);
-        db.in_new_file_path = undefined;
-        db.global_file_id = undefined;
+        ptr.global_file_id = global_file_id;
+        assert(db.new_files.remove(path) == true);
+
+        try db.files_needing_sync.put(db.allocator, path, {});
+    }
+
+    fn markFileAsSynced(db: *Database, path: Wtf16, io: Io) !void {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        assert(db.files_needing_sync.remove(path) == true);
     }
 
     fn checkMetadata(
@@ -398,31 +409,18 @@ pub const Database = struct {
             try writer.writeAll("\n");
         }
 
-        pub fn hostTransferFile(debug: *Debug, index: usize, q: *Host.TxQueue, io: Io) !void {
+        pub fn hostTransferFile(debug: *Debug, index: usize, io: Io) !void {
             const db: *Database = @alignCast(@fieldParentPtr("debug", debug));
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
             const entry = blk: {
-                var it = db.all_known_files.iterator();
+                var it = db.all_known_files.keyIterator();
                 for (0..index) |_| _ = it.next().?;
-                break :blk it.next().?;
+                break :blk it.next().?.*;
             };
-            // const transaction_data: TxData = .{
-            //     .send_file = .{
-            //         .state = .send_metadata,
-            //         .path = entry.key_ptr.*,
-            //         .size = entry.value_ptr.size,
-            //         .hash = entry.value_ptr.hash,
-            //     },
-            // };
-            const transaction_data: TxData = .{
-                .send_new_file = .{
-                    .state = .send_path,
-                    .path = entry.key_ptr.*,
-                },
-            };
-            try q.putOne(io, transaction_data);
+            try db.files_needing_sync.put(db.allocator, entry, {});
+            db.sendAlert(io);
         }
     };
 };
@@ -959,10 +957,9 @@ pub const Host = struct {
             none,
             acquired,
             get_global_file_id,
+            sync_file,
         };
     };
-
-    pub const TxQueue = Io.Queue(TxData);
 
     pub fn init(db: *Database, debug: Debug) Host {
         return .{
@@ -982,7 +979,6 @@ pub const Host = struct {
     pub const RunError = Io.ConcurrentError || Io.Cancelable;
 
     pub const Diagnostics = struct {
-        read_tx_queue: ?ReadTxQueueError = null,
         outgoing: ?OutgoingError = null,
         incoming: ?IncomingError = null,
     };
@@ -992,13 +988,11 @@ pub const Host = struct {
         host: *Host,
         diag: ?*Diagnostics,
         io: Io,
-        tx_queue: *TxQueue,
         reader: *Io.Reader,
         writer: *Io.Writer,
     ) RunError!void {
         const ns = struct {
             const SelectUnion = union(enum) {
-                read_tx_queue: ReadTxQueueError!void,
                 outgoing: OutgoingError!void,
                 incoming: IncomingError!void,
             };
@@ -1013,26 +1007,15 @@ pub const Host = struct {
             }
         };
 
-        var select_buffer: [3]ns.SelectUnion = undefined;
+        var select_buffer: [2]ns.SelectUnion = undefined;
         var select = Io.Select(ns.SelectUnion).init(io, &select_buffer);
         defer while (select.cancel()) |result| ns.addToDiagnostics(diag, result);
 
-        try select.concurrent(.read_tx_queue, readTxQueue, .{ host, tx_queue, io });
         try select.concurrent(.outgoing, sendOutgoingTxs, .{ host, writer, io });
         try select.concurrent(.incoming, receiveIncomingTxs, .{ host, reader, io });
 
         host.debugLog("started", .{});
         ns.addToDiagnostics(diag, try select.await());
-    }
-
-    pub const ReadTxQueueError = Io.QueueClosedError || Io.Cancelable || AddOutgoingTxError;
-
-    fn readTxQueue(host: *Host, tx_queue: *TxQueue, io: Io) ReadTxQueueError!void {
-        defer tx_queue.close(io);
-        while (true) {
-            const data = try tx_queue.getOne(io);
-            try host.addOutgoingTx(io, data, null);
-        }
     }
 
     pub const OutgoingError = Io.Writer.Error || Io.Cancelable || SendFileError;
@@ -1042,34 +1025,8 @@ pub const Host = struct {
             while (true) {
                 const state = host.db.host_state.load(.monotonic);
                 if (state.tx == .outgoing) break;
-                sw: switch (state.event) {
-                    .none, .acquired => try io.futexWait(State, &host.db.host_state.raw, state),
-                    .get_global_file_id => {
-                        const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
-                            error.NoTxSlotsAvailable => continue :sw .none,
-                        };
-                        assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
-
-                        host.debugLog("getting global file id for new file: {f}", .{host.db.out_new_file_path.formatUtf8()});
-                        host.tx.data = .{
-                            .send_new_file = .{
-                                .state = .send_path,
-                                .path = host.db.out_new_file_path,
-                            },
-                        };
-                        host.tx.peer_tx_id = .invalid;
-                        host.db.out_new_file_path = undefined;
-
-                        var old_state = state;
-                        while (true) {
-                            var new_state = state;
-                            new_state.tx = .outgoing;
-                            new_state.event = .none;
-                            old_state = host.db.host_state.cmpxchgWeak(old_state, new_state, .release, .monotonic) orelse break;
-                        }
-                        break;
-                    },
-                }
+                host.handleEvents(state) orelse
+                    try io.futexWait(State, &host.db.host_state.raw, state);
             }
 
             const tx_id: network.TransactionId = @enumFromInt(0); // TODO hardcoded value
@@ -1092,6 +1049,55 @@ pub const Host = struct {
                     .receive_file_contents => unreachable,
                 },
             }
+        }
+    }
+
+    fn handleEvents(host: *Host, state: State) ?void {
+        switch (state.event) {
+            .none, .acquired => return null,
+            .get_global_file_id => {
+                const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
+                    error.NoTxSlotsAvailable => return null,
+                };
+                assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
+                host.debugLog("getting global file id for new file: {f}", .{host.db.out_path.formatUtf8()});
+
+                host.tx.data = .{
+                    .send_new_file = .{
+                        .state = .send_path,
+                        .path = host.db.out_path,
+                    },
+                };
+                host.tx.peer_tx_id = .invalid;
+                host.db.out_path = undefined;
+            },
+            .sync_file => {
+                const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
+                    error.NoTxSlotsAvailable => return null,
+                };
+                assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
+                host.debugLog("syncing file: {f}", .{host.db.out_path.formatUtf8()});
+
+                host.tx.data = .{
+                    .send_file = .{
+                        .state = .send_metadata,
+                        .path = host.db.out_path,
+                        .size = host.db.out_entry.size,
+                        .hash = host.db.out_entry.hash,
+                    },
+                };
+                host.tx.peer_tx_id = .invalid;
+                host.db.out_path = undefined;
+                host.db.out_entry = undefined;
+            },
+        }
+
+        var old_state = state;
+        while (true) {
+            var new_state = state;
+            new_state.tx = .outgoing;
+            new_state.event = .none;
+            old_state = host.db.host_state.cmpxchgWeak(old_state, new_state, .release, .monotonic) orelse break;
         }
     }
 
@@ -1352,15 +1358,9 @@ pub const TxData = union(enum) {
                 .new_file_response => {
                     const file_id = try network.receiveFileId(reader);
                     host.debugLog("received file id {} for file {f}\n", .{ file_id, send_new_file.path.formatUtf8() });
-
-                    // TODO spin loop, maybe bad
-                    while (host.db.event.cmpxchgWeak(.none, .acquired, .acquire, .monotonic)) |_| {}
-                    host.db.in_new_file_path = send_new_file.path;
-                    host.db.global_file_id = file_id;
-                    assert(host.db.event.swap(.update_global_file_id, .release) == .acquired);
-                    io.futexWake(Database.Event, &host.db.event.raw, 1);
-
+                    try host.db.updateGlobalFileId(send_new_file.path, file_id, io);
                     host.deleteTransaction(tx_id, .incoming);
+                    host.db.sendAlert(io);
                 },
                 else => return error.InvalidAction,
             }
@@ -1513,17 +1513,25 @@ pub const TxData = union(enum) {
         }
 
         fn receiveResult(
-            _: *const SendFile,
+            send_file: *const SendFile,
             host: *Host,
             _: *Io.Reader,
-            _: Io,
+            io: Io,
             tx_id: network.TransactionId,
             action: network.Action,
         ) !void {
             switch (action) {
-                .transfer_file_success, .transfer_file_failure => host.deleteTransaction(tx_id, .incoming),
+                .transfer_file_success => {
+                    try host.db.markFileAsSynced(send_file.path, io);
+                },
+                .transfer_file_failure => {
+                    // TODO mark file as failed to sync
+                    try host.db.markFileAsSynced(send_file.path, io);
+                },
                 else => return error.InvalidAction,
             }
+            host.deleteTransaction(tx_id, .incoming);
+            host.db.sendAlert(io);
         }
     };
 
