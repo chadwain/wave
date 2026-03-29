@@ -134,16 +134,18 @@ pub const Database = struct {
         defer arena.deinit();
         var stderr = Io.File.stderr().writer(io, &.{});
 
-        const max_wait_time = Io.Clock.Duration{ .clock = .boot, .raw = .fromSeconds(8) };
-        var start = Io.Clock.boot.now(io);
+        const clock: Io.Clock = .boot;
+        const max_wait_time = Io.Clock.Duration{ .raw = .fromSeconds(8), .clock = clock };
+        var next_scan_time = Io.Clock.Timestamp.now(io, clock);
+
         while (true) {
-            const now = Io.Clock.boot.now(io);
-            if (start.durationTo(now).nanoseconds > max_wait_time.raw.nanoseconds) {
+            // If enough time has passed, do a scan
+            if (Io.Clock.Timestamp.now(io, .boot).compare(.gte, next_scan_time)) {
                 _ = arena.reset(.retain_capacity);
                 try completeScan(db, io, arena.allocator());
                 try stderr.interface.writeAll("Scan complete\n");
                 try db.debug.printFilesNeedingSync(&stderr.interface, io);
-                start = Io.Clock.boot.now(io);
+                next_scan_time = Io.Clock.Timestamp.now(io, clock).addDuration(max_wait_time);
                 continue;
             }
 
@@ -171,7 +173,7 @@ pub const Database = struct {
             }
 
             db.alert.store(.off, .release);
-            try io.futexWaitTimeout(Alert, &db.alert.raw, .off, .{ .duration = max_wait_time });
+            try io.futexWaitTimeout(Alert, &db.alert.raw, .off, .{ .deadline = next_scan_time });
         }
     }
 
