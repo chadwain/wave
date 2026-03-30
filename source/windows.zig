@@ -50,6 +50,8 @@ pub const Database = struct {
     out_path: Wtf16,
     out_entry: Entry,
 
+    scan_arena: std.heap.ArenaAllocator.State,
+
     allocator: Allocator,
     mutex: Io.Mutex, // TODO: Replace with RwLock
     debug: Debug,
@@ -110,6 +112,8 @@ pub const Database = struct {
             .out_path = undefined,
             .out_entry = undefined,
 
+            .scan_arena = .{},
+
             .allocator = allocator,
             .mutex = .init,
             .debug = .{},
@@ -126,12 +130,13 @@ pub const Database = struct {
         var file_path_arena = db.file_path_arena.promote(db.allocator);
         file_path_arena.deinit();
 
+        var scan_arena = db.scan_arena.promote(db.allocator);
+        scan_arena.deinit();
+
         db.* = undefined;
     }
 
-    pub fn run(db: *Database, io: Io, thread_safe_allocator: Allocator) !void {
-        var arena = std.heap.ArenaAllocator.init(thread_safe_allocator);
-        defer arena.deinit();
+    pub fn run(db: *Database, io: Io) !void {
         var stderr = Io.File.stderr().writer(io, &.{});
 
         const clock: Io.Clock = .boot;
@@ -141,8 +146,7 @@ pub const Database = struct {
         while (true) {
             // If enough time has passed, do a scan
             if (Io.Clock.Timestamp.now(io, .boot).compare(.gte, next_scan_time)) {
-                _ = arena.reset(.retain_capacity);
-                try completeScan(db, io, arena.allocator());
+                try completeScan(db, io);
                 try stderr.interface.writeAll("Scan complete\n");
                 try db.debug.printFilesNeedingSync(&stderr.interface, io);
                 next_scan_time = Io.Clock.Timestamp.now(io, clock).addDuration(max_wait_time);
@@ -428,42 +432,35 @@ pub const Database = struct {
 };
 
 const FullScanContext = struct {
+    arena: *std.heap.ArenaAllocator,
     pending_dirs: std.ArrayList(Wtf16),
-    pending_dir_names: std.heap.ArenaAllocator.State,
     sub_path: std.ArrayList(w.WCHAR),
     component_delimeters: std.ArrayList(u16),
     open_dir_handles: std.ArrayList(w.HANDLE),
 
-    fn init(db: *const Database, allocator: Allocator) !FullScanContext {
+    fn init(db: *const Database, arena: *std.heap.ArenaAllocator) !FullScanContext {
+        const allocator = arena.allocator();
         var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
-        errdefer open_dir_handles.deinit(allocator);
         try open_dir_handles.append(allocator, db.sync_dir);
 
         return .{
+            .arena = arena,
             .pending_dirs = .empty,
-            .pending_dir_names = .{},
             .sub_path = .empty,
             .component_delimeters = .empty,
             .open_dir_handles = open_dir_handles,
         };
     }
 
-    fn deinit(ctx: *FullScanContext, allocator: Allocator) void {
-        ctx.pending_dirs.deinit(allocator);
-        var arena = ctx.pending_dir_names.promote(allocator);
-        arena.deinit();
-        ctx.pending_dir_names = arena.state;
-        ctx.sub_path.deinit(allocator);
-        ctx.component_delimeters.deinit(allocator);
-        for (0..ctx.open_dir_handles.items.len - 1) |i| {
-            const handle = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1 - i];
+    fn deinit(ctx: *FullScanContext) void {
+        for (ctx.open_dir_handles.items[1..]) |handle| {
             w.CloseHandle(handle);
         }
-        ctx.open_dir_handles.deinit(allocator);
         ctx.* = undefined;
     }
 
-    fn enterDir(ctx: *FullScanContext, allocator: Allocator, dir_path: Wtf16) !void {
+    fn enterDir(ctx: *FullScanContext, dir_path: Wtf16) !void {
+        const allocator = ctx.arena.allocator();
         try ctx.component_delimeters.append(allocator, @intCast(ctx.sub_path.items.len));
         try ctx.sub_path.appendSlice(allocator, dir_path.slice);
         try ctx.sub_path.appendSlice(allocator, comptime wtf16("\\"));
@@ -483,7 +480,6 @@ const FullScanContext = struct {
     fn addObject(
         ctx: *FullScanContext,
         db: *Database,
-        allocator: Allocator,
         name: Wtf16,
         information: *const NtQueryInformation,
     ) !void {
@@ -503,11 +499,11 @@ const FullScanContext = struct {
         }
 
         if (information.FileAttributes.DIRECTORY) {
-            var arena = ctx.pending_dir_names.promote(allocator);
-            defer ctx.pending_dir_names = arena.state;
-            const copied_name = try arena.allocator().dupe(w.WCHAR, name.slice);
-            try ctx.pending_dirs.append(allocator, .wtf16Cast(copied_name));
+            const allocator = ctx.arena.allocator();
+            const copied_name = try name.dupe(allocator);
+            try ctx.pending_dirs.append(allocator, copied_name);
         } else {
+            const allocator = ctx.arena.allocator();
             const component_delimeter_index = ctx.sub_path.items.len;
             defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
             try ctx.sub_path.appendSlice(allocator, name.slice);
@@ -548,14 +544,20 @@ const NtQueryInformation = extern struct {
     const CCHAR = w.CHAR;
 };
 
-pub fn completeScan(db: *Database, io: Io, allocator: Allocator) !void {
+pub fn completeScan(db: *Database, io: Io) !void {
     try db.mutex.lock(io);
     defer db.mutex.unlock(io);
 
-    var ctx = try FullScanContext.init(db, allocator);
-    defer ctx.deinit(allocator);
+    var arena = db.scan_arena.promote(db.allocator);
+    defer {
+        _ = arena.reset(.retain_capacity);
+        db.scan_arena = arena.state;
+    }
 
-    try scanOneDirectory(db, allocator, &ctx);
+    var ctx = try FullScanContext.init(db, &arena);
+    defer ctx.deinit();
+
+    try scanOneDirectory(db, &ctx);
     while (ctx.pending_dirs.items.len > 0) {
         const dir_path_ptr = &ctx.pending_dirs.items[ctx.pending_dirs.items.len - 1];
         if (dir_path_ptr.slice.len == 0) {
@@ -566,12 +568,12 @@ pub fn completeScan(db: *Database, io: Io, allocator: Allocator) !void {
 
         const dir_path = dir_path_ptr.*;
         dir_path_ptr.* = .wtf16Cast(&.{});
-        try ctx.enterDir(allocator, dir_path);
-        try scanOneDirectory(db, allocator, &ctx);
+        try ctx.enterDir(dir_path);
+        try scanOneDirectory(db, &ctx);
     }
 }
 
-fn scanOneDirectory(db: *Database, allocator: Allocator, ctx: *FullScanContext) !void {
+fn scanOneDirectory(db: *Database, ctx: *FullScanContext) !void {
     const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
     var buffer align(@alignOf(NtQueryInformation)) = @as([64 * 1024]u8, undefined);
     var io_status_block: w.IO_STATUS_BLOCK = undefined;
@@ -613,7 +615,7 @@ fn scanOneDirectory(db: *Database, allocator: Allocator, ctx: *FullScanContext) 
                 std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".")) or
                 std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".."))) continue;
 
-            try ctx.addObject(db, allocator, file_name, info);
+            try ctx.addObject(db, file_name, info);
         }
     }
 }

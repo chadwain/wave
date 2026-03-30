@@ -19,8 +19,8 @@ pub fn main(init: std.process.Init) !void {
     var db = try wave.windows.Database.init(.wtf16Cast(sync_dir), io, args.syncDir(), allocator);
     defer db.deinit(io);
 
-    var watch_task = try io.concurrent(wave.windows.Database.run, .{ &db, io, init.gpa });
-    defer watch_task.cancel(io) catch {};
+    var db_run_task = try io.concurrent(wave.windows.Database.run, .{ &db, io });
+    defer db_run_task.cancel(io) catch {};
 
     const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.peerSyncDir());
     defer allocator.free(peer_sync_dir);
@@ -31,10 +31,10 @@ pub fn main(init: std.process.Init) !void {
     );
     defer host_pair_task.cancel(io) catch {};
 
-    try runCli(io, &db, allocator);
+    try runCli(io, &db);
 }
 
-fn runCli(io: Io, db: *wave.windows.Database, allocator: Allocator) !void {
+fn runCli(io: Io, db: *wave.windows.Database) !void {
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
     const reader = &stdin.interface;
@@ -62,7 +62,7 @@ fn runCli(io: Io, db: *wave.windows.Database, allocator: Allocator) !void {
                 try stdout.interface.flush();
             },
             's' => {
-                try wave.windows.completeScan(db, io, allocator);
+                try wave.windows.completeScan(db, io);
                 try stdout.interface.writeAll("scan complete\n");
                 try stdout.interface.flush();
             },
