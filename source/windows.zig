@@ -26,14 +26,36 @@ pub const Wtf16 = struct {
     pub fn formatUtf8(self: Wtf16) std.fmt.Alt([]const w.WCHAR, formatWtf16AsUtf8) {
         return .{ .data = self.slice };
     }
-};
 
-fn formatWtf16AsUtf8(slice: []const w.WCHAR, writer: *Io.Writer) Io.Writer.Error!void {
-    switch (cpu_endian) {
-        .little => try writer.print("{f}", .{std.unicode.fmtUtf16Le(slice)}),
-        .big => @compileError("TODO big endian"),
+    fn formatWtf16AsUtf8(slice: []const w.WCHAR, writer: *Io.Writer) Io.Writer.Error!void {
+        switch (cpu_endian) {
+            .little => try writer.print("{f}", .{std.unicode.fmtUtf16Le(slice)}),
+            .big => @compileError("TODO big endian"),
+        }
     }
-}
+
+    const Wtf8Path = struct {
+        buffer: [max_len]u8,
+        len: u16,
+
+        const max_len = w.MAX_PATH * 4;
+
+        fn slice(path: *const Wtf8Path) []const u8 {
+            return (&path.buffer)[0..path.len];
+        }
+    };
+
+    const ToWtf8PathError = error{PathTooLong};
+
+    fn toWtf8Path(self: Wtf16) ToWtf8PathError!Wtf8Path {
+        if (cpu_endian != .little) @compileError("TODO big endian");
+        const len = std.unicode.calcWtf8Len(self.slice);
+        if (len > Wtf8Path.max_len) return error.PathTooLong;
+        var path: Wtf8Path = .{ .buffer = undefined, .len = @intCast(len) };
+        assert(std.unicode.wtf16LeToWtf8(&path.buffer, self.slice) == len);
+        return path;
+    }
+};
 
 pub const Database = struct {
     sync_dir: w.HANDLE,
@@ -85,8 +107,15 @@ pub const Database = struct {
         return std.HashMapUnmanaged(Wtf16, V, Context, std.hash_map.default_max_load_percentage);
     }
 
-    pub fn init(sync_dir_path: Wtf16, io: Io, sync_dir_path_wtf8: []const u8, allocator: Allocator) !Database {
-        if (!std.fs.path.isAbsoluteWindowsWtf16(sync_dir_path.slice)) return error.NonAbsoluteSyncDirPath;
+    pub fn init(sync_dir_path: Wtf16, io: Io, allocator: Allocator) !Database {
+        if (cpu_endian != .little) @compileError("TODO big endian");
+        switch (std.fs.path.getWin32PathType(u16, sync_dir_path.slice)) {
+            .drive_absolute => {},
+            else => {
+                // TODO: Potentially support more path types
+                return error.NotADriveAbsoluteSyncDirPath;
+            },
+        }
         const sync_dir = blk: {
             // TODO: Proper Win32 -> NT path conversion
             const normalized = try std.mem.concat(allocator, w.WCHAR, &.{ wtf16("\\??\\"), sync_dir_path.slice });
@@ -95,7 +124,8 @@ pub const Database = struct {
         };
         errdefer w.CloseHandle(sync_dir);
 
-        const sync_dir_io = try Io.Dir.cwd().openDir(io, sync_dir_path_wtf8, .{});
+        const sync_dir_path_wtf8 = try sync_dir_path.toWtf8Path();
+        const sync_dir_io = try Io.Dir.cwd().openDir(io, sync_dir_path_wtf8.slice(), .{});
         errdefer comptime unreachable;
 
         return .{
@@ -302,17 +332,21 @@ pub const Database = struct {
         }
     }
 
-    fn openFileReadOnly(db: *const Database, io: Io, path: Wtf16) !w.HANDLE {
-        // try db.mutex.lock(io);
-        // defer db.mutex.unlock(io);
-        _ = .{ db, io };
+    fn openFileReadOnly(db: *const Database, path: Wtf16) !w.HANDLE {
         return openFile(db.sync_dir, path, .read);
     }
 
-    fn createFile(db: *const Database, io: Io, path: Wtf16, file_size: w.LARGE_INTEGER) !w.HANDLE {
-        // try db.mutex.lock(io);
-        // defer db.mutex.unlock(io);
-        _ = .{ db, io };
+    const CreateFileError = Io.Dir.CreateDirPathError || Wtf16.ToWtf8PathError || error{EmptyPath};
+
+    fn createFile(db: *const Database, io: Io, path: Wtf16, file_size: w.LARGE_INTEGER) CreateFileError!w.HANDLE {
+        // TODO janky
+        const path_wtf8 = try path.toWtf8Path();
+        var it = std.fs.path.componentIterator(path_wtf8.slice());
+        _ = it.last() orelse return error.EmptyPath;
+        if (it.previous()) |previous| {
+            try db.sync_dir_io.createDirPath(io, previous.path);
+        }
+
         return openFile(
             db.sync_dir,
             path,
@@ -1114,7 +1148,7 @@ pub const Host = struct {
         InvalidAction,
         InvalidHeader,
     } || wave.network.ReceiveActionError || wave.network.ReceiveFileMetadataError || Io.Reader.StreamError ||
-        Io.Cancelable || Allocator.Error || AddOutgoingTxError || ReceiveFileError;
+        Io.Cancelable || Allocator.Error || AddOutgoingTxError || ReceiveFileError || Database.CreateFileError;
 
     fn receiveIncomingTxs(host: *Host, reader: *Io.Reader, io: Io) IncomingError!void {
         while (true) {
@@ -1510,7 +1544,7 @@ pub const TxData = union(enum) {
             const action: network.Action = .transfer_file_contents;
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
 
-            const handle = try host.db.openFileReadOnly(io, send_file.path);
+            const handle = try host.db.openFileReadOnly(send_file.path);
             defer host.db.closeFile(handle);
 
             try network.sendMessageHeaderExistingTx(writer, peer_tx_id);

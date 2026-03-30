@@ -16,7 +16,7 @@ pub fn main(init: std.process.Init) !void {
     const sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
     defer allocator.free(sync_dir);
 
-    var db = try wave.windows.Database.init(.wtf16Cast(sync_dir), io, args.syncDir(), allocator);
+    var db = try wave.windows.Database.init(.wtf16Cast(sync_dir), io, allocator);
     defer db.deinit(io);
 
     var db_run_task = try io.concurrent(wave.windows.Database.run, .{ &db, io });
@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
 
     var host_pair_task = try io.concurrent(
         startHostPair,
-        .{ io, &db, .wtf16Cast(peer_sync_dir), args.peerSyncDir() },
+        .{ io, &db, .wtf16Cast(peer_sync_dir) },
     );
     defer host_pair_task.cancel(io) catch {};
 
@@ -101,13 +101,12 @@ fn startHostPair(
     io: Io,
     db: *wave.windows.Database,
     peer_sync_dir: wave.windows.Wtf16,
-    peer_sync_dir_wtf8: []const u8,
 ) !void {
     const addr = Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
     var server = try addr.listen(io, .{});
     defer server.deinit(io);
 
-    var peer = try io.concurrent(startPeer, .{ io, server.socket.address, peer_sync_dir, peer_sync_dir_wtf8 });
+    var peer = try io.concurrent(startPeer, .{ io, server.socket.address, peer_sync_dir });
     defer peer.cancel(io) catch {};
 
     const stream = try server.accept(io);
@@ -126,7 +125,7 @@ fn startHostPair(
     try host.run(&diag, io, &reader.interface, &writer.interface);
 }
 
-fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16, sync_dir_wtf8: []const u8) !void {
+fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16) !void {
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
@@ -139,7 +138,7 @@ fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16, sync_
     defer assert(dbg_allocator.deinit() == .ok);
     const allocator = dbg_allocator.allocator();
 
-    var db = try wave.windows.Database.init(sync_dir, io, sync_dir_wtf8, allocator);
+    var db = try wave.windows.Database.init(sync_dir, io, allocator);
     defer db.deinit(io);
 
     var host = wave.windows.Host.init(&db, .{ .name = "B" });
