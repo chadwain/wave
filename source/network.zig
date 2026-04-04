@@ -38,9 +38,11 @@ pub const MessageHeader = packed struct(u8) {
 
 pub const Action = enum(u8) {
     /// A client has seen a new file on its local filesystem.
-    new_file_init,
-    /// The server responds to a new file message.
-    new_file_response,
+    client_new_file,
+
+    server_registered_new_file,
+    server_cant_register_new_files,
+    server_new_file_exists,
 
     transfer_file_metadata,
     transfer_file_accept,
@@ -131,16 +133,13 @@ pub fn sendNewFilePath(
 /// Asserts that `path.len` can fit into a `PathByteCount`.
 pub fn sendFileMetadata(
     writer: *Io.Writer,
-    path_encoding: PathEncoding,
-    path: []const u8, // TODO: Make a Path struct
+    file_id: FileId,
     file_size: FileSize,
     hash: *const FileHash,
 ) !void {
-    try writer.writeByte(@intFromEnum(path_encoding));
-    try writer.writeInt(PathByteCount, @intCast(path.len), endian);
+    try sendFileId(writer, file_id);
     try writer.writeInt(FileSize, file_size, endian);
     try writer.writeAll(&hash.blake3);
-    try writer.writeAll(path);
 }
 
 /// Asserts a reader buffer size of at least 1.
@@ -188,34 +187,23 @@ pub fn receiveNewFilePath(
 }
 
 pub const IncomingFileMetadata = struct {
-    path_encoding: PathEncoding,
-    path_byte_count: PathByteCount,
+    file_id: FileId,
     file_size: FileSize,
     hash: FileHash,
 };
 
-pub const ReceiveFileMetadataError = error{UnknownPathEncoding} || Io.Reader.StreamError;
+pub const ReceiveFileMetadataError = Io.Reader.Error;
 
 /// Asserts a reader buffer size of at least `FileHash.byte_size`.
-pub fn receiveFileMetadata(
-    reader: *Io.Reader,
-    file_path_buffer: *FilePathBuffer,
-) ReceiveFileMetadataError!IncomingFileMetadata {
-    const path_encoding = std.enums.fromInt(PathEncoding, try reader.takeByte()) orelse
-        return error.UnknownPathEncoding;
-    const path_byte_count = try reader.takeInt(PathByteCount, endian);
+pub fn receiveFileMetadata(reader: *Io.Reader) ReceiveFileMetadataError!IncomingFileMetadata {
+    const file_id = try receiveFileId(reader);
     const file_size = try reader.takeInt(FileSize, endian);
 
     const hash_bytes = try reader.takeArray(FileHash.byte_size);
     const hash: FileHash = .{ .blake3 = hash_bytes.* };
 
-    // TODO: Do path encoding verification here
-    var file_path_writer: Io.Writer = .fixed(file_path_buffer);
-    try reader.streamExact(&file_path_writer, path_byte_count);
-
     return .{
-        .path_encoding = path_encoding,
-        .path_byte_count = path_byte_count,
+        .file_id = file_id,
         .file_size = file_size,
         .hash = hash,
     };

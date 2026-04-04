@@ -57,51 +57,96 @@ pub const Wtf16 = struct {
     }
 };
 
+fn normalizePath(path: Wtf16) void {
+    // TODO: assert path is relative
+    var buffer: [w.MAX_PATH * 4]u8 = undefined;
+
+    // path must be relative
+    // path must be a Win32 path for ComponentIterator to work
+    // ComponentIterator only does little endian
+    if (cpu_endian != .little) @compileError("TODO big endian");
+
+    var it = std.fs.path.ComponentIterator(.windows, u16).init(path.slice);
+    _ = it.peekNext() orelse return error.EmptyPath;
+    var index: u16 = 0;
+    while (it.next()) |component| {
+        if (std.mem.eql(u16, component.name, wtf16(".")) or
+            std.mem.eql(u16, component.name, wtf16("..")))
+            return error.UnwantedPath;
+        if (it.peekNext() == null) {
+            // TODO trim trailing spaces and dots
+        }
+        const bytes_written = std.unicode.wtf16LeToWtf8(&buffer[index..], component.name);
+        index += @intCast(bytes_written);
+        if (it.peekNext() != null) {
+            buffer[index] = '/';
+            index += 1;
+        }
+    }
+}
+
 pub const Database = struct {
+    // Server and Client fields
     sync_dir: w.HANDLE,
     sync_dir_io: Io.Dir,
+    allocator: Allocator,
+    mutex: Io.Mutex, // TODO: Compare with RwLock
+    debug: Debug,
 
+    // Server and Client fields
     file_path_arena: std.heap.ArenaAllocator.State,
-    all_known_files: FileHashMap(Entry),
-    files_needing_sync: FileHashMap(void),
-    new_files: FileHashMap(void),
+    file_id_map: Win32RelativePathHashMap(network.FileId),
+
+    // Server only
+    next_file_id: ?std.meta.Tag(network.FileId),
+    server_known_files: std.AutoHashMapUnmanaged(network.FileId, ServerFileEntry),
+
+    // Client only
+    client_known_files: Win32RelativePathHashMap(FileMetadata),
+    awaiting_sync_files: Win32RelativePathHashMap(void), // TODO change to a key value type of `FileId`
+    new_files: Win32RelativePathHashMap(void),
+    scan_arena: std.heap.ArenaAllocator.State,
 
     // Database-Host synchronization fields (client only)
     alert: std.atomic.Value(Alert),
     host_state: std.atomic.Value(Host.State),
     out_path: Wtf16,
-    out_entry: Entry,
-
-    scan_arena: std.heap.ArenaAllocator.State,
-
-    allocator: Allocator,
-    mutex: Io.Mutex, // TODO: Replace with RwLock
-    debug: Debug,
+    out_file_id: network.FileId,
+    out_entry: FileMetadata,
 
     pub const Alert = enum(u32) { off, on };
 
-    pub const Entry = struct {
-        global_file_id: network.FileId,
-
+    pub const FileMetadata = struct {
         local_file_id: w.LARGE_INTEGER,
         hash: network.FileHash,
         modified_time: w.LARGE_INTEGER,
         size: w.ULARGE_INTEGER,
     };
 
-    pub fn FileHashMap(comptime V: type) type {
+    pub const ServerFileState = enum { unsynced, synced };
+
+    pub const ServerFileEntry = struct {
+        path: Wtf16,
+        state: ServerFileState,
+        metadata: FileMetadata,
+    };
+
+    pub fn Win32RelativePathHashMap(comptime V: type) type {
         const Context = struct {
             pub fn hash(_: @This(), self: Wtf16) u32 {
-                // TODO: Better hashing
-                // TODO: Case insensitivity
-                // TODO: Do WTF-16 strings have a unique representation?
+                // TODO: more efficient hashing
                 var hasher = std.hash.Wyhash.init(0);
-                for (self.slice) |c| std.hash.autoHash(&hasher, c);
+                for (self.slice) |c| {
+                    // TODO get a userspace implementation of RtlUpcaseUnicodeChar
+                    const uppercase = w.ntdll.RtlUpcaseUnicodeChar(c);
+                    std.hash.autoHash(&hasher, uppercase);
+                }
                 return @truncate(hasher.final());
             }
 
             pub fn eql(_: @This(), a: Wtf16, b: Wtf16) bool {
-                return std.mem.eql(w.WCHAR, a.slice, b.slice);
+                // TODO get a userspace implementation of RtlEqualUnicodeString
+                return w.ntdll.RtlEqualUnicodeString(&.init(a.slice), &.init(b.slice), w.TRUE) == w.TRUE;
             }
         };
         return std.HashMapUnmanaged(Wtf16, V, Context, std.hash_map.default_max_load_percentage);
@@ -131,22 +176,26 @@ pub const Database = struct {
         return .{
             .sync_dir = sync_dir,
             .sync_dir_io = sync_dir_io,
+            .allocator = allocator,
+            .mutex = .init,
+            .debug = .{},
 
             .file_path_arena = .{},
-            .all_known_files = .empty,
-            .files_needing_sync = .empty,
+            .file_id_map = .empty,
+
+            .next_file_id = 1,
+            .server_known_files = .empty,
+
+            .client_known_files = .empty,
+            .awaiting_sync_files = .empty,
             .new_files = .empty,
+            .scan_arena = .{},
 
             .alert = .init(.off),
             .host_state = .init(.{}),
             .out_path = undefined,
+            .out_file_id = undefined,
             .out_entry = undefined,
-
-            .scan_arena = .{},
-
-            .allocator = allocator,
-            .mutex = .init,
-            .debug = .{},
         };
     }
 
@@ -154,12 +203,15 @@ pub const Database = struct {
         w.CloseHandle(db.sync_dir);
         db.sync_dir_io.close(io);
 
-        db.all_known_files.deinit(db.allocator);
-        db.files_needing_sync.deinit(db.allocator);
-        db.new_files.deinit(db.allocator);
         var file_path_arena = db.file_path_arena.promote(db.allocator);
         file_path_arena.deinit();
+        db.file_id_map.deinit(db.allocator);
 
+        db.server_known_files.deinit(db.allocator);
+
+        db.client_known_files.deinit(db.allocator);
+        db.awaiting_sync_files.deinit(db.allocator);
+        db.new_files.deinit(db.allocator);
         var scan_arena = db.scan_arena.promote(db.allocator);
         scan_arena.deinit();
 
@@ -196,12 +248,13 @@ pub const Database = struct {
                     db.releaseHostEvent(.get_global_file_id);
                     io.futexWake(Host.State, &db.host_state.raw, 1);
                     continue;
-                } else if (db.files_needing_sync.count() != 0 and db.acquireHostEvent() != null) {
-                    var it = db.files_needing_sync.keyIterator();
+                } else if (db.awaiting_sync_files.count() != 0 and db.acquireHostEvent() != null) {
+                    var it = db.awaiting_sync_files.keyIterator();
                     const path = it.next().?;
+                    db.out_file_id = db.file_id_map.get(path.*).?;
                     db.out_path = path.*;
-                    db.out_entry = db.all_known_files.get(path.*).?;
-                    db.files_needing_sync.removeByPtr(path);
+                    db.out_entry = db.client_known_files.get(path.*).?;
+                    db.awaiting_sync_files.removeByPtr(path);
 
                     db.releaseHostEvent(.sync_file);
                     io.futexWake(Host.State, &db.host_state.raw, 1);
@@ -238,6 +291,7 @@ pub const Database = struct {
         }
     }
 
+    // client
     /// Must be called with a lock.
     fn updateLocalFile(
         db: *Database,
@@ -245,16 +299,10 @@ pub const Database = struct {
         information: *const NtQueryInformation,
         hash: *const network.FileHash,
     ) !void {
-        const new_entry = Entry{
-            .global_file_id = .unknown, // TODO wrong value
-            .local_file_id = information.FileId,
-            .hash = hash.*,
-            .modified_time = information.ChangeTime,
-            .size = std.math.cast(w.ULARGE_INTEGER, information.EndOfFile) orelse return error.Unexpected,
-        };
+        const size = std.math.cast(w.ULARGE_INTEGER, information.EndOfFile) orelse return error.Unexpected;
 
-        const gop = try db.all_known_files.getOrPut(db.allocator, path);
-        errdefer if (!gop.found_existing) db.all_known_files.removeByPtr(gop.key_ptr);
+        const gop = try db.client_known_files.getOrPut(db.allocator, path);
+        errdefer if (!gop.found_existing) db.client_known_files.removeByPtr(gop.key_ptr);
 
         var file_path_arena = db.file_path_arena.promote(db.allocator);
         defer db.file_path_arena = file_path_arena.state;
@@ -262,6 +310,13 @@ pub const Database = struct {
 
         if (!gop.found_existing) gop.key_ptr.* = try path.dupe(file_path_allocator);
         errdefer if (!gop.found_existing) file_path_allocator.free(gop.key_ptr.slice);
+
+        const new_entry = FileMetadata{
+            .local_file_id = information.FileId,
+            .hash = hash.*,
+            .modified_time = information.ChangeTime,
+            .size = size,
+        };
 
         if (gop.found_existing and
             gop.value_ptr.local_file_id == new_entry.local_file_id and
@@ -273,23 +328,59 @@ pub const Database = struct {
             gop.value_ptr.* = new_entry;
             db.new_files.putAssumeCapacity(gop.key_ptr.*, {});
         } else {
-            try db.files_needing_sync.ensureUnusedCapacity(db.allocator, 1);
+            try db.awaiting_sync_files.ensureUnusedCapacity(db.allocator, 1);
             gop.value_ptr.* = new_entry;
-            db.files_needing_sync.putAssumeCapacity(gop.key_ptr.*, {});
+            db.awaiting_sync_files.putAssumeCapacity(gop.key_ptr.*, {});
         }
     }
 
-    fn updateGlobalFileId(db: *Database, path: Wtf16, global_file_id: network.FileId, io: Io) !void {
+    const NewFileResult = union(enum) {
+        file_id: network.FileId,
+        file_already_exists,
+        exhausted_file_ids,
+    };
+
+    // server
+    fn newFile(db: *Database, path: Wtf16, io: Io) !NewFileResult {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        const ptr = db.all_known_files.getPtr(path) orelse {
-            wave.log.warn("Got global file id, but file is not in database: {f}", .{path.formatUtf8()});
-            return;
-        };
-        ptr.global_file_id = global_file_id;
+        const gop = try db.file_id_map.getOrPut(db.allocator, path);
+        if (gop.found_existing) return .file_already_exists;
+        errdefer db.file_id_map.removeByPtr(gop.key_ptr);
 
-        try db.files_needing_sync.put(db.allocator, path, {});
+        const file_id_tag = db.next_file_id orelse return .exhausted_file_ids;
+        db.next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch null;
+        errdefer db.next_file_id = file_id_tag;
+        const file_id: network.FileId = @enumFromInt(file_id_tag);
+
+        var file_path_arena = db.file_path_arena.promote(db.allocator);
+        defer db.file_path_arena = file_path_arena.state;
+        const path_copy = try path.dupe(file_path_arena.allocator());
+        errdefer file_path_arena.allocator().free(path_copy.slice);
+
+        try db.server_known_files.ensureUnusedCapacity(db.allocator, 1);
+        errdefer comptime unreachable;
+
+        db.server_known_files.putAssumeCapacityNoClobber(file_id, .{
+            .path = path_copy,
+            .state = .unsynced,
+            .metadata = undefined,
+        });
+        gop.key_ptr.* = path_copy;
+        gop.value_ptr.* = file_id;
+
+        return .{ .file_id = file_id };
+    }
+
+    // client
+    fn setNewFileId(db: *Database, path: Wtf16, global_file_id: network.FileId, io: Io) !void {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        try db.file_id_map.putNoClobber(db.allocator, path, global_file_id);
+
+        try db.awaiting_sync_files.put(db.allocator, path, {});
     }
 
     fn markFileAsSynced(db: *Database, path: Wtf16) void {
@@ -297,39 +388,39 @@ pub const Database = struct {
         _ = .{ db, path };
     }
 
+    const CheckMetadataResult = union(enum) {
+        file_exists: struct {
+            path: Wtf16,
+            comparison: enum { equals, differs },
+        },
+        file_is_uninitialized: struct {
+            path: Wtf16,
+        },
+        file_doesnt_exist,
+    };
+
+    // server
     fn checkMetadata(
         db: *Database,
         metadata: *const network.IncomingFileMetadata,
-        file_path_buffer: *align(@alignOf(w.WCHAR)) const network.FilePathBuffer,
         io: Io,
-    ) !struct {
-        Wtf16,
-        enum { equals, differs },
-    } {
+    ) !CheckMetadataResult {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        // TODO: normalize path
-        const path: Wtf16 = switch (metadata.path_encoding) {
-            .wtf16le => switch (cpu_endian) {
-                .little => .wtf16Cast(@ptrCast(file_path_buffer[0..metadata.path_byte_count])),
-                .big => @compileError("TODO big endian"),
-            },
-        };
-
-        var file_path_arena = db.file_path_arena.promote(db.allocator);
-        defer db.file_path_arena = file_path_arena.state;
-        const path_copied = try path.dupe(file_path_arena.allocator());
-
-        const entry = db.all_known_files.getPtr(path);
-        if (entry != null and
-            entry.?.size == metadata.file_size and
-            std.mem.eql(u8, &entry.?.hash.blake3, &metadata.hash.blake3))
-        {
-            return .{ path_copied, .equals };
-        } else {
-            return .{ path_copied, .differs };
+        const entry = db.server_known_files.getPtr(metadata.file_id) orelse return .file_doesnt_exist;
+        switch (entry.state) {
+            .unsynced => return .{ .file_is_uninitialized = .{ .path = entry.path } },
+            .synced => {},
         }
+        const equals =
+            entry.metadata.size == metadata.file_size and
+            std.mem.eql(u8, &entry.metadata.hash.blake3, &metadata.hash.blake3);
+
+        return .{ .file_exists = .{
+            .path = entry.path,
+            .comparison = if (equals) .equals else .differs,
+        } };
     }
 
     fn openFileReadOnly(db: *const Database, path: Wtf16) !w.HANDLE {
@@ -338,6 +429,8 @@ pub const Database = struct {
 
     const CreateFileError = Io.Dir.CreateDirPathError || Wtf16.ToWtf8PathError || error{EmptyPath};
 
+    // server
+    // TODO create temporary files instead
     fn createFile(db: *const Database, io: Io, path: Wtf16, file_size: w.LARGE_INTEGER) CreateFileError!w.HANDLE {
         // TODO janky
         const path_wtf8 = try path.toWtf8Path();
@@ -358,11 +451,11 @@ pub const Database = struct {
         w.CloseHandle(file);
     }
 
-    fn updateReceivedFile(
+    fn finishReceiveFileContents(
         db: *Database,
         io: Io,
         handle: w.HANDLE,
-        path: Wtf16,
+        file_id: network.FileId,
         hash: *const network.FileHash,
         file_size: w.LARGE_INTEGER,
     ) !void {
@@ -400,13 +493,14 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        try db.all_known_files.put(db.allocator, path, .{
-            .global_file_id = .unknown, // TODO wrong value
+        const entry = db.server_known_files.getPtr(file_id).?;
+        entry.metadata = .{
             .local_file_id = internal_information.IndexNumber,
             .hash = hash.*,
             .modified_time = basic_information.ChangeTime,
             .size = @intCast(file_size),
-        });
+        };
+        entry.state = .synced;
     }
 
     pub const Debug = struct {
@@ -415,7 +509,7 @@ pub const Database = struct {
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
-            var it = db.all_known_files.iterator();
+            var it = db.client_known_files.iterator();
             while (it.next()) |entry| {
                 try writer.print(
                     "{f}: hash({f}) modified({}) size({})\n",
@@ -441,7 +535,7 @@ pub const Database = struct {
             }
 
             try writer.writeAll("\nLocally updated files\n");
-            var it2 = db.files_needing_sync.iterator();
+            var it2 = db.awaiting_sync_files.iterator();
             while (it2.next()) |entry| {
                 try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()});
             }
@@ -455,11 +549,11 @@ pub const Database = struct {
             defer db.mutex.unlock(io);
 
             const entry = blk: {
-                var it = db.all_known_files.keyIterator();
+                var it = db.client_known_files.keyIterator();
                 for (0..index) |_| _ = it.next().?;
                 break :blk it.next().?.*;
             };
-            try db.files_needing_sync.put(db.allocator, entry, {});
+            try db.awaiting_sync_files.put(db.allocator, entry, {});
             db.sendAlert(io);
         }
     };
@@ -609,7 +703,7 @@ pub fn completeScan(db: *Database, io: Io) !void {
 
 fn scanOneDirectory(db: *Database, ctx: *FullScanContext) !void {
     const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
-    var buffer align(@alignOf(NtQueryInformation)) = @as([64 * 1024]u8, undefined);
+    var buffer: [64 * 1024]u8 align(@alignOf(NtQueryInformation)) = undefined;
     var io_status_block: w.IO_STATUS_BLOCK = undefined;
     var restart_scan: w.BOOLEAN = w.TRUE;
 
@@ -1119,6 +1213,7 @@ pub const Host = struct {
                 host.tx.data = .{
                     .send_file = .{
                         .state = .send_metadata,
+                        .file_id = host.db.out_file_id,
                         .path = host.db.out_path,
                         .size = host.db.out_entry.size,
                         .hash = host.db.out_entry.hash,
@@ -1147,7 +1242,7 @@ pub const Host = struct {
         WrongPeerTxId,
         InvalidAction,
         InvalidHeader,
-    } || wave.network.ReceiveActionError || wave.network.ReceiveFileMetadataError || Io.Reader.StreamError ||
+    } || network.ReceiveActionError || network.ReceiveFileMetadataError || network.ReceiveNewFilePathError ||
         Io.Cancelable || Allocator.Error || AddOutgoingTxError || ReceiveFileError || Database.CreateFileError;
 
     fn receiveIncomingTxs(host: *Host, reader: *Io.Reader, io: Io) IncomingError!void {
@@ -1163,7 +1258,7 @@ pub const Host = struct {
                     if (header.tx_id != .invalid) return error.InvalidTxId;
                     if (header.peer_tx_id == .invalid) return error.InvalidPeerTxId;
                     switch (action) {
-                        .new_file_init => {
+                        .client_new_file => {
                             try TxData.ReceiveNewFile.newTx(host, header.peer_tx_id, io, reader);
                         },
                         .transfer_file_metadata => {
@@ -1368,7 +1463,7 @@ pub const TxData = union(enum) {
             assert(send_new_file.state == .send_path);
             assert(peer_tx_id == .invalid);
 
-            const action: network.Action = .new_file_init;
+            const action: network.Action = .client_new_file;
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
 
             try network.sendMessageHeaderNewTx(writer, tx_id);
@@ -1400,10 +1495,18 @@ pub const TxData = union(enum) {
             if (peer_tx_id != .invalid) return error.InvalidPeerTxId;
 
             switch (action) {
-                .new_file_response => {
+                .server_registered_new_file => {
                     const file_id = try network.receiveFileId(reader);
                     host.debugLog("received file id {} for file {f}\n", .{ file_id, send_new_file.path.formatUtf8() });
-                    try host.db.updateGlobalFileId(send_new_file.path, file_id, io);
+                    try host.db.setNewFileId(send_new_file.path, file_id, io);
+                    host.deleteTransaction(tx_id, .incoming, io);
+                },
+                .server_cant_register_new_files => {
+                    host.debugLog("server can't register file {f}\n", .{send_new_file.path.formatUtf8()});
+                    host.deleteTransaction(tx_id, .incoming, io);
+                },
+                .server_new_file_exists => {
+                    host.debugLog("new file already exists: {f}\n", .{send_new_file.path.formatUtf8()});
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
                 else => return error.InvalidAction,
@@ -1412,7 +1515,7 @@ pub const TxData = union(enum) {
     };
 
     pub const ReceiveNewFile = struct {
-        file_id: network.FileId,
+        data: Database.NewFileResult,
 
         fn newTx(
             host: *Host,
@@ -1422,11 +1525,16 @@ pub const TxData = union(enum) {
         ) !void {
             var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
             const path_info = try network.receiveNewFilePath(reader, &file_path_buffer);
-            _ = path_info;
-
+            // TODO ensure it's a relative path
+            const path: Wtf16 = switch (path_info.path_encoding) {
+                .wtf16le => switch (cpu_endian) {
+                    .big => @compileError("TODO big endian"),
+                    .little => .wtf16Cast(@ptrCast(file_path_buffer[0..path_info.path_byte_count])),
+                },
+            };
             const data: TxData = .{
                 .receive_new_file = .{
-                    .file_id = @enumFromInt(0), // TODO hardcoded value
+                    .data = try host.db.newFile(path, io),
                 },
             };
             try host.addOutgoingTx(io, data, peer_tx_id);
@@ -1442,13 +1550,31 @@ pub const TxData = union(enum) {
         ) !void {
             assert(peer_tx_id != .invalid);
 
-            const action: network.Action = .new_file_response;
             const outgoing_tx_id: network.TransactionId = .invalid;
-            host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+            switch (receive_new_file.data) {
+                .file_id => |file_id| {
+                    const action: network.Action = .server_registered_new_file;
+                    host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
 
-            try network.sendMessageHeaderNewTxReply(writer, outgoing_tx_id, peer_tx_id);
-            try network.sendAction(writer, action);
-            try network.sendFileId(writer, receive_new_file.file_id);
+                    try network.sendMessageHeaderNewTxReply(writer, outgoing_tx_id, peer_tx_id);
+                    try network.sendAction(writer, action);
+                    try network.sendFileId(writer, file_id);
+                },
+                .file_already_exists => {
+                    const action: network.Action = .server_new_file_exists;
+                    host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+
+                    try network.sendMessageHeaderNewTxReply(writer, outgoing_tx_id, peer_tx_id);
+                    try network.sendAction(writer, action);
+                },
+                .exhausted_file_ids => {
+                    const action: network.Action = .server_cant_register_new_files;
+                    host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+
+                    try network.sendMessageHeaderNewTxReply(writer, outgoing_tx_id, peer_tx_id);
+                    try network.sendAction(writer, action);
+                },
+            }
             try writer.flush();
 
             host.deleteTransaction(tx_id, .outgoing, io);
@@ -1457,6 +1583,7 @@ pub const TxData = union(enum) {
 
     pub const SendFile = struct {
         state: State,
+        file_id: network.FileId,
         path: Wtf16,
         size: w.ULARGE_INTEGER,
         hash: network.FileHash,
@@ -1489,16 +1616,7 @@ pub const TxData = union(enum) {
                 );
             try network.sendMessageHeaderNewTx(writer, tx_id);
             try network.sendAction(writer, action);
-            try network.sendFileMetadata(
-                writer,
-                switch (cpu_endian) {
-                    .big => @compileError("TODO big endian"),
-                    .little => .wtf16le,
-                },
-                @ptrCast(send_file.path.slice),
-                file_size,
-                &send_file.hash,
-            );
+            try network.sendFileMetadata(writer, send_file.file_id, file_size, &send_file.hash);
             try writer.flush();
 
             send_file.state = .receive_decision;
@@ -1580,6 +1698,7 @@ pub const TxData = union(enum) {
 
     pub const ReceiveFile = struct {
         state: State,
+        file_id: network.FileId,
         path: Wtf16,
         size: w.LARGE_INTEGER,
         hash: network.FileHash,
@@ -1599,20 +1718,22 @@ pub const TxData = union(enum) {
             io: Io,
             reader: *Io.Reader,
         ) !void {
-            var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
-            const metadata = try network.receiveFileMetadata(reader, &file_path_buffer);
-            const file_path, const comparison = try host.db.checkMetadata(&metadata, &file_path_buffer, io);
-
-            const decision: State.SendDecision =
-                switch (comparison) {
-                    .equals => .decline,
-                    .differs => .accept,
-                };
-
+            const metadata = try network.receiveFileMetadata(reader);
+            const path: Wtf16, const decision: State.SendDecision = switch (try host.db.checkMetadata(&metadata, io)) {
+                .file_exists => |res| .{
+                    res.path, switch (res.comparison) {
+                        .equals => .decline,
+                        .differs => .accept,
+                    },
+                },
+                .file_is_uninitialized => |res| .{ res.path, .accept },
+                .file_doesnt_exist => std.debug.panic("TODO", .{}),
+            };
             const data: TxData = .{
                 .receive_file = .{
                     .state = .{ .send_decision = decision },
-                    .path = file_path,
+                    .file_id = metadata.file_id,
+                    .path = path,
                     .size = @as(w.LARGE_INTEGER, @intCast(metadata.file_size)),
                     .hash = metadata.hash,
                 },
@@ -1665,10 +1786,10 @@ pub const TxData = union(enum) {
                     const handle = try host.db.createFile(io, receive_file.path, receive_file.size);
                     defer host.db.closeFile(handle);
                     try receiveFile(reader, handle, receive_file.size);
-                    try host.db.updateReceivedFile(
+                    try host.db.finishReceiveFileContents(
                         io,
                         handle,
-                        receive_file.path,
+                        receive_file.file_id,
                         &receive_file.hash,
                         receive_file.size,
                     );
