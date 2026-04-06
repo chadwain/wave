@@ -57,34 +57,6 @@ pub const Wtf16 = struct {
     }
 };
 
-fn normalizePath(path: Wtf16) void {
-    // TODO: assert path is relative
-    var buffer: [w.MAX_PATH * 4]u8 = undefined;
-
-    // path must be relative
-    // path must be a Win32 path for ComponentIterator to work
-    // ComponentIterator only does little endian
-    if (cpu_endian != .little) @compileError("TODO big endian");
-
-    var it = std.fs.path.ComponentIterator(.windows, u16).init(path.slice);
-    _ = it.peekNext() orelse return error.EmptyPath;
-    var index: u16 = 0;
-    while (it.next()) |component| {
-        if (std.mem.eql(u16, component.name, wtf16(".")) or
-            std.mem.eql(u16, component.name, wtf16("..")))
-            return error.UnwantedPath;
-        if (it.peekNext() == null) {
-            // TODO trim trailing spaces and dots
-        }
-        const bytes_written = std.unicode.wtf16LeToWtf8(&buffer[index..], component.name);
-        index += @intCast(bytes_written);
-        if (it.peekNext() != null) {
-            buffer[index] = '/';
-            index += 1;
-        }
-    }
-}
-
 pub const Database = struct {
     // Server and Client fields
     sync_dir: w.HANDLE,
@@ -102,9 +74,10 @@ pub const Database = struct {
     server_known_files: std.AutoHashMapUnmanaged(network.FileId, ServerFileEntry),
 
     // Client only
-    client_known_files: Win32RelativePathHashMap(FileMetadata),
+    client_known_files: Win32RelativePathHashMap(ClientFileEntry),
     awaiting_sync_files: Win32RelativePathHashMap(void), // TODO change to a key value type of `FileId`
     new_files: Win32RelativePathHashMap(void),
+    deleted_files: std.ArrayList(struct { Wtf16, network.FileId }),
     scan_arena: std.heap.ArenaAllocator.State,
 
     // Database-Host synchronization fields (client only)
@@ -112,7 +85,7 @@ pub const Database = struct {
     host_state: std.atomic.Value(Host.State),
     out_path: Wtf16,
     out_file_id: network.FileId,
-    out_entry: FileMetadata,
+    out_metadata: FileMetadata,
 
     pub const Alert = enum(u32) { off, on };
 
@@ -121,6 +94,13 @@ pub const Database = struct {
         hash: network.FileHash,
         modified_time: w.LARGE_INTEGER,
         size: w.ULARGE_INTEGER,
+    };
+
+    pub const ClientFileState = enum { normal, untracked };
+
+    pub const ClientFileEntry = struct {
+        state: ClientFileState,
+        metadata: FileMetadata,
     };
 
     pub const ServerFileState = enum { unsynced, synced };
@@ -132,6 +112,7 @@ pub const Database = struct {
     };
 
     pub fn Win32RelativePathHashMap(comptime V: type) type {
+        // TODO: hash and eql functions don't agree on path normalization rules
         const Context = struct {
             pub fn hash(_: @This(), self: Wtf16) u32 {
                 // TODO: more efficient hashing
@@ -189,13 +170,14 @@ pub const Database = struct {
             .client_known_files = .empty,
             .awaiting_sync_files = .empty,
             .new_files = .empty,
+            .deleted_files = .empty,
             .scan_arena = .{},
 
             .alert = .init(.off),
             .host_state = .init(.{}),
             .out_path = undefined,
             .out_file_id = undefined,
-            .out_entry = undefined,
+            .out_metadata = undefined,
         };
     }
 
@@ -212,6 +194,7 @@ pub const Database = struct {
         db.client_known_files.deinit(db.allocator);
         db.awaiting_sync_files.deinit(db.allocator);
         db.new_files.deinit(db.allocator);
+        db.deleted_files.deinit(db.allocator);
         var scan_arena = db.scan_arena.promote(db.allocator);
         scan_arena.deinit();
 
@@ -242,6 +225,9 @@ pub const Database = struct {
                 if (db.new_files.count() != 0 and db.acquireHostEvent() != null) {
                     var it = db.new_files.keyIterator();
                     const path = it.next().?;
+                    const file_info = db.client_known_files.get(path.*).?;
+                    assert(file_info.state == .normal);
+
                     db.out_path = path.*;
                     db.new_files.removeByPtr(path);
 
@@ -251,14 +237,25 @@ pub const Database = struct {
                 } else if (db.awaiting_sync_files.count() != 0 and db.acquireHostEvent() != null) {
                     var it = db.awaiting_sync_files.keyIterator();
                     const path = it.next().?;
+                    const file_info = db.client_known_files.get(path.*).?;
+                    assert(file_info.state == .normal);
+
                     db.out_file_id = db.file_id_map.get(path.*).?;
                     db.out_path = path.*;
-                    db.out_entry = db.client_known_files.get(path.*).?;
+                    db.out_metadata = file_info.metadata;
                     db.awaiting_sync_files.removeByPtr(path);
 
                     db.releaseHostEvent(.sync_file);
                     io.futexWake(Host.State, &db.host_state.raw, 1);
                     continue;
+                } else if (db.deleted_files.items.len != 0 and db.acquireHostEvent() != null) {
+                    const path, const file_id = db.deleted_files.swapRemove(db.deleted_files.items.len - 1);
+
+                    db.out_file_id = file_id;
+                    db.out_path = path;
+
+                    db.releaseHostEvent(.delete_file);
+                    io.futexWake(Host.State, &db.host_state.raw, 1);
                 }
             }
 
@@ -298,40 +295,62 @@ pub const Database = struct {
         path: Wtf16,
         information: *const NtQueryInformation,
         hash: *const network.FileHash,
+        untracked: bool,
     ) !void {
         const size = std.math.cast(w.ULARGE_INTEGER, information.EndOfFile) orelse return error.Unexpected;
 
-        const gop = try db.client_known_files.getOrPut(db.allocator, path);
-        errdefer if (!gop.found_existing) db.client_known_files.removeByPtr(gop.key_ptr);
-
-        var file_path_arena = db.file_path_arena.promote(db.allocator);
-        defer db.file_path_arena = file_path_arena.state;
-        const file_path_allocator = file_path_arena.allocator();
-
-        if (!gop.found_existing) gop.key_ptr.* = try path.dupe(file_path_allocator);
-        errdefer if (!gop.found_existing) file_path_allocator.free(gop.key_ptr.slice);
-
-        const new_entry = FileMetadata{
+        const metadata = FileMetadata{
             .local_file_id = information.FileId,
             .hash = hash.*,
             .modified_time = information.ChangeTime,
             .size = size,
         };
 
-        if (gop.found_existing and
-            gop.value_ptr.local_file_id == new_entry.local_file_id and
-            gop.value_ptr.size == new_entry.size and
-            gop.value_ptr.hash.eql(&new_entry.hash)) return;
+        const gop = try db.client_known_files.getOrPut(db.allocator, path);
+        if (gop.found_existing) {
+            if (untracked) {
+                gop.value_ptr.* = .{ .state = .untracked, .metadata = metadata };
+                return;
+            }
 
-        if (!gop.found_existing) {
-            try db.new_files.ensureUnusedCapacity(db.allocator, 1);
-            gop.value_ptr.* = new_entry;
-            db.new_files.putAssumeCapacity(gop.key_ptr.*, {});
+            if (gop.value_ptr.metadata.local_file_id == metadata.local_file_id and
+                gop.value_ptr.metadata.size == metadata.size and
+                gop.value_ptr.metadata.hash.eql(&metadata.hash)) return;
+
+            try db.awaiting_sync_files.put(db.allocator, gop.key_ptr.*, {});
+            errdefer comptime unreachable;
         } else {
-            try db.awaiting_sync_files.ensureUnusedCapacity(db.allocator, 1);
-            gop.value_ptr.* = new_entry;
-            db.awaiting_sync_files.putAssumeCapacity(gop.key_ptr.*, {});
+            errdefer db.client_known_files.removeByPtr(gop.key_ptr);
+
+            var file_path_arena = db.file_path_arena.promote(db.allocator);
+            defer db.file_path_arena = file_path_arena.state;
+            const file_path_allocator = file_path_arena.allocator();
+
+            gop.key_ptr.* = try path.dupe(file_path_allocator);
+            errdefer file_path_allocator.free(gop.key_ptr.slice);
+
+            if (untracked) {
+                gop.value_ptr.* = .{ .state = .untracked, .metadata = metadata };
+                return;
+            }
+
+            try db.new_files.put(db.allocator, gop.key_ptr.*, {});
+            errdefer comptime unreachable;
         }
+
+        gop.value_ptr.* = .{ .state = .normal, .metadata = metadata };
+    }
+
+    // client
+    /// Must be called with a lock.
+    /// `path` must be a path to a tracked file
+    fn deleteLocalFile(db: *Database, path: Wtf16) !void {
+        try db.deleted_files.ensureUnusedCapacity(db.allocator, 1);
+        errdefer comptime unreachable;
+
+        assert(db.client_known_files.remove(path));
+        const file_id = db.file_id_map.fetchRemove(path).?.value;
+        db.deleted_files.appendAssumeCapacity(.{ path, file_id });
     }
 
     const NewFileResult = union(enum) {
@@ -381,6 +400,7 @@ pub const Database = struct {
         try db.file_id_map.putNoClobber(db.allocator, path, global_file_id);
 
         try db.awaiting_sync_files.put(db.allocator, path, {});
+        // TODO: send alert here?
     }
 
     fn markFileAsSynced(db: *Database, path: Wtf16) void {
@@ -503,23 +523,62 @@ pub const Database = struct {
         entry.state = .synced;
     }
 
+    const ServerDeleteGlobalFileResult = union(enum) {
+        success,
+        unknown_file,
+        delete_file_err: Io.Dir.DeleteFileError,
+    };
+
+    fn serverDeleteGlobalFile(db: *Database, file_id: network.FileId, io: Io) !ServerDeleteGlobalFileResult {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        const entry = db.server_known_files.fetchRemove(file_id) orelse return .unknown_file;
+        assert(db.file_id_map.fetchRemove(entry.value.path).?.value == file_id);
+        switch (entry.value.state) {
+            .synced, .unsynced => {},
+        }
+        // TODO janky, use NT functions
+        const path_wtf8 = try entry.value.path.toWtf8Path();
+        if (db.sync_dir_io.deleteFile(io, path_wtf8.slice())) |_| {
+            return .success;
+        } else |err| {
+            return .{ .delete_file_err = err };
+        }
+    }
+
     pub const Debug = struct {
         pub fn printKnownFiles(debug: *Debug, writer: *Io.Writer, io: Io) !void {
             const db: *Database = @alignCast(@fieldParentPtr("debug", debug));
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
+            try writer.writeAll("Tracked files\n");
             var it = db.client_known_files.iterator();
             while (it.next()) |entry| {
+                switch (entry.value_ptr.state) {
+                    .normal => {},
+                    .untracked => continue,
+                }
                 try writer.print(
                     "{f}: hash({f}) modified({}) size({})\n",
                     .{
                         entry.key_ptr.formatUtf8(),
-                        entry.value_ptr.hash,
-                        entry.value_ptr.modified_time,
-                        entry.value_ptr.size,
+                        entry.value_ptr.metadata.hash,
+                        entry.value_ptr.metadata.modified_time,
+                        entry.value_ptr.metadata.size,
                     },
                 );
+            }
+
+            try writer.writeAll("\nUntracked files\n");
+            it = db.client_known_files.iterator();
+            while (it.next()) |entry| {
+                switch (entry.value_ptr.state) {
+                    .normal => continue,
+                    .untracked => {},
+                }
+                try writer.print("{f}\n", .{entry.key_ptr.formatUtf8()});
             }
         }
 
@@ -565,11 +624,23 @@ const FullScanContext = struct {
     sub_path: std.ArrayList(w.WCHAR),
     component_delimeters: std.ArrayList(u16),
     open_dir_handles: std.ArrayList(w.HANDLE),
+    known_files_copy: Database.Win32RelativePathHashMap(void),
 
     fn init(db: *const Database, arena: *std.heap.ArenaAllocator) !FullScanContext {
         const allocator = arena.allocator();
+
         var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
         try open_dir_handles.append(allocator, db.sync_dir);
+
+        var known_files_copy: Database.Win32RelativePathHashMap(void) = .empty;
+        try known_files_copy.ensureTotalCapacity(allocator, db.client_known_files.count());
+        var it = db.client_known_files.iterator();
+        while (it.next()) |entry| {
+            switch (entry.value_ptr.state) {
+                .normal => known_files_copy.putAssumeCapacityNoClobber(entry.key_ptr.*, {}),
+                .untracked => {},
+            }
+        }
 
         return .{
             .arena = arena,
@@ -577,6 +648,7 @@ const FullScanContext = struct {
             .sub_path = .empty,
             .component_delimeters = .empty,
             .open_dir_handles = open_dir_handles,
+            .known_files_copy = known_files_copy,
         };
     }
 
@@ -618,15 +690,10 @@ const FullScanContext = struct {
             .REPARSE_POINT = true,
             .ENCRYPTED = true,
         };
-        if (@as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0) {
-            wave.log.info("Not processing file because it has unwanted attributes: {f}{f}\n", .{
-                std.unicode.fmtUtf16Le(ctx.sub_path.items),
-                std.unicode.fmtUtf16Le(name.slice),
-            });
-            return;
-        }
+        const untracked = @as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0;
 
         if (information.FileAttributes.DIRECTORY) {
+            if (untracked) return;
             const allocator = ctx.arena.allocator();
             const copied_name = try name.dupe(allocator);
             try ctx.pending_dirs.append(allocator, copied_name);
@@ -635,6 +702,7 @@ const FullScanContext = struct {
             const component_delimeter_index = ctx.sub_path.items.len;
             defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
             try ctx.sub_path.appendSlice(allocator, name.slice);
+            const path: Wtf16 = .wtf16Cast(ctx.sub_path.items);
 
             // TODO: Do not compute the hash right now
             const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
@@ -642,8 +710,14 @@ const FullScanContext = struct {
             defer w.CloseHandle(file);
             const hash = try computeFileHash(file, information.EndOfFile);
 
-            try db.updateLocalFile(.wtf16Cast(ctx.sub_path.items), information, &hash);
+            try db.updateLocalFile(path, information, &hash, untracked);
+            _ = ctx.known_files_copy.remove(path);
         }
+    }
+
+    fn deleteFiles(ctx: *FullScanContext, db: *Database) !void {
+        var it = ctx.known_files_copy.keyIterator();
+        while (it.next()) |path| try db.deleteLocalFile(path.*);
     }
 };
 
@@ -699,6 +773,8 @@ pub fn completeScan(db: *Database, io: Io) !void {
         try ctx.enterDir(dir_path);
         try scanOneDirectory(db, &ctx);
     }
+
+    try ctx.deleteFiles(db);
 }
 
 fn scanOneDirectory(db: *Database, ctx: *FullScanContext) !void {
@@ -751,12 +827,7 @@ fn scanOneDirectory(db: *Database, ctx: *FullScanContext) !void {
 /// Opens a directory capable of async operations and being waited on.
 fn openDir(parent: ?w.HANDLE, path: Wtf16) !w.HANDLE {
     var handle: w.HANDLE = undefined;
-    const path_byte_count: w.USHORT = @intCast(path.slice.len * @sizeOf(w.WCHAR));
-    var unicode_string: w.UNICODE_STRING = .{
-        .Length = path_byte_count,
-        .MaximumLength = path_byte_count,
-        .Buffer = @constCast(path.slice.ptr),
-    };
+    var unicode_string = w.UNICODE_STRING.init(path.slice);
     const object_attributes: w.OBJECT.ATTRIBUTES = .{
         .Length = @sizeOf(w.OBJECT.ATTRIBUTES),
         .RootDirectory = parent,
@@ -818,12 +889,7 @@ fn openFile(parent: ?w.HANDLE, path: Wtf16, options: OpenFileOptions) !w.HANDLE 
     errdefer wave.log.err("Failed to open file: {f}\n", .{path.formatUtf8()});
 
     var handle: w.HANDLE = undefined;
-    const path_byte_count: w.USHORT = @intCast(@as([]const u8, @ptrCast(path.slice)).len);
-    var unicode_string: w.UNICODE_STRING = .{
-        .Length = path_byte_count,
-        .MaximumLength = path_byte_count,
-        .Buffer = @constCast(path.slice.ptr),
-    };
+    var unicode_string = w.UNICODE_STRING.init(path.slice);
     const object_attributes: w.OBJECT.ATTRIBUTES = .{
         .Length = @sizeOf(w.OBJECT.ATTRIBUTES),
         .RootDirectory = parent,
@@ -1072,7 +1138,7 @@ pub const Host = struct {
     pub const State = packed struct(u32) {
         tx: TxStatus = .init,
         event: Event = .none,
-        padding: u28 = 0,
+        padding: u27 = 0,
 
         pub const TxStatus = enum(u2) {
             /// The TX is free to use.
@@ -1085,11 +1151,12 @@ pub const Host = struct {
             incoming,
         };
 
-        pub const Event = enum(u2) {
+        pub const Event = enum(u3) {
             none,
             acquired,
             get_global_file_id,
             sync_file,
+            delete_file,
         };
     };
 
@@ -1163,27 +1230,35 @@ pub const Host = struct {
 
             const tx_id: network.TransactionId = @enumFromInt(0); // TODO hardcoded value
             switch (host.tx.data) {
-                .send_new_file => |*send_new_file| switch (send_new_file.state) {
-                    .send_path => try send_new_file.sendPath(host, tx_id, host.tx.peer_tx_id, io, writer),
+                .out_new_file => |*out_new_file| switch (out_new_file.state) {
+                    .send_path => try out_new_file.sendPath(host, tx_id, host.tx.peer_tx_id, io, writer),
                     .receive_decision => unreachable,
                 },
-                .receive_new_file => |*receive_new_file| {
-                    try receive_new_file.sendDecision(host, tx_id, host.tx.peer_tx_id, io, writer);
+                .in_new_file => |*in_new_file| {
+                    try in_new_file.sendDecision(host, tx_id, host.tx.peer_tx_id, io, writer);
                 },
-                .send_file => |*send_file| switch (send_file.state) {
-                    .send_metadata => try send_file.sendMetadata(host, tx_id, host.tx.peer_tx_id, io, writer),
-                    .send_file_contents => try send_file.sendFileContents(host, tx_id, host.tx.peer_tx_id, io, writer),
+                .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
+                    .send_metadata => try out_file_contents.sendMetadata(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .send_file_contents => try out_file_contents.sendFileContents(host, tx_id, host.tx.peer_tx_id, io, writer),
                     .receive_decision, .receive_result => unreachable,
                 },
-                .receive_file => |*receive_file| switch (receive_file.state) {
-                    .send_decision => try receive_file.sendDecision(host, tx_id, host.tx.peer_tx_id, io, writer),
-                    .send_result => try receive_file.sendResult(host, tx_id, host.tx.peer_tx_id, io, writer),
+                .in_file_contents => |*in_file_contents| switch (in_file_contents.state) {
+                    .send_decision => try in_file_contents.sendDecision(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .send_result => try in_file_contents.sendResult(host, tx_id, host.tx.peer_tx_id, io, writer),
                     .receive_file_contents => unreachable,
+                },
+                .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
+                    .send_file_id => try out_delete_file.sendFileId(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .receive_confirmation => unreachable,
+                },
+                .in_delete_file => |*in_delete_file| {
+                    try in_delete_file.sendConfirmation(host, tx_id, host.tx.peer_tx_id, io, writer);
                 },
             }
         }
     }
 
+    /// Returns null if no event was handled.
     fn handleEvents(host: *Host, state: State, io: Io) ?void {
         switch (state.event) {
             .none, .acquired => return null,
@@ -1195,12 +1270,13 @@ pub const Host = struct {
                 host.debugLog("getting global file id for new file: {f}", .{host.db.out_path.formatUtf8()});
 
                 host.tx.data = .{
-                    .send_new_file = .{
+                    .out_new_file = .{
                         .state = .send_path,
                         .path = host.db.out_path,
                     },
                 };
                 host.tx.peer_tx_id = .invalid;
+
                 host.db.out_path = undefined;
             },
             .sync_file => {
@@ -1211,17 +1287,38 @@ pub const Host = struct {
                 host.debugLog("syncing file: {f}", .{host.db.out_path.formatUtf8()});
 
                 host.tx.data = .{
-                    .send_file = .{
+                    .out_file_contents = .{
                         .state = .send_metadata,
                         .file_id = host.db.out_file_id,
                         .path = host.db.out_path,
-                        .size = host.db.out_entry.size,
-                        .hash = host.db.out_entry.hash,
+                        .size = host.db.out_metadata.size,
+                        .hash = host.db.out_metadata.hash,
                     },
                 };
                 host.tx.peer_tx_id = .invalid;
+
+                host.db.out_file_id = undefined;
                 host.db.out_path = undefined;
-                host.db.out_entry = undefined;
+                host.db.out_metadata = undefined;
+            },
+            .delete_file => {
+                const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
+                    error.NoTxSlotsAvailable => return null,
+                };
+                assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
+                host.debugLog("deleting file: {f}", .{host.db.out_path.formatUtf8()});
+
+                host.tx.data = .{
+                    .out_delete_file = .{
+                        .state = .send_file_id,
+                        .file_id = host.db.out_file_id,
+                        .path = host.db.out_path,
+                    },
+                };
+                host.tx.peer_tx_id = .invalid;
+
+                host.db.out_file_id = undefined;
+                host.db.out_path = undefined;
             },
         }
 
@@ -1259,23 +1356,27 @@ pub const Host = struct {
                     if (header.peer_tx_id == .invalid) return error.InvalidPeerTxId;
                     switch (action) {
                         .client_new_file => {
-                            try TxData.ReceiveNewFile.newTx(host, header.peer_tx_id, io, reader);
+                            try TxData.InNewFile.newTx(host, header.peer_tx_id, io, reader);
                         },
                         .transfer_file_metadata => {
-                            try TxData.ReceiveFile.newTx(host, header.peer_tx_id, io, reader);
+                            try TxData.InFileContents.newTx(host, header.peer_tx_id, io, reader);
+                        },
+                        .delete_file => {
+                            try TxData.InDeleteFile.newTx(host, header.peer_tx_id, io, reader);
                         },
                         else => return error.InvalidAction,
                     }
                 },
                 .new_tx_reply => {
                     if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
+                    // TODO There is a chance that this line can be reached before the send task flips the TX to incoming
                     if (host.db.host_state.load(.monotonic).tx != .incoming) return error.InvalidTxId;
                     if (host.tx.peer_tx_id != .invalid) return error.WrongPeerTxId;
 
                     switch (host.tx.data) {
-                        .send_new_file => |*send_new_file| switch (send_new_file.state) {
+                        .out_new_file => |*out_new_file| switch (out_new_file.state) {
                             .receive_decision => {
-                                try send_new_file.receiveDecision(
+                                try out_new_file.receiveDecision(
                                     host,
                                     reader,
                                     io,
@@ -1286,10 +1387,10 @@ pub const Host = struct {
                             },
                             .send_path => unreachable,
                         },
-                        .receive_new_file => unreachable,
-                        .send_file => |*send_file| switch (send_file.state) {
+                        .in_new_file => unreachable,
+                        .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
                             .receive_decision => {
-                                try send_file.receiveDecision(
+                                try out_file_contents.receiveDecision(
                                     host,
                                     reader,
                                     io,
@@ -1301,36 +1402,54 @@ pub const Host = struct {
                             .receive_result => return error.InvalidHeader,
                             .send_metadata, .send_file_contents => unreachable,
                         },
-                        .receive_file => |*receive_file| switch (receive_file.state) {
+                        .in_file_contents => |*in_file_contents| switch (in_file_contents.state) {
                             .receive_file_contents => return error.InvalidHeader,
                             .send_decision, .send_result => unreachable,
                         },
+                        .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
+                            .send_file_id => unreachable,
+                            .receive_confirmation => try out_delete_file.receiveConfirmation(
+                                host,
+                                reader,
+                                io,
+                                header.tx_id,
+                                header.peer_tx_id,
+                                action,
+                            ),
+                        },
+                        .in_delete_file => unreachable,
                     }
                 },
                 .existing_tx => {
                     if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
+                    // TODO There is a chance that this line can be reached before the send task flips the TX to incoming
                     if (host.db.host_state.load(.monotonic).tx != .incoming) return error.InvalidTxId;
                     if (header.peer_tx_id != .invalid) return error.WrongPeerTxId;
 
                     switch (host.tx.data) {
-                        .send_new_file => |*send_new_file| switch (send_new_file.state) {
+                        .out_new_file => |*out_new_file| switch (out_new_file.state) {
                             .receive_decision => return error.InvalidHeader,
                             .send_path => unreachable,
                         },
-                        .receive_new_file => unreachable,
-                        .send_file => |*send_file| switch (send_file.state) {
+                        .in_new_file => unreachable,
+                        .out_file_contents => |*out_file_contents| switch (out_file_contents.state) {
                             .receive_decision => return error.InvalidHeader,
                             .receive_result => {
-                                try send_file.receiveResult(host, reader, io, header.tx_id, action);
+                                try out_file_contents.receiveResult(host, reader, io, header.tx_id, action);
                             },
                             .send_metadata, .send_file_contents => unreachable,
                         },
-                        .receive_file => |*receive_file| switch (receive_file.state) {
+                        .in_file_contents => |*in_file_contents| switch (in_file_contents.state) {
                             .receive_file_contents => {
-                                try receive_file.receiveFileContents(host, reader, io, header.tx_id, action);
+                                try in_file_contents.receiveFileContents(host, reader, io, header.tx_id, action);
                             },
                             .send_decision, .send_result => unreachable,
                         },
+                        .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
+                            .send_file_id => unreachable,
+                            .receive_confirmation => return error.InvalidHeader,
+                        },
+                        .in_delete_file => unreachable,
                     }
                 },
             }
@@ -1437,13 +1556,16 @@ pub const Host = struct {
 };
 
 pub const TxData = union(enum) {
-    send_new_file: SendNewFile,
-    receive_new_file: ReceiveNewFile,
+    out_new_file: OutNewFile,
+    in_new_file: InNewFile,
 
-    send_file: SendFile,
-    receive_file: ReceiveFile,
+    out_file_contents: OutFileContents,
+    in_file_contents: InFileContents,
 
-    pub const SendNewFile = struct {
+    out_delete_file: OutDeleteFile,
+    in_delete_file: InDeleteFile,
+
+    pub const OutNewFile = struct {
         state: State,
         path: Wtf16,
 
@@ -1453,14 +1575,14 @@ pub const TxData = union(enum) {
         };
 
         fn sendPath(
-            send_new_file: *SendNewFile,
+            out_new_file: *OutNewFile,
             host: *Host,
             tx_id: network.TransactionId,
             peer_tx_id: network.TransactionId,
             io: Io,
             writer: *Io.Writer,
         ) !void {
-            assert(send_new_file.state == .send_path);
+            assert(out_new_file.state == .send_path);
             assert(peer_tx_id == .invalid);
 
             const action: network.Action = .client_new_file;
@@ -1474,16 +1596,16 @@ pub const TxData = union(enum) {
                     .big => @compileError("TODO big endian"),
                     .little => .wtf16le,
                 },
-                @ptrCast(send_new_file.path.slice),
+                @ptrCast(out_new_file.path.slice),
             );
             try writer.flush();
 
-            send_new_file.state = .receive_decision;
+            out_new_file.state = .receive_decision;
             host.flipTransaction(.incoming, tx_id, io);
         }
 
         fn receiveDecision(
-            send_new_file: *const SendNewFile,
+            out_new_file: *const OutNewFile,
             host: *Host,
             reader: *Io.Reader,
             io: Io,
@@ -1491,22 +1613,22 @@ pub const TxData = union(enum) {
             peer_tx_id: network.TransactionId,
             action: network.Action,
         ) !void {
-            assert(send_new_file.state == .receive_decision);
+            assert(out_new_file.state == .receive_decision);
             if (peer_tx_id != .invalid) return error.InvalidPeerTxId;
 
             switch (action) {
                 .server_registered_new_file => {
                     const file_id = try network.receiveFileId(reader);
-                    host.debugLog("received file id {} for file {f}\n", .{ file_id, send_new_file.path.formatUtf8() });
-                    try host.db.setNewFileId(send_new_file.path, file_id, io);
+                    host.debugLog("received file id {} for file {f}\n", .{ file_id, out_new_file.path.formatUtf8() });
+                    try host.db.setNewFileId(out_new_file.path, file_id, io);
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
                 .server_cant_register_new_files => {
-                    host.debugLog("server can't register file {f}\n", .{send_new_file.path.formatUtf8()});
+                    host.debugLog("server can't register file {f}\n", .{out_new_file.path.formatUtf8()});
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
                 .server_new_file_exists => {
-                    host.debugLog("new file already exists: {f}\n", .{send_new_file.path.formatUtf8()});
+                    host.debugLog("new file already exists: {f}\n", .{out_new_file.path.formatUtf8()});
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
                 else => return error.InvalidAction,
@@ -1514,7 +1636,7 @@ pub const TxData = union(enum) {
         }
     };
 
-    pub const ReceiveNewFile = struct {
+    pub const InNewFile = struct {
         data: Database.NewFileResult,
 
         fn newTx(
@@ -1533,7 +1655,7 @@ pub const TxData = union(enum) {
                 },
             };
             const data: TxData = .{
-                .receive_new_file = .{
+                .in_new_file = .{
                     .data = try host.db.newFile(path, io),
                 },
             };
@@ -1541,7 +1663,7 @@ pub const TxData = union(enum) {
         }
 
         fn sendDecision(
-            receive_new_file: *const ReceiveNewFile,
+            in_new_file: *const InNewFile,
             host: *Host,
             tx_id: network.TransactionId,
             peer_tx_id: network.TransactionId,
@@ -1551,7 +1673,7 @@ pub const TxData = union(enum) {
             assert(peer_tx_id != .invalid);
 
             const outgoing_tx_id: network.TransactionId = .invalid;
-            switch (receive_new_file.data) {
+            switch (in_new_file.data) {
                 .file_id => |file_id| {
                     const action: network.Action = .server_registered_new_file;
                     host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
@@ -1581,7 +1703,7 @@ pub const TxData = union(enum) {
         }
     };
 
-    pub const SendFile = struct {
+    pub const OutFileContents = struct {
         state: State,
         file_id: network.FileId,
         path: Wtf16,
@@ -1596,35 +1718,35 @@ pub const TxData = union(enum) {
         };
 
         fn sendMetadata(
-            send_file: *SendFile,
+            out_file_contents: *OutFileContents,
             host: *Host,
             tx_id: network.TransactionId,
             peer_tx_id: network.TransactionId,
             io: Io,
             writer: *Io.Writer,
         ) !void {
-            assert(send_file.state == .send_metadata);
+            assert(out_file_contents.state == .send_metadata);
             assert(peer_tx_id == .invalid);
 
             const action: network.Action = .transfer_file_metadata;
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
 
-            const file_size = std.math.cast(network.FileSize, send_file.size) orelse
+            const file_size = std.math.cast(network.FileSize, out_file_contents.size) orelse
                 std.debug.panic(
                     "TODO: File too large to transfer: '{f}' with size {}",
-                    .{ send_file.path.formatUtf8(), send_file.size },
+                    .{ out_file_contents.path.formatUtf8(), out_file_contents.size },
                 );
             try network.sendMessageHeaderNewTx(writer, tx_id);
             try network.sendAction(writer, action);
-            try network.sendFileMetadata(writer, send_file.file_id, file_size, &send_file.hash);
+            try network.sendFileMetadata(writer, out_file_contents.file_id, file_size, &out_file_contents.hash);
             try writer.flush();
 
-            send_file.state = .receive_decision;
+            out_file_contents.state = .receive_decision;
             host.flipTransaction(.incoming, tx_id, io);
         }
 
         fn receiveDecision(
-            send_file: *SendFile,
+            out_file_contents: *OutFileContents,
             host: *Host,
             _: *Io.Reader,
             io: Io,
@@ -1632,12 +1754,12 @@ pub const TxData = union(enum) {
             peer_tx_id: network.TransactionId,
             action: network.Action,
         ) !void {
-            assert(send_file.state == .receive_decision);
+            assert(out_file_contents.state == .receive_decision);
 
             switch (action) {
                 .transfer_file_accept => {
                     if (peer_tx_id == .invalid) return error.WrongPeerTxId;
-                    send_file.state = .send_file_contents;
+                    out_file_contents.state = .send_file_contents;
                     host.tx.peer_tx_id = peer_tx_id;
                     host.flipTransaction(.outgoing, tx_id, io);
                 },
@@ -1650,32 +1772,32 @@ pub const TxData = union(enum) {
         }
 
         fn sendFileContents(
-            send_file: *SendFile,
+            out_file_contents: *OutFileContents,
             host: *Host,
             tx_id: network.TransactionId,
             peer_tx_id: network.TransactionId,
             io: Io,
             writer: *Io.Writer,
         ) !void {
-            assert(send_file.state == .send_file_contents);
+            assert(out_file_contents.state == .send_file_contents);
 
             const action: network.Action = .transfer_file_contents;
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
 
-            const handle = try host.db.openFileReadOnly(send_file.path);
+            const handle = try host.db.openFileReadOnly(out_file_contents.path);
             defer host.db.closeFile(handle);
 
             try network.sendMessageHeaderExistingTx(writer, peer_tx_id);
             try network.sendAction(writer, action);
-            try sendFile(writer, handle, send_file.size);
+            try sendFile(writer, handle, out_file_contents.size);
             try writer.flush();
 
-            send_file.state = .receive_result;
+            out_file_contents.state = .receive_result;
             host.flipTransaction(.incoming, tx_id, io);
         }
 
         fn receiveResult(
-            send_file: *const SendFile,
+            out_file_contents: *const OutFileContents,
             host: *Host,
             _: *Io.Reader,
             io: Io,
@@ -1684,11 +1806,11 @@ pub const TxData = union(enum) {
         ) !void {
             switch (action) {
                 .transfer_file_success => {
-                    host.db.markFileAsSynced(send_file.path);
+                    host.db.markFileAsSynced(out_file_contents.path);
                 },
                 .transfer_file_failure => {
                     // TODO mark file as failed to sync
-                    host.db.markFileAsSynced(send_file.path);
+                    host.db.markFileAsSynced(out_file_contents.path);
                 },
                 else => return error.InvalidAction,
             }
@@ -1696,7 +1818,7 @@ pub const TxData = union(enum) {
         }
     };
 
-    pub const ReceiveFile = struct {
+    pub const InFileContents = struct {
         state: State,
         file_id: network.FileId,
         path: Wtf16,
@@ -1730,7 +1852,7 @@ pub const TxData = union(enum) {
                 .file_doesnt_exist => std.debug.panic("TODO", .{}),
             };
             const data: TxData = .{
-                .receive_file = .{
+                .in_file_contents = .{
                     .state = .{ .send_decision = decision },
                     .file_id = metadata.file_id,
                     .path = path,
@@ -1742,18 +1864,18 @@ pub const TxData = union(enum) {
         }
 
         fn sendDecision(
-            receive_file: *ReceiveFile,
+            in_file_contents: *InFileContents,
             host: *Host,
             tx_id: network.TransactionId,
             peer_tx_id: network.TransactionId,
             io: Io,
             writer: *Io.Writer,
         ) !void {
-            assert(receive_file.state == .send_decision);
+            assert(in_file_contents.state == .send_decision);
             assert(peer_tx_id != .invalid);
 
             const actual_tx_id: network.TransactionId, const action: network.Action =
-                switch (receive_file.state.send_decision) {
+                switch (in_file_contents.state.send_decision) {
                     .accept => .{ tx_id, .transfer_file_accept },
                     .decline => .{ .invalid, .transfer_file_decline },
                 };
@@ -1763,9 +1885,9 @@ pub const TxData = union(enum) {
             try network.sendAction(writer, action);
             try writer.flush();
 
-            switch (receive_file.state.send_decision) {
+            switch (in_file_contents.state.send_decision) {
                 .accept => {
-                    receive_file.state = .receive_file_contents;
+                    in_file_contents.state = .receive_file_contents;
                     host.flipTransaction(.incoming, tx_id, io);
                 },
                 .decline => host.deleteTransaction(tx_id, .outgoing, io),
@@ -1773,28 +1895,28 @@ pub const TxData = union(enum) {
         }
 
         fn receiveFileContents(
-            receive_file: *ReceiveFile,
+            in_file_contents: *InFileContents,
             host: *Host,
             reader: *Io.Reader,
             io: Io,
             tx_id: network.TransactionId,
             action: network.Action,
         ) !void {
-            assert(receive_file.state == .receive_file_contents);
+            assert(in_file_contents.state == .receive_file_contents);
             switch (action) {
                 .transfer_file_contents => {
-                    const handle = try host.db.createFile(io, receive_file.path, receive_file.size);
+                    const handle = try host.db.createFile(io, in_file_contents.path, in_file_contents.size);
                     defer host.db.closeFile(handle);
-                    try receiveFile(reader, handle, receive_file.size);
+                    try receiveFile(reader, handle, in_file_contents.size);
                     try host.db.finishReceiveFileContents(
                         io,
                         handle,
-                        receive_file.file_id,
-                        &receive_file.hash,
-                        receive_file.size,
+                        in_file_contents.file_id,
+                        &in_file_contents.hash,
+                        in_file_contents.size,
                     );
 
-                    receive_file.state = .{ .send_result = .success };
+                    in_file_contents.state = .{ .send_result = .success };
                     host.flipTransaction(.outgoing, tx_id, io);
                 },
                 else => return error.InvalidAction,
@@ -1802,23 +1924,110 @@ pub const TxData = union(enum) {
         }
 
         fn sendResult(
-            receive_file: *const ReceiveFile,
+            in_file_contents: *const InFileContents,
             host: *Host,
             tx_id: network.TransactionId,
             peer_tx_id: network.TransactionId,
             io: Io,
             writer: *Io.Writer,
         ) !void {
-            assert(receive_file.state == .send_result);
+            assert(in_file_contents.state == .send_result);
             assert(peer_tx_id != .invalid);
 
-            const action: network.Action = switch (receive_file.state.send_result) {
+            const action: network.Action = switch (in_file_contents.state.send_result) {
                 .success => .transfer_file_success,
                 .failure => .transfer_file_failure,
             };
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
 
             try network.sendMessageHeaderExistingTx(writer, peer_tx_id);
+            try network.sendAction(writer, action);
+            try writer.flush();
+
+            host.deleteTransaction(tx_id, .outgoing, io);
+        }
+    };
+
+    pub const OutDeleteFile = struct {
+        state: enum { send_file_id, receive_confirmation },
+        file_id: network.FileId,
+        path: Wtf16,
+
+        fn sendFileId(
+            out_delete_file: *OutDeleteFile,
+            host: *Host,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            writer: *Io.Writer,
+        ) !void {
+            assert(out_delete_file.state == .send_file_id);
+            assert(peer_tx_id == .invalid);
+
+            const action: network.Action = .delete_file;
+            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+
+            try network.sendMessageHeaderNewTx(writer, tx_id);
+            try network.sendAction(writer, action);
+            try network.sendFileId(writer, out_delete_file.file_id);
+            try writer.flush();
+
+            out_delete_file.state = .receive_confirmation;
+            host.flipTransaction(.incoming, tx_id, io);
+        }
+
+        fn receiveConfirmation(
+            out_delete_file: *OutDeleteFile,
+            host: *Host,
+            _: *Io.Reader,
+            io: Io,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            action: network.Action,
+        ) !void {
+            assert(out_delete_file.state == .receive_confirmation);
+            if (peer_tx_id != .invalid) return error.WrongPeerTxId;
+
+            switch (action) {
+                .delete_file_confirm => {
+                    host.deleteTransaction(tx_id, .incoming, io);
+                },
+                else => return error.InvalidAction,
+            }
+        }
+    };
+
+    pub const InDeleteFile = struct {
+        fn newTx(
+            host: *Host,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            reader: *Io.Reader,
+        ) !void {
+            const file_id = try network.receiveFileId(reader);
+            switch (try host.db.serverDeleteGlobalFile(file_id, io)) {
+                .success => {},
+                .unknown_file, .delete_file_err => std.debug.panic("TODO", .{}),
+            }
+
+            const data: TxData = .{
+                .in_delete_file = .{},
+            };
+            try host.addOutgoingTx(io, data, peer_tx_id);
+        }
+
+        fn sendConfirmation(
+            _: *InDeleteFile,
+            host: *Host,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            writer: *Io.Writer,
+        ) !void {
+            const action: network.Action = .delete_file_confirm;
+            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+
+            try network.sendMessageHeaderNewTxReply(writer, .invalid, peer_tx_id);
             try network.sendAction(writer, action);
             try writer.flush();
 

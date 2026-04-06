@@ -50,6 +50,11 @@ pub const Action = enum(u8) {
     transfer_file_contents,
     transfer_file_success,
     transfer_file_failure,
+
+    /// A client has seen a file get deleted on its local filesystem.
+    delete_file,
+    /// The server notifies that a file has been globally deleted.
+    delete_file_confirm,
 };
 
 pub const FileHash = struct {
