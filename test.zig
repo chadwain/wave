@@ -13,20 +13,20 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = try Args.init(init.minimal.args, init.arena);
 
-    const sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
+    const sync_dir = try std.unicode.wtf8ToWtf16LeAlloc(allocator, args.syncDir());
     defer allocator.free(sync_dir);
 
-    var db = try wave.windows.Database.init(.wtf16Cast(sync_dir), io, allocator);
+    var db = try wave.client.Database.init(.wtf16Cast(sync_dir), io, allocator);
     defer db.deinit(io);
 
-    var db_run_task = try io.concurrent(wave.windows.Database.run, .{ &db, io });
+    var db_run_task = try io.concurrent(wave.client.Database.run, .{ &db, io });
     defer db_run_task.cancel(io) catch {};
 
-    const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.peerSyncDir());
+    const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAlloc(allocator, args.peerSyncDir());
     defer allocator.free(peer_sync_dir);
 
     var host_pair_task = try io.concurrent(
-        startHostPair,
+        startServerAndClient,
         .{ io, &db, .wtf16Cast(peer_sync_dir) },
     );
     defer host_pair_task.cancel(io) catch {};
@@ -34,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
     try runCli(io, &db);
 }
 
-fn runCli(io: Io, db: *wave.windows.Database) !void {
+fn runCli(io: Io, db: *wave.client.Database) !void {
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
     const reader = &stdin.interface;
@@ -62,7 +62,7 @@ fn runCli(io: Io, db: *wave.windows.Database) !void {
                 try stdout.interface.flush();
             },
             's' => {
-                try wave.windows.completeScan(db, io);
+                try wave.client.completeScan(db, io);
                 try stdout.interface.writeAll("scan complete\n");
                 try stdout.interface.flush();
             },
@@ -97,16 +97,16 @@ const Args = struct {
     }
 };
 
-fn startHostPair(
+fn startServerAndClient(
     io: Io,
-    db: *wave.windows.Database,
+    client_db: *wave.client.Database,
     peer_sync_dir: wave.windows.Wtf16,
 ) !void {
-    const addr = Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
+    const addr = comptime Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
     var server = try addr.listen(io, .{});
     defer server.deinit(io);
 
-    var peer = try io.concurrent(startPeer, .{ io, server.socket.address, peer_sync_dir });
+    var peer = try io.concurrent(startServer, .{ io, server.socket.address, peer_sync_dir });
     defer peer.cancel(io) catch {};
 
     const stream = try server.accept(io);
@@ -118,14 +118,15 @@ fn startHostPair(
     var write_buffer: [64]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
 
-    var host = wave.windows.Host.init(db, .{ .name = "A" });
+    const name = "client";
+    var host = wave.client.Host.init(client_db, .{ .name = name });
     defer host.deinit();
-    var diag: wave.windows.Host.Diagnostics = .{};
-    defer std.debug.print("A result: {any}\n", .{diag});
+    var diag: wave.client.Host.Diagnostics = .{};
+    defer std.debug.print("{s} result: {any}\n", .{ name, diag });
     try host.run(&diag, io, &reader.interface, &writer.interface);
 }
 
-fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16) !void {
+fn startServer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16) !void {
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
@@ -138,12 +139,13 @@ fn startPeer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16) !void
     defer assert(dbg_allocator.deinit() == .ok);
     const allocator = dbg_allocator.allocator();
 
-    var db = try wave.windows.Database.init(sync_dir, io, allocator);
+    var db = try wave.server.Database.init(sync_dir, io, allocator);
     defer db.deinit(io);
 
-    var host = wave.windows.Host.init(&db, .{ .name = "B" });
+    const name = "server";
+    var host = wave.server.Host.init(&db, .{ .name = name });
     defer host.deinit();
-    var diag: wave.windows.Host.Diagnostics = .{};
-    defer std.debug.print("B result: {any}\n", .{diag});
+    var diag: wave.server.Host.Diagnostics = .{};
+    defer std.debug.print("{s} result: {any}\n", .{ name, diag });
     try host.run(&diag, io, &reader.interface, &writer.interface);
 }
