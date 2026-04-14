@@ -62,13 +62,9 @@ fn runCli(io: Io, db: *wave.client.Database) !void {
                 try stdout.interface.flush();
             },
             's' => {
-                try wave.client.completeScan(db, io);
+                try db.manualScan(io);
                 try stdout.interface.writeAll("scan complete\n");
                 try stdout.interface.flush();
-            },
-            '0'...'9' => |c| {
-                const index = c - '0';
-                try db.debug.hostTransferFile(index, io);
             },
             'q' => break,
             else => continue,

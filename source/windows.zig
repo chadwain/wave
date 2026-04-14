@@ -212,6 +212,7 @@ pub fn sendFile(
                 std.math.maxInt(w.ULONG),
             )];
         };
+        // TODO NtReadFileScatter
         const status = w.ntdll.NtReadFile(
             handle,
             null,
@@ -253,6 +254,7 @@ pub fn receiveFile(
                 std.math.maxInt(w.ULONG),
             )];
         };
+        // TODO NtWriteFileGather
         const status = w.ntdll.NtWriteFile(
             handle,
             null,

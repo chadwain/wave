@@ -20,13 +20,12 @@ pub const Database = struct {
     debug: Debug,
 
     file_path_arena: std.heap.ArenaAllocator.State,
-    file_id_map: Win32RelativePathHashMap(network.FileId),
-
-    client_known_files: Win32RelativePathHashMap(ClientFileEntry),
-    awaiting_sync_files: Win32RelativePathHashMap(void), // TODO change to a key value type of `FileId`
-    new_files: Win32RelativePathHashMap(void),
-    deleted_files: std.ArrayList(struct { Wtf16, network.FileId }),
     scan_arena: std.heap.ArenaAllocator.State,
+
+    /// There should be an entry for every file in the sync directory
+    known_files: Win32RelativePathHashMap(FileEntry),
+    new_files: Win32RelativePathHashMap(void),
+    updated_files: Win32RelativePathHashMap(FileUpdate), // TODO change to a key value type of `FileId`
 
     // Database-Host synchronization fields
     alert: std.atomic.Value(Alert),
@@ -44,12 +43,24 @@ pub const Database = struct {
         size: w.ULARGE_INTEGER,
     };
 
-    pub const ClientFileState = enum { normal, untracked };
-
-    pub const ClientFileEntry = struct {
-        state: ClientFileState,
-        metadata: FileMetadata,
+    pub const FileState = enum {
+        /// file_id is undefined
+        new,
+        normal,
+        /// metadata is undefined
+        pending_deletion,
+        /// metadata is undefined
+        /// file_id is undefined
+        untracked,
     };
+
+    pub const FileEntry = struct {
+        state: FileState,
+        metadata: FileMetadata,
+        id: network.FileId,
+    };
+
+    pub const FileUpdate = enum { modified, deleted };
 
     pub fn init(sync_dir_path: Wtf16, io: Io, allocator: Allocator) !Database {
         if (cpu_endian != .little) @compileError("TODO big endian");
@@ -80,13 +91,11 @@ pub const Database = struct {
             .debug = .{},
 
             .file_path_arena = .{},
-            .file_id_map = .empty,
-
-            .client_known_files = .empty,
-            .awaiting_sync_files = .empty,
-            .new_files = .empty,
-            .deleted_files = .empty,
             .scan_arena = .{},
+
+            .known_files = .empty,
+            .new_files = .empty,
+            .updated_files = .empty,
 
             .alert = .init(.off),
             .host_state = .init(.{}),
@@ -102,14 +111,12 @@ pub const Database = struct {
 
         var file_path_arena = db.file_path_arena.promote(db.allocator);
         file_path_arena.deinit();
-        db.file_id_map.deinit(db.allocator);
-
-        db.client_known_files.deinit(db.allocator);
-        db.awaiting_sync_files.deinit(db.allocator);
-        db.new_files.deinit(db.allocator);
-        db.deleted_files.deinit(db.allocator);
         var scan_arena = db.scan_arena.promote(db.allocator);
         scan_arena.deinit();
+
+        db.known_files.deinit(db.allocator);
+        db.new_files.deinit(db.allocator);
+        db.updated_files.deinit(db.allocator);
 
         db.* = undefined;
     }
@@ -119,62 +126,80 @@ pub const Database = struct {
 
         const clock: Io.Clock = .boot;
         const max_wait_time = Io.Clock.Duration{ .raw = .fromSeconds(8), .clock = clock };
-        var next_scan_time = Io.Clock.Timestamp.now(io, clock);
+        var next_scan_time = Io.Clock.Timestamp.now(io, clock); // First scan happens immediately
 
         while (true) {
             // If enough time has passed, do a scan
             if (Io.Clock.Timestamp.now(io, .boot).compare(.gte, next_scan_time)) {
-                try completeScan(db, io);
+                try scan.run(db, io);
                 try stderr.interface.writeAll("Scan complete\n");
                 try db.debug.printFilesNeedingSync(&stderr.interface, io);
                 next_scan_time = Io.Clock.Timestamp.now(io, clock).addDuration(max_wait_time);
                 continue;
             }
 
-            { // Look for events to send to the host
-                try db.mutex.lock(io);
-                defer db.mutex.unlock(io);
-
-                if (db.new_files.count() != 0 and db.acquireHostEvent() != null) {
-                    var it = db.new_files.keyIterator();
-                    const path = it.next().?;
-                    const file_info = db.client_known_files.get(path.*).?;
-                    assert(file_info.state == .normal);
-
-                    db.out_path = path.*;
-                    db.new_files.removeByPtr(path);
-
-                    db.releaseHostEvent(.get_global_file_id);
-                    io.futexWake(Host.State, &db.host_state.raw, 1);
-                    continue;
-                } else if (db.awaiting_sync_files.count() != 0 and db.acquireHostEvent() != null) {
-                    var it = db.awaiting_sync_files.keyIterator();
-                    const path = it.next().?;
-                    const file_info = db.client_known_files.get(path.*).?;
-                    assert(file_info.state == .normal);
-
-                    db.out_file_id = db.file_id_map.get(path.*).?;
-                    db.out_path = path.*;
-                    db.out_metadata = file_info.metadata;
-                    db.awaiting_sync_files.removeByPtr(path);
-
-                    db.releaseHostEvent(.sync_file);
-                    io.futexWake(Host.State, &db.host_state.raw, 1);
-                    continue;
-                } else if (db.deleted_files.items.len != 0 and db.acquireHostEvent() != null) {
-                    const path, const file_id = db.deleted_files.swapRemove(db.deleted_files.items.len - 1);
-
-                    db.out_file_id = file_id;
-                    db.out_path = path;
-
-                    db.releaseHostEvent(.delete_file);
-                    io.futexWake(Host.State, &db.host_state.raw, 1);
-                }
-            }
+            if (try db.sendHostEvents(io)) |_| continue;
 
             db.alert.store(.off, .release);
             try io.futexWaitTimeout(Alert, &db.alert.raw, .off, .{ .deadline = next_scan_time });
         }
+    }
+
+    /// `null` means that no events were sent
+    fn sendHostEvents(db: *Database, io: Io) !?void {
+        // TODO no mutex
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        if (db.new_files.count() != 0 and db.acquireHostEvent() != null) {
+            var it = db.new_files.keyIterator();
+            const path = it.next().?;
+            const file_info = db.known_files.getPtr(path.*).?;
+            switch (file_info.state) {
+                .new => {},
+                .normal, .pending_deletion, .untracked => unreachable,
+            }
+
+            db.out_path = path.*;
+            db.new_files.removeByPtr(path);
+
+            db.releaseHostEvent(.get_global_file_id);
+            return io.futexWake(Host.State, &db.host_state.raw, 1);
+        } else if (db.updated_files.count() != 0 and db.acquireHostEvent() != null) {
+            var it = db.updated_files.iterator();
+            const updated_file = it.next().?;
+            const path = updated_file.key_ptr.*;
+            const file_entry = db.known_files.getPtr(path).?;
+            switch (updated_file.value_ptr.*) {
+                .modified => {
+                    switch (file_entry.state) {
+                        .normal => {},
+                        .new, .untracked, .pending_deletion => unreachable,
+                    }
+
+                    db.out_file_id = file_entry.id;
+                    db.out_path = path;
+                    db.out_metadata = file_entry.metadata;
+
+                    db.releaseHostEvent(.sync_file);
+                },
+                .deleted => {
+                    switch (file_entry.state) {
+                        .pending_deletion => {},
+                        .new, .normal, .untracked => unreachable,
+                    }
+
+                    db.out_file_id = file_entry.id;
+                    db.out_path = path;
+
+                    db.releaseHostEvent(.delete_file);
+                },
+            }
+            db.updated_files.removeByPtr(updated_file.key_ptr);
+            return io.futexWake(Host.State, &db.host_state.raw, 1);
+        }
+
+        return null;
     }
 
     fn sendAlert(db: *Database, io: Io) void {
@@ -201,69 +226,8 @@ pub const Database = struct {
         }
     }
 
-    // client
-    /// Must be called with a lock.
-    fn updateLocalFile(
-        db: *Database,
-        path: Wtf16,
-        information: *const NtQueryInformation,
-        hash: *const network.FileHash,
-        untracked: bool,
-    ) !void {
-        const size = std.math.cast(w.ULARGE_INTEGER, information.EndOfFile) orelse return error.Unexpected;
-
-        const metadata = FileMetadata{
-            .local_file_id = information.FileId,
-            .hash = hash.*,
-            .modified_time = information.ChangeTime,
-            .size = size,
-        };
-
-        const gop = try db.client_known_files.getOrPut(db.allocator, path);
-        if (gop.found_existing) {
-            if (untracked) {
-                gop.value_ptr.* = .{ .state = .untracked, .metadata = metadata };
-                return;
-            }
-
-            if (gop.value_ptr.metadata.local_file_id == metadata.local_file_id and
-                gop.value_ptr.metadata.size == metadata.size and
-                gop.value_ptr.metadata.hash.eql(&metadata.hash)) return;
-
-            try db.awaiting_sync_files.put(db.allocator, gop.key_ptr.*, {});
-            errdefer comptime unreachable;
-        } else {
-            errdefer db.client_known_files.removeByPtr(gop.key_ptr);
-
-            var file_path_arena = db.file_path_arena.promote(db.allocator);
-            defer db.file_path_arena = file_path_arena.state;
-            const file_path_allocator = file_path_arena.allocator();
-
-            gop.key_ptr.* = try path.dupe(file_path_allocator);
-            errdefer file_path_allocator.free(gop.key_ptr.slice);
-
-            if (untracked) {
-                gop.value_ptr.* = .{ .state = .untracked, .metadata = metadata };
-                return;
-            }
-
-            try db.new_files.put(db.allocator, gop.key_ptr.*, {});
-            errdefer comptime unreachable;
-        }
-
-        gop.value_ptr.* = .{ .state = .normal, .metadata = metadata };
-    }
-
-    // client
-    /// Must be called with a lock.
-    /// `path` must be a path to a tracked file
-    fn deleteLocalFile(db: *Database, path: Wtf16) !void {
-        try db.deleted_files.ensureUnusedCapacity(db.allocator, 1);
-        errdefer comptime unreachable;
-
-        assert(db.client_known_files.remove(path));
-        const file_id = db.file_id_map.fetchRemove(path).?.value;
-        db.deleted_files.appendAssumeCapacity(.{ path, file_id });
+    pub fn manualScan(db: *Database, io: Io) !void {
+        try scan.run(db, io);
     }
 
     // client
@@ -271,10 +235,37 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        try db.file_id_map.putNoClobber(db.allocator, path, global_file_id);
+        const file_entry = db.known_files.getPtr(path) orelse
+            std.debug.panic("received file id for unknown file: {f}", .{path.formatUtf8()});
+        // TODO make sure this is actually the same file that the event was created for
+        switch (file_entry.state) {
+            .new => {},
+            .normal, .pending_deletion, .untracked => std.debug.panic("TODO: handle new file id for non-new file", .{}),
+        }
 
-        try db.awaiting_sync_files.put(db.allocator, path, {});
+        try db.updated_files.put(db.allocator, path, .modified);
+        errdefer comptime unreachable;
+
+        file_entry.state = .normal;
+        file_entry.id = global_file_id;
         // TODO: send alert here?
+    }
+
+    // client
+    fn confirmDeleteFile(db: *Database, path: Wtf16, io: Io) !void {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        const file_entry = db.known_files.getEntry(path) orelse
+            std.debug.panic("received delete confirmation for unknown file: {f}", .{path.formatUtf8()});
+        // TODO make sure this is actually the same file that the event was created for
+        switch (file_entry.value_ptr.state) {
+            .pending_deletion => {},
+            .new, .normal, .untracked => std.debug.panic("TODO: handle new file id for non-pending-delete file", .{}),
+        }
+
+        db.known_files.removeByPtr(file_entry.key_ptr);
+        if (db.updated_files.fetchRemove(path)) |_| std.debug.panic("TODO: a 2nd updated_files entry was found", .{});
     }
 
     fn markFileAsSynced(db: *Database, path: Wtf16) void {
@@ -297,11 +288,11 @@ pub const Database = struct {
             defer db.mutex.unlock(io);
 
             try writer.writeAll("Tracked files\n");
-            var it = db.client_known_files.iterator();
+            var it = db.known_files.iterator();
             while (it.next()) |entry| {
                 switch (entry.value_ptr.state) {
-                    .normal => {},
-                    .untracked => continue,
+                    .new, .normal => {},
+                    .pending_deletion, .untracked => continue,
                 }
                 try writer.print(
                     "{f}: hash({f}) modified({}) size({})\n",
@@ -315,11 +306,11 @@ pub const Database = struct {
             }
 
             try writer.writeAll("\nUntracked files\n");
-            it = db.client_known_files.iterator();
+            it = db.known_files.iterator();
             while (it.next()) |entry| {
                 switch (entry.value_ptr.state) {
-                    .normal => continue,
-                    .untracked => {},
+                    .new, .normal => continue,
+                    .pending_deletion, .untracked => {},
                 }
                 try writer.print("{f}\n", .{entry.key_ptr.formatUtf8()});
             }
@@ -330,58 +321,62 @@ pub const Database = struct {
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
-            try writer.writeAll("Locally new files\n");
-            var it1 = db.new_files.iterator();
-            while (it1.next()) |entry| {
-                try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()});
+            {
+                try writer.writeAll("Locally new files\n");
+                var it = db.new_files.iterator();
+                while (it.next()) |entry| {
+                    try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()});
+                }
             }
-
-            try writer.writeAll("\nLocally updated files\n");
-            var it2 = db.awaiting_sync_files.iterator();
-            while (it2.next()) |entry| {
-                try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()});
+            {
+                try writer.writeAll("\nLocally modified files\n");
+                var it = db.updated_files.iterator();
+                while (it.next()) |entry| {
+                    switch (entry.value_ptr.*) {
+                        .modified => try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()}),
+                        .deleted => continue,
+                    }
+                }
             }
-
+            {
+                try writer.writeAll("\nLocally untracked/deleted files\n");
+                var it = db.updated_files.iterator();
+                while (it.next()) |entry| {
+                    switch (entry.value_ptr.*) {
+                        .deleted => try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()}),
+                        .modified => continue,
+                    }
+                }
+            }
             try writer.writeAll("\n");
-        }
-
-        pub fn hostTransferFile(debug: *Debug, index: usize, io: Io) !void {
-            const db: *Database = @alignCast(@fieldParentPtr("debug", debug));
-            try db.mutex.lock(io);
-            defer db.mutex.unlock(io);
-
-            const entry = blk: {
-                var it = db.client_known_files.keyIterator();
-                for (0..index) |_| _ = it.next().?;
-                break :blk it.next().?.*;
-            };
-            try db.awaiting_sync_files.put(db.allocator, entry, {});
-            db.sendAlert(io);
         }
     };
 };
 
-const FullScanContext = struct {
-    arena: *std.heap.ArenaAllocator,
-    pending_dirs: std.ArrayList(Wtf16),
-    sub_path: std.ArrayList(w.WCHAR),
-    component_delimeters: std.ArrayList(u16),
-    open_dir_handles: std.ArrayList(w.HANDLE),
-    known_files_copy: Win32RelativePathHashMap(void),
+const scan = struct {
+    const Context = struct {
+        arena: *std.heap.ArenaAllocator,
+        pending_dirs: std.ArrayList(Wtf16),
+        sub_path: std.ArrayList(w.WCHAR),
+        component_delimeters: std.ArrayList(u16),
+        open_dir_handles: std.ArrayList(w.HANDLE),
+        set_of_tracked_files: Win32RelativePathHashMap(Database.FileState),
+    };
 
-    fn init(db: *const Database, arena: *std.heap.ArenaAllocator) !FullScanContext {
+    fn initContext(db: *const Database, arena: *std.heap.ArenaAllocator) !Context {
         const allocator = arena.allocator();
 
         var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
         try open_dir_handles.append(allocator, db.sync_dir);
 
-        var known_files_copy: Win32RelativePathHashMap(void) = .empty;
-        try known_files_copy.ensureTotalCapacity(allocator, db.client_known_files.count());
-        var it = db.client_known_files.iterator();
+        var set_of_tracked_files: Win32RelativePathHashMap(Database.FileState) = .empty;
+        try set_of_tracked_files.ensureTotalCapacity(allocator, db.known_files.count());
+        var it = db.known_files.iterator();
         while (it.next()) |entry| {
-            switch (entry.value_ptr.state) {
-                .normal => known_files_copy.putAssumeCapacityNoClobber(entry.key_ptr.*, {}),
-                .untracked => {},
+            const state = entry.value_ptr.state;
+            switch (state) {
+                .new, .normal => set_of_tracked_files.putAssumeCapacityNoClobber(entry.key_ptr.*, state),
+                .pending_deletion, .untracked => {},
             }
         }
 
@@ -391,38 +386,123 @@ const FullScanContext = struct {
             .sub_path = .empty,
             .component_delimeters = .empty,
             .open_dir_handles = open_dir_handles,
-            .known_files_copy = known_files_copy,
+            .set_of_tracked_files = set_of_tracked_files,
         };
     }
 
-    fn deinit(ctx: *FullScanContext) void {
+    fn deinitContext(ctx: *Context) void {
         for (ctx.open_dir_handles.items[1..]) |handle| {
             w.CloseHandle(handle);
         }
         ctx.* = undefined;
     }
 
-    fn enterDir(ctx: *FullScanContext, dir_path: Wtf16) !void {
-        const allocator = ctx.arena.allocator();
-        try ctx.component_delimeters.append(allocator, @intCast(ctx.sub_path.items.len));
-        try ctx.sub_path.appendSlice(allocator, dir_path.slice);
-        try ctx.sub_path.appendSlice(allocator, comptime wtf16("\\"));
+    const nt_query_information_class: w.FILE.INFORMATION_CLASS = .IdBothDirectory;
 
-        const parent_dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
-        const dir = try wave.windows.openDir(parent_dir, dir_path);
-        try ctx.open_dir_handles.append(allocator, dir);
+    // Corresponds to FILE_ID_BOTH_DIR_INFORMATION.
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_id_both_dir_information
+    const NtQueryInformation = extern struct {
+        NextEntryOffset: w.ULONG,
+        FileIndex: w.ULONG,
+        CreationTime: w.LARGE_INTEGER,
+        LastAccessTime: w.LARGE_INTEGER,
+        LastWriteTime: w.LARGE_INTEGER,
+        ChangeTime: w.LARGE_INTEGER,
+        EndOfFile: w.LARGE_INTEGER,
+        AllocationSize: w.LARGE_INTEGER,
+        FileAttributes: w.FILE.ATTRIBUTE,
+        FileNameLength: w.ULONG,
+        EaSize: w.ULONG,
+        ShortNameLength: CCHAR,
+        ShortName: [12]w.WCHAR,
+        FileId: w.LARGE_INTEGER,
+        FileName: [1]w.WCHAR,
+
+        // https://learn.microsoft.com/en-us/windows/win32/winprog/windows-data-types
+        const CCHAR = w.CHAR;
+    };
+
+    fn run(db: *Database, io: Io) !void {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        var arena = db.scan_arena.promote(db.allocator);
+        defer {
+            _ = arena.reset(.retain_capacity);
+            db.scan_arena = arena.state;
+        }
+
+        var ctx = try initContext(db, &arena);
+        defer deinitContext(&ctx);
+
+        try scanOneDirectory(db, &ctx);
+        while (ctx.pending_dirs.items.len > 0) {
+            const dir_path_ptr = &ctx.pending_dirs.items[ctx.pending_dirs.items.len - 1];
+            if (dir_path_ptr.slice.len == 0) {
+                _ = ctx.pending_dirs.pop();
+                exitDir(&ctx);
+                continue;
+            }
+
+            const dir_path = dir_path_ptr.*;
+            dir_path_ptr.* = .wtf16Cast(&.{});
+            try enterDir(&ctx, dir_path);
+            try scanOneDirectory(db, &ctx);
+        }
+
+        try deleteFiles(db, &ctx);
     }
 
-    fn exitDir(ctx: *FullScanContext) void {
-        const component_delimeter_index = ctx.component_delimeters.pop().?;
-        ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
-        const dir = ctx.open_dir_handles.pop().?;
-        w.CloseHandle(dir);
+    fn scanOneDirectory(db: *Database, ctx: *Context) !void {
+        const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
+        var buffer: [64 * 1024]u8 align(@alignOf(NtQueryInformation)) = undefined;
+        var io_status_block: w.IO_STATUS_BLOCK = undefined;
+        var restart_scan: w.BOOLEAN = w.TRUE;
+
+        while (true) {
+            const status = w.ntdll.NtQueryDirectoryFile(
+                dir,
+                null,
+                null,
+                null,
+                &io_status_block,
+                &buffer,
+                buffer.len,
+                nt_query_information_class,
+                w.FALSE,
+                null,
+                restart_scan,
+            );
+            switch (status) {
+                .NO_MORE_FILES => break,
+                .BUFFER_OVERFLOW => return error.NtBufferOverflow,
+                .SUCCESS => if (io_status_block.Information == 0) return error.NtBufferOverflow,
+                else => return w.unexpectedStatus(status),
+            }
+            restart_scan = w.FALSE;
+
+            var offset: usize = 0;
+            var next_entry_offset: usize = 1; // Any non-zero value
+            while (next_entry_offset != 0) : (offset += next_entry_offset) {
+                const info: *const NtQueryInformation = @ptrCast(@alignCast(&buffer[offset]));
+                next_entry_offset = info.NextEntryOffset;
+
+                const offset_of_file_name = @offsetOf(NtQueryInformation, "FileName");
+                const file_name_bytes = buffer[offset + offset_of_file_name ..][0..info.FileNameLength];
+                const file_name: Wtf16 = .wtf16Cast(@ptrCast(@alignCast(file_name_bytes)));
+
+                if (info.FileNameLength > w.NAME_MAX or
+                    std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".")) or
+                    std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".."))) continue;
+
+                try processFile(db, ctx, file_name, info);
+            }
+        }
     }
 
-    fn addObject(
-        ctx: *FullScanContext,
+    fn processFile(
         db: *Database,
+        ctx: *Context,
         name: Wtf16,
         information: *const NtQueryInformation,
     ) !void {
@@ -433,10 +513,10 @@ const FullScanContext = struct {
             .REPARSE_POINT = true,
             .ENCRYPTED = true,
         };
-        const untracked = @as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0;
+        const set_to_untracked = @as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0;
 
         if (information.FileAttributes.DIRECTORY) {
-            if (untracked) return;
+            if (set_to_untracked) return;
             const allocator = ctx.arena.allocator();
             const copied_name = try name.dupe(allocator);
             try ctx.pending_dirs.append(allocator, copied_name);
@@ -453,119 +533,128 @@ const FullScanContext = struct {
             defer w.CloseHandle(file);
             const hash = try computeFileHash(file, information.EndOfFile);
 
-            try db.updateLocalFile(path, information, &hash, untracked);
-            _ = ctx.known_files_copy.remove(path);
+            try queueUpdateFileEvent(db, path, information, &hash, set_to_untracked);
+            _ = ctx.set_of_tracked_files.remove(path);
         }
     }
 
-    fn deleteFiles(ctx: *FullScanContext, db: *Database) !void {
-        var it = ctx.known_files_copy.keyIterator();
-        while (it.next()) |path| try db.deleteLocalFile(path.*);
+    fn enterDir(ctx: *Context, dir_path: Wtf16) !void {
+        const allocator = ctx.arena.allocator();
+        try ctx.component_delimeters.append(allocator, @intCast(ctx.sub_path.items.len));
+        try ctx.sub_path.appendSlice(allocator, dir_path.slice);
+        try ctx.sub_path.appendSlice(allocator, comptime wtf16("\\"));
+
+        const parent_dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
+        const dir = try wave.windows.openDir(parent_dir, dir_path);
+        try ctx.open_dir_handles.append(allocator, dir);
+    }
+
+    fn exitDir(ctx: *Context) void {
+        const component_delimeter_index = ctx.component_delimeters.pop().?;
+        ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
+        const dir = ctx.open_dir_handles.pop().?;
+        w.CloseHandle(dir);
+    }
+
+    fn queueUpdateFileEvent(
+        db: *Database,
+        path: Wtf16,
+        information: *const NtQueryInformation,
+        hash: *const network.FileHash,
+        set_to_untracked: bool,
+    ) !void {
+        const size = std.math.cast(w.ULARGE_INTEGER, information.EndOfFile) orelse return error.Unexpected;
+
+        const metadata = Database.FileMetadata{
+            .local_file_id = information.FileId,
+            .hash = hash.*,
+            .modified_time = information.ChangeTime,
+            .size = size,
+        };
+
+        const gop = try db.known_files.getOrPut(db.allocator, path);
+        if (gop.found_existing) {
+            switch (gop.value_ptr.state) {
+                .new => {
+                    gop.value_ptr.metadata = metadata;
+                },
+                .untracked => {
+                    if (set_to_untracked) return;
+
+                    try db.new_files.put(db.allocator, gop.key_ptr.*, {});
+                    errdefer comptime unreachable;
+
+                    gop.value_ptr.* = .{ .state = .new, .metadata = metadata, .id = undefined };
+                },
+                .pending_deletion => {
+                    if (set_to_untracked) return;
+
+                    std.debug.panic("TODO: file was created while pending deletion: {f}", .{path.formatUtf8()});
+                },
+                .normal => {
+                    if (set_to_untracked) {
+                        try db.updated_files.put(db.allocator, gop.key_ptr.*, .deleted);
+                        errdefer comptime unreachable;
+
+                        gop.value_ptr.state = .pending_deletion;
+                        gop.value_ptr.metadata = undefined;
+                    } else {
+                        if (gop.value_ptr.metadata.local_file_id == metadata.local_file_id and
+                            gop.value_ptr.metadata.size == metadata.size and
+                            gop.value_ptr.metadata.hash.eql(&metadata.hash)) return;
+
+                        try db.updated_files.put(db.allocator, gop.key_ptr.*, .modified);
+                        errdefer comptime unreachable;
+
+                        gop.value_ptr.metadata = metadata;
+                    }
+                },
+            }
+        } else {
+            errdefer db.known_files.removeByPtr(gop.key_ptr);
+
+            var file_path_arena = db.file_path_arena.promote(db.allocator);
+            defer db.file_path_arena = file_path_arena.state;
+            const file_path_allocator = file_path_arena.allocator();
+
+            gop.key_ptr.* = try path.dupe(file_path_allocator);
+            errdefer file_path_allocator.free(gop.key_ptr.slice);
+
+            if (set_to_untracked) {
+                gop.value_ptr.* = .{ .state = .untracked, .metadata = undefined, .id = undefined };
+                return;
+            }
+
+            try db.new_files.put(db.allocator, gop.key_ptr.*, {});
+            errdefer comptime unreachable;
+
+            gop.value_ptr.* = .{ .state = .new, .metadata = metadata, .id = undefined };
+        }
+    }
+
+    fn deleteFiles(db: *Database, ctx: *Context) !void {
+        try db.updated_files.ensureUnusedCapacity(db.allocator, ctx.set_of_tracked_files.count());
+        errdefer comptime unreachable;
+
+        var it = ctx.set_of_tracked_files.iterator();
+        while (it.next()) |file| {
+            const path = file.key_ptr.*;
+            switch (file.value_ptr.*) {
+                .new => {
+                    assert(db.known_files.remove(path));
+                    assert(db.new_files.remove(path));
+                },
+                .normal => {
+                    const file_entry = db.known_files.getPtr(path).?;
+                    file_entry.state = .pending_deletion;
+                    file_entry.metadata = undefined;
+                    db.updated_files.putAssumeCapacity(path, .deleted);
+                },
+                .pending_deletion, .untracked => unreachable,
+            }
+        }
     }
 };
-
-const nt_query_information_class: w.FILE.INFORMATION_CLASS = .IdBothDirectory;
-
-// Corresponds to FILE_ID_BOTH_DIR_INFORMATION.
-// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_id_both_dir_information
-const NtQueryInformation = extern struct {
-    NextEntryOffset: w.ULONG,
-    FileIndex: w.ULONG,
-    CreationTime: w.LARGE_INTEGER,
-    LastAccessTime: w.LARGE_INTEGER,
-    LastWriteTime: w.LARGE_INTEGER,
-    ChangeTime: w.LARGE_INTEGER,
-    EndOfFile: w.LARGE_INTEGER,
-    AllocationSize: w.LARGE_INTEGER,
-    FileAttributes: w.FILE.ATTRIBUTE,
-    FileNameLength: w.ULONG,
-    EaSize: w.ULONG,
-    ShortNameLength: CCHAR,
-    ShortName: [12]w.WCHAR,
-    FileId: w.LARGE_INTEGER,
-    FileName: [1]w.WCHAR,
-
-    // https://learn.microsoft.com/en-us/windows/win32/winprog/windows-data-types
-    const CCHAR = w.CHAR;
-};
-
-pub fn completeScan(db: *Database, io: Io) !void {
-    try db.mutex.lock(io);
-    defer db.mutex.unlock(io);
-
-    var arena = db.scan_arena.promote(db.allocator);
-    defer {
-        _ = arena.reset(.retain_capacity);
-        db.scan_arena = arena.state;
-    }
-
-    var ctx = try FullScanContext.init(db, &arena);
-    defer ctx.deinit();
-
-    try scanOneDirectory(db, &ctx);
-    while (ctx.pending_dirs.items.len > 0) {
-        const dir_path_ptr = &ctx.pending_dirs.items[ctx.pending_dirs.items.len - 1];
-        if (dir_path_ptr.slice.len == 0) {
-            _ = ctx.pending_dirs.pop();
-            ctx.exitDir();
-            continue;
-        }
-
-        const dir_path = dir_path_ptr.*;
-        dir_path_ptr.* = .wtf16Cast(&.{});
-        try ctx.enterDir(dir_path);
-        try scanOneDirectory(db, &ctx);
-    }
-
-    try ctx.deleteFiles(db);
-}
-
-fn scanOneDirectory(db: *Database, ctx: *FullScanContext) !void {
-    const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
-    var buffer: [64 * 1024]u8 align(@alignOf(NtQueryInformation)) = undefined;
-    var io_status_block: w.IO_STATUS_BLOCK = undefined;
-    var restart_scan: w.BOOLEAN = w.TRUE;
-
-    while (true) {
-        const status = w.ntdll.NtQueryDirectoryFile(
-            dir,
-            null,
-            null,
-            null,
-            &io_status_block,
-            &buffer,
-            buffer.len,
-            nt_query_information_class,
-            w.FALSE,
-            null,
-            restart_scan,
-        );
-        switch (status) {
-            .NO_MORE_FILES => break,
-            .BUFFER_OVERFLOW => return error.NtBufferOverflow,
-            .SUCCESS => if (io_status_block.Information == 0) return error.NtBufferOverflow,
-            else => return w.unexpectedStatus(status),
-        }
-        restart_scan = w.FALSE;
-
-        var offset: usize = 0;
-        var next_entry_offset: usize = 1; // Any non-zero value
-        while (next_entry_offset != 0) : (offset += next_entry_offset) {
-            const info: *const NtQueryInformation = @ptrCast(@alignCast(&buffer[offset]));
-            next_entry_offset = info.NextEntryOffset;
-
-            const offset_of_file_name = @offsetOf(NtQueryInformation, "FileName");
-            const file_name_bytes = buffer[offset + offset_of_file_name ..][0..info.FileNameLength];
-            const file_name: Wtf16 = .wtf16Cast(@ptrCast(@alignCast(file_name_bytes)));
-
-            if (info.FileNameLength > w.NAME_MAX or
-                std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".")) or
-                std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".."))) continue;
-
-            try ctx.addObject(db, file_name, info);
-        }
-    }
-}
 
 fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash {
     var iosb: w.IO_STATUS_BLOCK = undefined;
@@ -648,8 +737,8 @@ pub const Host = struct {
     pub const RunError = Io.ConcurrentError || Io.Cancelable;
 
     pub const Diagnostics = struct {
-        outgoing: ?OutgoingError = null,
-        incoming: ?IncomingError = null,
+        send: ?SendMessagesError = null,
+        receive: ?ReceiveMessagesError = null,
     };
 
     /// Blocks until the `Host` is finished running.
@@ -662,8 +751,8 @@ pub const Host = struct {
     ) RunError!void {
         const ns = struct {
             const SelectUnion = union(enum) {
-                outgoing: OutgoingError!void,
-                incoming: IncomingError!void,
+                send: SendMessagesError!void,
+                receive: ReceiveMessagesError!void,
             };
 
             fn addToDiagnostics(d: ?*Diagnostics, u: SelectUnion) void {
@@ -680,16 +769,16 @@ pub const Host = struct {
         var select = Io.Select(ns.SelectUnion).init(io, &select_buffer);
         defer while (select.cancel()) |result| ns.addToDiagnostics(diag, result);
 
-        try select.concurrent(.outgoing, sendOutgoingTxs, .{ host, writer, io });
-        try select.concurrent(.incoming, receiveIncomingTxs, .{ host, reader, io });
+        try select.concurrent(.send, sendMessages, .{ host, writer, io });
+        try select.concurrent(.receive, receiveMessages, .{ host, reader, io });
 
         host.debugLog("started", .{});
         ns.addToDiagnostics(diag, try select.await());
     }
 
-    pub const OutgoingError = Io.Writer.Error || Io.Cancelable || wave.windows.SendFileError;
+    pub const SendMessagesError = Io.Writer.Error || Io.Cancelable || wave.windows.SendFileError;
 
-    fn sendOutgoingTxs(host: *Host, writer: *Io.Writer, io: Io) OutgoingError!void {
+    fn sendMessages(host: *Host, writer: *Io.Writer, io: Io) SendMessagesError!void {
         while (true) {
             while (true) {
                 const state = host.db.host_state.load(.monotonic);
@@ -791,7 +880,7 @@ pub const Host = struct {
         host.db.sendAlert(io);
     }
 
-    pub const IncomingError = error{
+    pub const ReceiveMessagesError = error{
         InvalidTxId,
         InvalidPeerTxId,
         WrongTxId,
@@ -801,7 +890,7 @@ pub const Host = struct {
     } || network.ReceiveActionError || network.ReceiveFileMetadataError || network.ReceiveNewFilePathError ||
         Io.Cancelable || Allocator.Error || AddOutgoingTxError || wave.windows.ReceiveFileError;
 
-    fn receiveIncomingTxs(host: *Host, reader: *Io.Reader, io: Io) IncomingError!void {
+    fn receiveMessages(host: *Host, reader: *Io.Reader, io: Io) ReceiveMessagesError!void {
         while (true) {
             const header = try network.receiveMessageHeader(reader);
             if (header.tag == .disconnect) break;
@@ -813,9 +902,7 @@ pub const Host = struct {
                 .new_tx => {
                     if (header.tx_id != .invalid) return error.InvalidTxId;
                     if (header.peer_tx_id == .invalid) return error.InvalidPeerTxId;
-                    switch (action) {
-                        else => return error.InvalidAction,
-                    }
+                    return error.InvalidAction;
                 },
                 .new_tx_reply => {
                     if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
@@ -1224,6 +1311,7 @@ pub const TxData = union(enum) {
 
             switch (action) {
                 .delete_file_confirm => {
+                    try host.db.confirmDeleteFile(out_delete_file.path, io);
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
                 else => return error.InvalidAction,
