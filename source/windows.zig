@@ -69,7 +69,7 @@ pub fn Win32RelativePathHashMap(comptime V: type) type {
 
         pub fn eql(_: @This(), a: Wtf16, b: Wtf16) bool {
             // TODO get a userspace implementation of RtlEqualUnicodeString
-            return w.ntdll.RtlEqualUnicodeString(&.init(a.slice), &.init(b.slice), w.TRUE) == w.TRUE;
+            return w.ntdll.RtlEqualUnicodeString(&.init(a.slice), &.init(b.slice), .TRUE).toBool();
         }
     };
     return std.HashMapUnmanaged(Wtf16, V, Context, std.hash_map.default_max_load_percentage);

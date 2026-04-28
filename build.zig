@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "wave", .module = wave },
             },
         }),
+        .use_llvm = false,
     });
     b.installArtifact(test_exe);
 }

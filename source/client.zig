@@ -457,7 +457,7 @@ const scan = struct {
         const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
         var buffer: [64 * 1024]u8 align(@alignOf(NtQueryInformation)) = undefined;
         var io_status_block: w.IO_STATUS_BLOCK = undefined;
-        var restart_scan: w.BOOLEAN = w.TRUE;
+        var restart_scan: w.BOOLEAN = .TRUE;
 
         while (true) {
             const status = w.ntdll.NtQueryDirectoryFile(
@@ -469,7 +469,7 @@ const scan = struct {
                 &buffer,
                 buffer.len,
                 nt_query_information_class,
-                w.FALSE,
+                .FALSE,
                 null,
                 restart_scan,
             );
@@ -479,7 +479,7 @@ const scan = struct {
                 .SUCCESS => if (io_status_block.Information == 0) return error.NtBufferOverflow,
                 else => return w.unexpectedStatus(status),
             }
-            restart_scan = w.FALSE;
+            restart_scan = .FALSE;
 
             var offset: usize = 0;
             var next_entry_offset: usize = 1; // Any non-zero value
