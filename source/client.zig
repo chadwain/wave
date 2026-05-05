@@ -134,6 +134,7 @@ pub const Database = struct {
                 try scan.run(db, io);
                 try stderr.interface.writeAll("Scan complete\n");
                 try db.debug.printFilesNeedingSync(&stderr.interface, io);
+                try stderr.interface.flush();
                 next_scan_time = Io.Clock.Timestamp.now(io, clock).addDuration(max_wait_time);
                 continue;
             }
@@ -737,8 +738,8 @@ pub const Host = struct {
     pub const RunError = Io.ConcurrentError || Io.Cancelable;
 
     pub const Diagnostics = struct {
-        send: ?SendMessagesError = null,
-        receive: ?ReceiveMessagesError = null,
+        send_error: ?SendMessagesError = null,
+        recv_error: ?ReceiveMessagesError = null,
     };
 
     /// Blocks until the `Host` is finished running.
@@ -751,8 +752,8 @@ pub const Host = struct {
     ) RunError!void {
         const ns = struct {
             const SelectUnion = union(enum) {
-                send: SendMessagesError!void,
-                receive: ReceiveMessagesError!void,
+                send_error: SendMessagesError!void,
+                recv_error: ReceiveMessagesError!void,
             };
 
             fn addToDiagnostics(d: ?*Diagnostics, u: SelectUnion) void {
@@ -769,8 +770,8 @@ pub const Host = struct {
         var select = Io.Select(ns.SelectUnion).init(io, &select_buffer);
         defer while (select.cancel()) |result| ns.addToDiagnostics(diag, result);
 
-        try select.concurrent(.send, sendMessages, .{ host, writer, io });
-        try select.concurrent(.receive, receiveMessages, .{ host, reader, io });
+        try select.concurrent(.send_error, sendMessages, .{ host, writer, io });
+        try select.concurrent(.recv_error, receiveMessages, .{ host, reader, io });
 
         host.debugLog("started", .{});
         ns.addToDiagnostics(diag, try select.await());

@@ -1,5 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const print = std.debug.print;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -40,7 +41,7 @@ fn runCli(io: Io, db: *wave.client.Database) !void {
     const reader = &stdin.interface;
 
     var stdout = Io.File.stdout().writer(io, &.{});
-    std.debug.print("s - scan, a - print all files, n - print files needing sync, q - quit\n", .{});
+    print("s - scan, a - print all files, n - print files needing sync, q - quit\n", .{});
     while (true) {
         var line: []const u8 = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.ReadFailed, error.EndOfStream => |e| return e,
@@ -107,7 +108,7 @@ fn startServerAndClient(
 
     const stream = try server.accept(io);
     defer stream.close(io);
-    std.debug.print("connected\n", .{});
+    print("connected\n", .{});
 
     var read_buffer: [64]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
@@ -118,7 +119,19 @@ fn startServerAndClient(
     var host = wave.client.Host.init(client_db, .{ .name = name });
     defer host.deinit();
     var diag: wave.client.Host.Diagnostics = .{};
-    defer std.debug.print("{s} result: {any}\n", .{ name, diag });
+    defer {
+        print("{s} send result: {s}, recv result: {s}\n", .{
+            name,
+            blk: {
+                const err = diag.send_error orelse break :blk "OK";
+                break :blk (if (err == error.WriteFailed) @errorName(writer.err.?) else @errorName(err));
+            },
+            blk: {
+                const err = diag.recv_error orelse break :blk "OK";
+                break :blk (if (err == error.ReadFailed) @errorName(reader.err.?) else @errorName(err));
+            },
+        });
+    }
     try host.run(&diag, io, &reader.interface, &writer.interface);
 }
 
@@ -142,6 +155,19 @@ fn startServer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16) !vo
     var host = wave.server.Host.init(&db, .{ .name = name });
     defer host.deinit();
     var diag: wave.server.Host.Diagnostics = .{};
-    defer std.debug.print("{s} result: {any}\n", .{ name, diag });
+    defer {
+        // TODO (Windows) this print statement doesn't show up in the terminal for some reason
+        print("{s} send result: {s}, recv result: {s}\n", .{
+            name,
+            blk: {
+                const err = diag.send_error orelse break :blk "OK";
+                break :blk (if (err == error.WriteFailed) @errorName(writer.err.?) else @errorName(err));
+            },
+            blk: {
+                const err = diag.recv_error orelse break :blk "OK";
+                break :blk (if (err == error.ReadFailed) @errorName(reader.err.?) else @errorName(err));
+            },
+        });
+    }
     try host.run(&diag, io, &reader.interface, &writer.interface);
 }

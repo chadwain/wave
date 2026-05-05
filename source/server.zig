@@ -89,21 +89,15 @@ pub const Database = struct {
         db.* = undefined;
     }
 
-    const NewFileResult = union(enum) {
-        file_id: network.FileId,
-        file_already_exists,
-        exhausted_file_ids,
-    };
-
-    fn newFile(db: *Database, path: Wtf16, io: Io) !NewFileResult {
+    fn newFile(db: *Database, path: Wtf16, io: Io) !network.FileId {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
         const gop = try db.file_id_map.getOrPut(db.allocator, path);
-        if (gop.found_existing) return .file_already_exists;
+        if (gop.found_existing) return error.FileAlreadyExists;
         errdefer db.file_id_map.removeByPtr(gop.key_ptr);
 
-        const file_id_tag = db.next_file_id orelse return .exhausted_file_ids;
+        const file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
         db.next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch null;
         errdefer db.next_file_id = file_id_tag;
         const file_id: network.FileId = @enumFromInt(file_id_tag);
@@ -124,10 +118,10 @@ pub const Database = struct {
         gop.key_ptr.* = path_copy;
         gop.value_ptr.* = file_id;
 
-        return .{ .file_id = file_id };
+        return file_id;
     }
 
-    const CheckMetadataResult = union(enum) {
+    const CompareMetadataResult = union(enum) {
         file_exists: struct {
             path: Wtf16,
             comparison: enum { equals, differs },
@@ -138,11 +132,11 @@ pub const Database = struct {
         file_doesnt_exist,
     };
 
-    fn checkMetadata(
+    fn compareMetadata(
         db: *Database,
         metadata: *const network.IncomingFileMetadata,
         io: Io,
-    ) !CheckMetadataResult {
+    ) !CompareMetadataResult {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
@@ -314,8 +308,8 @@ pub const Host = struct {
     pub const RunError = Io.ConcurrentError || Io.Cancelable;
 
     pub const Diagnostics = struct {
-        outgoing: ?OutgoingError = null,
-        incoming: ?IncomingError = null,
+        send_error: ?SendError = null,
+        recv_error: ?RecvError = null,
     };
 
     /// Blocks until the `Host` is finished running.
@@ -328,8 +322,8 @@ pub const Host = struct {
     ) RunError!void {
         const ns = struct {
             const SelectUnion = union(enum) {
-                outgoing: OutgoingError!void,
-                incoming: IncomingError!void,
+                send_error: SendError!void,
+                recv_error: RecvError!void,
             };
 
             fn addToDiagnostics(d: ?*Diagnostics, u: SelectUnion) void {
@@ -346,16 +340,16 @@ pub const Host = struct {
         var select = Io.Select(ns.SelectUnion).init(io, &select_buffer);
         defer while (select.cancel()) |result| ns.addToDiagnostics(diag, result);
 
-        try select.concurrent(.outgoing, sendOutgoingTxs, .{ host, writer, io });
-        try select.concurrent(.incoming, receiveIncomingTxs, .{ host, reader, io });
+        try select.concurrent(.send_error, sendOutgoingTxs, .{ host, writer, io });
+        try select.concurrent(.recv_error, receiveIncomingTxs, .{ host, reader, io });
 
         host.debugLog("started", .{});
         ns.addToDiagnostics(diag, try select.await());
     }
 
-    pub const OutgoingError = Io.Writer.Error || Io.Cancelable || wave.windows.SendFileError;
+    pub const SendError = Io.Writer.Error || Io.Cancelable || wave.windows.SendFileError;
 
-    fn sendOutgoingTxs(host: *Host, writer: *Io.Writer, io: Io) OutgoingError!void {
+    fn sendOutgoingTxs(host: *Host, writer: *Io.Writer, io: Io) SendError!void {
         while (true) {
             while (true) {
                 const state = host.db.host_state.load(.monotonic);
@@ -380,7 +374,7 @@ pub const Host = struct {
         }
     }
 
-    pub const IncomingError = error{
+    pub const RecvError = error{
         InvalidTxId,
         InvalidPeerTxId,
         WrongTxId,
@@ -390,7 +384,7 @@ pub const Host = struct {
     } || network.ReceiveActionError || network.ReceiveFileMetadataError || network.ReceiveNewFilePathError ||
         Io.Cancelable || Allocator.Error || AddOutgoingTxError || wave.windows.ReceiveFileError || Database.CreateFileError;
 
-    fn receiveIncomingTxs(host: *Host, reader: *Io.Reader, io: Io) IncomingError!void {
+    fn receiveIncomingTxs(host: *Host, reader: *Io.Reader, io: Io) RecvError!void {
         while (true) {
             const header = try network.receiveMessageHeader(reader);
             if (header.tag == .disconnect) break;
@@ -558,7 +552,13 @@ pub const TxData = union(enum) {
     in_delete_file: InDeleteFile,
 
     pub const InNewFile = struct {
-        data: Database.NewFileResult,
+        data: NewFileResult,
+
+        const NewFileResult = union(enum) {
+            file_id: network.FileId,
+            file_already_exists,
+            exhausted_file_ids,
+        };
 
         fn newTx(
             host: *Host,
@@ -577,7 +577,11 @@ pub const TxData = union(enum) {
             };
             const data: TxData = .{
                 .in_new_file = .{
-                    .data = try host.db.newFile(path, io),
+                    .data = if (host.db.newFile(path, io)) |file_id| .{ .file_id = file_id } else |err| switch (err) {
+                        error.FileAlreadyExists => .file_already_exists,
+                        error.ExhaustedFileIds => .exhausted_file_ids,
+                        error.Canceled, error.OutOfMemory => |e| return e,
+                    },
                 },
             };
             try host.addOutgoingTx(io, data, peer_tx_id);
@@ -647,9 +651,10 @@ pub const TxData = union(enum) {
             reader: *Io.Reader,
         ) !void {
             const metadata = try network.receiveFileMetadata(reader);
-            const path: Wtf16, const decision: State.SendDecision = switch (try host.db.checkMetadata(&metadata, io)) {
+            const path: Wtf16, const decision: State.SendDecision = switch (try host.db.compareMetadata(&metadata, io)) {
                 .file_exists => |res| .{
-                    res.path, switch (res.comparison) {
+                    res.path,
+                    switch (res.comparison) {
                         .equals => .decline,
                         .differs => .accept,
                     },
