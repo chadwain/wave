@@ -907,7 +907,6 @@ pub const Host = struct {
                 },
                 .new_tx_reply => {
                     if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
-                    // TODO There is a chance that this line can be reached before the send task flips the TX to incoming
                     if (host.db.host_state.load(.monotonic).tx != .incoming) return error.InvalidTxId;
                     if (host.tx.peer_tx_id != .invalid) return error.WrongPeerTxId;
 
@@ -954,7 +953,6 @@ pub const Host = struct {
                 },
                 .existing_tx => {
                     if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
-                    // TODO There is a chance that this line can be reached before the send task flips the TX to incoming
                     if (host.db.host_state.load(.monotonic).tx != .incoming) return error.InvalidTxId;
                     if (header.peer_tx_id != .invalid) return error.WrongPeerTxId;
 
@@ -1107,6 +1105,9 @@ pub const TxData = union(enum) {
             const action: network.Action = .client_new_file;
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
 
+            out_new_file.state = .receive_decision;
+            host.flipTransaction(.incoming, tx_id, io);
+
             try network.sendMessageHeaderNewTx(writer, tx_id);
             try network.sendAction(writer, action);
             try network.sendNewFilePath(
@@ -1118,9 +1119,6 @@ pub const TxData = union(enum) {
                 @ptrCast(out_new_file.path.slice),
             );
             try writer.flush();
-
-            out_new_file.state = .receive_decision;
-            host.flipTransaction(.incoming, tx_id, io);
         }
 
         fn receiveDecision(
@@ -1188,13 +1186,14 @@ pub const TxData = union(enum) {
                     "TODO: File too large to transfer: '{f}' with size {}",
                     .{ out_file_contents.path.formatUtf8(), out_file_contents.size },
                 );
+
+            out_file_contents.state = .receive_decision;
+            host.flipTransaction(.incoming, tx_id, io);
+
             try network.sendMessageHeaderNewTx(writer, tx_id);
             try network.sendAction(writer, action);
             try network.sendFileMetadata(writer, out_file_contents.file_id, file_size, &out_file_contents.hash);
             try writer.flush();
-
-            out_file_contents.state = .receive_decision;
-            host.flipTransaction(.incoming, tx_id, io);
         }
 
         fn receiveDecision(
@@ -1239,13 +1238,13 @@ pub const TxData = union(enum) {
             const handle = try host.db.openFileReadOnly(out_file_contents.path);
             defer host.db.closeFile(handle);
 
+            out_file_contents.state = .receive_result;
+            host.flipTransaction(.incoming, tx_id, io);
+
             try network.sendMessageHeaderExistingTx(writer, peer_tx_id);
             try network.sendAction(writer, action);
             try wave.windows.sendFile(writer, handle, out_file_contents.size);
             try writer.flush();
-
-            out_file_contents.state = .receive_result;
-            host.flipTransaction(.incoming, tx_id, io);
         }
 
         fn receiveResult(
@@ -1289,13 +1288,13 @@ pub const TxData = union(enum) {
             const action: network.Action = .delete_file;
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
 
+            out_delete_file.state = .receive_confirmation;
+            host.flipTransaction(.incoming, tx_id, io);
+
             try network.sendMessageHeaderNewTx(writer, tx_id);
             try network.sendAction(writer, action);
             try network.sendFileId(writer, out_delete_file.file_id);
             try writer.flush();
-
-            out_delete_file.state = .receive_confirmation;
-            host.flipTransaction(.incoming, tx_id, io);
         }
 
         fn receiveConfirmation(

@@ -418,7 +418,6 @@ pub const Host = struct {
                 },
                 .new_tx_reply => {
                     if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
-                    // TODO There is a chance that this line can be reached before the send task flips the TX to incoming
                     if (host.db.host_state.load(.monotonic).tx != .incoming) return error.InvalidTxId;
                     if (host.tx.peer_tx_id != .invalid) return error.WrongPeerTxId;
 
@@ -433,7 +432,6 @@ pub const Host = struct {
                 },
                 .existing_tx => {
                     if (@intFromEnum(header.tx_id) != 0) return error.WrongTxId; // TODO: hardcoded value
-                    // TODO There is a chance that this line can be reached before the send task flips the TX to incoming
                     if (host.db.host_state.load(.monotonic).tx != .incoming) return error.InvalidTxId;
                     if (header.peer_tx_id != .invalid) return error.WrongPeerTxId;
 
@@ -609,6 +607,7 @@ pub const TxData = union(enum) {
                 .file_id => |file_id| {
                     const action: network.Action = .server_registered_new_file;
                     host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+                    host.deleteTransaction(tx_id, .outgoing, io);
 
                     try network.sendMessageHeaderNewTxReply(writer, outgoing_tx_id, peer_tx_id);
                     try network.sendAction(writer, action);
@@ -617,6 +616,7 @@ pub const TxData = union(enum) {
                 .file_already_exists => {
                     const action: network.Action = .server_new_file_exists;
                     host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+                    host.deleteTransaction(tx_id, .outgoing, io);
 
                     try network.sendMessageHeaderNewTxReply(writer, outgoing_tx_id, peer_tx_id);
                     try network.sendAction(writer, action);
@@ -624,14 +624,13 @@ pub const TxData = union(enum) {
                 .exhausted_file_ids => {
                     const action: network.Action = .server_cant_register_new_files;
                     host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+                    host.deleteTransaction(tx_id, .outgoing, io);
 
                     try network.sendMessageHeaderNewTxReply(writer, outgoing_tx_id, peer_tx_id);
                     try network.sendAction(writer, action);
                 },
             }
             try writer.flush();
-
-            host.deleteTransaction(tx_id, .outgoing, io);
         }
     };
 
@@ -699,10 +698,6 @@ pub const TxData = union(enum) {
                 };
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
 
-            try network.sendMessageHeaderNewTxReply(writer, actual_tx_id, peer_tx_id);
-            try network.sendAction(writer, action);
-            try writer.flush();
-
             switch (in_file_contents.state.send_decision) {
                 .accept => {
                     in_file_contents.state = .receive_file_contents;
@@ -710,6 +705,10 @@ pub const TxData = union(enum) {
                 },
                 .decline => host.deleteTransaction(tx_id, .outgoing, io),
             }
+
+            try network.sendMessageHeaderNewTxReply(writer, actual_tx_id, peer_tx_id);
+            try network.sendAction(writer, action);
+            try writer.flush();
         }
 
         fn receiveFileContents(
@@ -757,12 +756,11 @@ pub const TxData = union(enum) {
                 .failure => .transfer_file_failure,
             };
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+            host.deleteTransaction(tx_id, .outgoing, io);
 
             try network.sendMessageHeaderExistingTx(writer, peer_tx_id);
             try network.sendAction(writer, action);
             try writer.flush();
-
-            host.deleteTransaction(tx_id, .outgoing, io);
         }
     };
 
@@ -795,12 +793,11 @@ pub const TxData = union(enum) {
         ) !void {
             const action: network.Action = .delete_file_confirm;
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+            host.deleteTransaction(tx_id, .outgoing, io);
 
             try network.sendMessageHeaderNewTxReply(writer, .invalid, peer_tx_id);
             try network.sendAction(writer, action);
             try writer.flush();
-
-            host.deleteTransaction(tx_id, .outgoing, io);
         }
     };
 };
