@@ -244,16 +244,23 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        const entry = db.known_files.fetchRemove(file_id) orelse return .unknown_file;
-        assert(db.file_id_map.fetchRemove(entry.value.path).?.value == file_id);
-        switch (entry.value.state) {
+        const entry = db.known_files.getEntry(file_id) orelse return .unknown_file;
+        const file_id_map_entry = db.file_id_map.getEntry(entry.value_ptr.path).?;
+        assert(file_id_map_entry.value_ptr.* == file_id);
+        switch (entry.value_ptr.state) {
             .synced, .unsynced => {},
         }
+
         // TODO janky, use NT functions
-        const path_wtf8 = try entry.value.path.toWtf8Path();
+        const path_wtf8 = try entry.value_ptr.path.toWtf8Path();
+        // TODO maybe don't perform the delete right away, but just queue it
         if (db.sync_dir_io.deleteFile(io, path_wtf8.slice())) |_| {
+            db.known_files.removeByPtr(entry.key_ptr);
+            db.file_id_map.removeByPtr(file_id_map_entry.key_ptr);
             return .success;
         } else |err| {
+            // TODO: set the file entry to some errored state
+            // TODO: retry the deletion
             return .{ .delete_file_err = err };
         }
     }
