@@ -94,6 +94,8 @@ const Args = struct {
     }
 };
 
+const buffer_size = @max(wave.network.min_reader_writer_buffer_size, 128);
+
 fn startServerAndClient(
     io: Io,
     client_db: *wave.client.Database,
@@ -110,9 +112,9 @@ fn startServerAndClient(
     defer stream.close(io);
     print("connected\n", .{});
 
-    var read_buffer: [64]u8 = undefined;
+    var read_buffer: [buffer_size]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
-    var write_buffer: [64]u8 = undefined;
+    var write_buffer: [buffer_size]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
 
     const name = "client";
@@ -139,9 +141,9 @@ fn startServer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16) !vo
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
-    var read_buffer: [64]u8 = undefined;
+    var read_buffer: [buffer_size]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
-    var write_buffer: [64]u8 = undefined;
+    var write_buffer: [buffer_size]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
 
     var dbg_allocator = std.heap.DebugAllocator(.{}).init;
@@ -156,7 +158,7 @@ fn startServer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16) !vo
     defer host.deinit();
     var diag: wave.server.Host.Diagnostics = .{};
     defer {
-        // TODO (Windows) this print statement doesn't show up in the terminal for some reason
+        // TODO (Windows) this print statement randomly doesn't show up in the terminal for some reason
         print("{s} send result: {s}, recv result: {s}\n", .{
             name,
             blk: {

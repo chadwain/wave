@@ -83,133 +83,154 @@ pub const PathByteCount = u16;
 
 pub const FilePathBuffer = [1 << @bitSizeOf(PathByteCount)]u8;
 
-/// Asserts a writer buffer size of at least 1.
-pub fn sendMessageHeaderExistingTx(writer: *Io.Writer, peer_tx_id: TransactionId) !void {
-    const header = MessageHeader{
-        .tag = .existing_tx,
-        .tx_id = peer_tx_id,
-        .peer_tx_id = .invalid,
-    };
-    try writer.writeByte(@bitCast(header));
-}
+pub const min_reader_writer_buffer_size = FileHash.byte_size;
 
-/// Asserts a writer buffer size of at least 1.
-pub fn sendMessageHeaderNewTx(writer: *Io.Writer, tx_id: TransactionId) !void {
-    const header = MessageHeader{
-        .tag = .new_tx,
-        .tx_id = .invalid,
-        .peer_tx_id = tx_id,
-    };
-    try writer.writeByte(@bitCast(header));
-}
+pub const Writer = struct {
+    io: *Io.Writer,
 
-/// Asserts a writer buffer size of at least 1.
-pub fn sendMessageHeaderNewTxReply(writer: *Io.Writer, tx_id: TransactionId, peer_tx_id: TransactionId) !void {
-    const header = MessageHeader{
-        .tag = .new_tx_reply,
-        .tx_id = peer_tx_id,
-        .peer_tx_id = tx_id,
-    };
-    try writer.writeByte(@bitCast(header));
-}
+    /// Asserts a writer buffer size of at least `min_reader_writer_buffer_size`.
+    pub fn init(io_writer: *Io.Writer) Writer {
+        assert(io_writer.buffer.len >= min_reader_writer_buffer_size);
+        return .{ .io = io_writer };
+    }
 
-/// Asserts a writer buffer size of at least 1.
-pub fn sendAction(writer: *Io.Writer, action: Action) !void {
-    try writer.writeByte(@intFromEnum(action));
-}
+    pub fn flush(writer: Writer) !void {
+        try writer.io.flush();
+    }
 
-/// Asserts a writer buffer size of at least `@sizeOf(FileId)`.
-pub fn sendFileId(writer: *Io.Writer, id: FileId) !void {
-    try writer.writeInt(std.meta.Tag(FileId), @intFromEnum(id), endian);
-}
+    fn writeEnum(writer: Writer, comptime Enum: type, value: Enum) !void {
+        try writer.io.writeInt(@typeInfo(Enum).@"enum".tag_type, @intFromEnum(value), endian);
+    }
 
-/// Asserts a writer buffer size of at least `@sizeOf(PathByteCount)`.
-pub fn sendNewFilePath(
-    writer: *Io.Writer,
-    path_encoding: PathEncoding,
-    path: []const u8, // TODO: Make a Path struct
-) !void {
-    try writer.writeByte(@intFromEnum(path_encoding));
-    try writer.writeInt(PathByteCount, @intCast(path.len), endian);
-    try writer.writeAll(path);
-}
+    pub fn sendMessageHeaderExistingTx(writer: Writer, peer_tx_id: TransactionId) !void {
+        const header = MessageHeader{
+            .tag = .existing_tx,
+            .tx_id = peer_tx_id,
+            .peer_tx_id = .invalid,
+        };
+        try writer.io.writeStruct(header, endian);
+    }
 
-/// Asserts a writer buffer size of at least `@sizeOf(FileSize)`.
-/// Asserts that `path.len` can fit into a `PathByteCount`.
-pub fn sendFileMetadata(
-    writer: *Io.Writer,
-    file_id: FileId,
-    file_size: FileSize,
-    hash: *const FileHash,
-) !void {
-    try sendFileId(writer, file_id);
-    try writer.writeInt(FileSize, file_size, endian);
-    try writer.writeAll(&hash.blake3);
-}
+    pub fn sendMessageHeaderNewTx(writer: Writer, tx_id: TransactionId) !void {
+        const header = MessageHeader{
+            .tag = .new_tx,
+            .tx_id = .invalid,
+            .peer_tx_id = tx_id,
+        };
+        try writer.io.writeStruct(header, endian);
+    }
 
-/// Asserts a reader buffer size of at least 1.
-pub fn receiveMessageHeader(reader: *Io.Reader) Io.Reader.Error!MessageHeader {
-    return @bitCast(try reader.takeByte());
-}
+    pub fn sendMessageHeaderNewTxReply(writer: Writer, tx_id: TransactionId, peer_tx_id: TransactionId) !void {
+        const header = MessageHeader{
+            .tag = .new_tx_reply,
+            .tx_id = peer_tx_id,
+            .peer_tx_id = tx_id,
+        };
+        try writer.io.writeStruct(header, endian);
+    }
 
-pub const ReceiveActionError = error{UnknownAction} || Io.Reader.Error;
+    pub fn sendAction(writer: Writer, action: Action) !void {
+        try writer.writeEnum(Action, action);
+    }
 
-/// Asserts a reader buffer size of at least 1.
-pub fn receiveAction(reader: *Io.Reader) ReceiveActionError!Action {
-    return std.enums.fromInt(Action, try reader.takeByte()) orelse error.UnknownAction;
-}
+    pub fn sendFileId(writer: Writer, id: FileId) !void {
+        try writer.writeEnum(FileId, id);
+    }
 
-/// Asserts a reader buffer size of at least `@sizeOf(FileId)`.
-pub fn receiveFileId(reader: *Io.Reader) Io.Reader.Error!FileId {
-    // All values of FileId are valid
-    return std.enums.fromInt(FileId, try reader.takeInt(std.meta.Tag(FileId), endian)).?;
-}
+    pub fn sendNewFilePath(
+        writer: Writer,
+        path_encoding: PathEncoding,
+        path: []const u8, // TODO: Make a Path struct
+    ) !void {
+        try writer.writeEnum(PathEncoding, path_encoding);
+        try writer.io.writeInt(PathByteCount, @intCast(path.len), endian);
+        try writer.io.writeAll(path);
+    }
 
-pub const IncomingNewFilePath = struct {
-    path_encoding: PathEncoding,
-    path_byte_count: PathByteCount,
+    pub fn sendFileMetadata(
+        writer: Writer,
+        file_id: FileId,
+        file_size: FileSize,
+        hash: *const FileHash,
+    ) !void {
+        try writer.sendFileId(file_id);
+        try writer.io.writeInt(FileSize, file_size, endian);
+        try writer.io.writeAll(&hash.blake3);
+    }
 };
 
-pub const ReceiveNewFilePathError = error{UnknownPathEncoding} || Io.Reader.StreamError;
+pub const Reader = struct {
+    io: *Io.Reader,
 
-/// Asserts a reader buffer size of at least `FileHash.byte_size`.
-pub fn receiveNewFilePath(
-    reader: *Io.Reader,
-    file_path_buffer: *FilePathBuffer,
-) ReceiveNewFilePathError!IncomingNewFilePath {
-    const path_encoding = std.enums.fromInt(PathEncoding, try reader.takeByte()) orelse
-        return error.UnknownPathEncoding;
-    const path_byte_count = try reader.takeInt(PathByteCount, endian);
+    /// Asserts a reader buffer size of at least `min_reader_writer_buffer_size`.
+    pub fn init(io_reader: *Io.Reader) Reader {
+        assert(io_reader.buffer.len >= min_reader_writer_buffer_size);
+        return .{ .io = io_reader };
+    }
 
-    // TODO: Do path encoding verification here
-    var file_path_writer: Io.Writer = .fixed(file_path_buffer);
-    try reader.streamExact(&file_path_writer, path_byte_count);
+    fn readEnum(reader: Reader, comptime Enum: type) Io.Reader.Error!?Enum {
+        const int = try reader.io.takeInt(@typeInfo(Enum).@"enum".tag_type, endian);
+        return std.enums.fromInt(Enum, int);
+    }
 
-    return .{
-        .path_encoding = path_encoding,
-        .path_byte_count = path_byte_count,
+    pub fn receiveMessageHeader(reader: Reader) Io.Reader.Error!MessageHeader {
+        return reader.io.takeStruct(MessageHeader, endian);
+    }
+
+    pub const ReceiveActionError = error{UnknownAction} || Io.Reader.Error;
+
+    pub fn receiveAction(reader: Reader) ReceiveActionError!Action {
+        return try reader.readEnum(Action) orelse error.UnknownAction;
+    }
+
+    pub fn receiveFileId(reader: Reader) Io.Reader.Error!FileId {
+        // All values of FileId are valid
+        return reader.io.takeEnumNonexhaustive(FileId, endian);
+    }
+
+    pub const IncomingNewFilePath = struct {
+        path_encoding: PathEncoding,
+        path_byte_count: PathByteCount,
     };
-}
 
-pub const IncomingFileMetadata = struct {
-    file_id: FileId,
-    file_size: FileSize,
-    hash: FileHash,
+    pub const ReceiveNewFilePathError = error{UnknownPathEncoding} || Io.Reader.StreamError;
+
+    pub fn receiveNewFilePath(
+        reader: Reader,
+        file_path_buffer: *FilePathBuffer,
+    ) ReceiveNewFilePathError!IncomingNewFilePath {
+        const path_encoding = try reader.readEnum(PathEncoding) orelse return error.UnknownPathEncoding;
+        const path_byte_count = try reader.io.takeInt(PathByteCount, endian);
+
+        // TODO: Do path encoding verification here
+        var file_path_writer: Io.Writer = .fixed(file_path_buffer);
+        try reader.io.streamExact(&file_path_writer, path_byte_count);
+
+        return .{
+            .path_encoding = path_encoding,
+            .path_byte_count = path_byte_count,
+        };
+    }
+
+    pub const IncomingFileMetadata = struct {
+        file_id: FileId,
+        file_size: FileSize,
+        hash: FileHash,
+    };
+
+    pub const ReceiveFileMetadataError = Io.Reader.Error;
+
+    pub fn receiveFileMetadata(reader: Reader) ReceiveFileMetadataError!IncomingFileMetadata {
+        const file_id = try receiveFileId(reader);
+        const file_size = try reader.io.takeInt(FileSize, endian);
+
+        const hash_bytes = try reader.io.takeArray(FileHash.byte_size);
+        const hash: FileHash = .{ .blake3 = hash_bytes.* };
+
+        return .{
+            .file_id = file_id,
+            .file_size = file_size,
+            .hash = hash,
+        };
+    }
 };
-
-pub const ReceiveFileMetadataError = Io.Reader.Error;
-
-/// Asserts a reader buffer size of at least `FileHash.byte_size`.
-pub fn receiveFileMetadata(reader: *Io.Reader) ReceiveFileMetadataError!IncomingFileMetadata {
-    const file_id = try receiveFileId(reader);
-    const file_size = try reader.takeInt(FileSize, endian);
-
-    const hash_bytes = try reader.takeArray(FileHash.byte_size);
-    const hash: FileHash = .{ .blake3 = hash_bytes.* };
-
-    return .{
-        .file_id = file_id,
-        .file_size = file_size,
-        .hash = hash,
-    };
-}
