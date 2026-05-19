@@ -38,8 +38,8 @@ pub const MessageHeader = packed struct(u8) {
 
 pub const Action = enum(u8) {
     /// A client has seen a new file on its local filesystem.
+    /// Payload: A path
     client_new_file,
-
     server_registered_new_file,
     server_cant_register_new_files,
     server_new_file_exists,
@@ -71,7 +71,7 @@ pub const FileHash = struct {
     }
 };
 
-pub const FileId = enum(u32) { unknown, _ };
+pub const FileId = enum(u32) { _ };
 
 pub const FileSize = u64;
 
@@ -201,6 +201,7 @@ pub const Reader = struct {
     ) ReceiveNewFilePathError!IncomingNewFilePath {
         const path_encoding = try reader.readEnum(PathEncoding) orelse return error.UnknownPathEncoding;
         const path_byte_count = try reader.io.takeInt(PathByteCount, endian);
+        // TODO: Ensure path is not empty, and maybe some other sanity checks
 
         // TODO: Do path encoding verification here
         var file_path_writer: Io.Writer = .fixed(file_path_buffer);

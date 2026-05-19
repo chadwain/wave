@@ -16,32 +16,33 @@ pub fn main(init: std.process.Init) !void {
 
     const sync_dir = try std.unicode.wtf8ToWtf16LeAlloc(allocator, args.syncDir());
     defer allocator.free(sync_dir);
-
-    var db = try wave.client.Database.init(.wtf16Cast(sync_dir), io, allocator);
-    defer db.deinit(io);
-
-    var db_run_task = try io.concurrent(wave.client.Database.run, .{ &db, io });
-    defer db_run_task.cancel(io) catch {};
-
     const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAlloc(allocator, args.peerSyncDir());
     defer allocator.free(peer_sync_dir);
 
-    var host_pair_task = try io.concurrent(
-        startServerAndClient,
-        .{ io, &db, .wtf16Cast(peer_sync_dir) },
-    );
+    var cdb = try wave.client.Database.init(.wtf16Cast(sync_dir), io, allocator);
+    defer cdb.deinit(io);
+
+    var sdb = try wave.server.Database.init(.wtf16Cast(peer_sync_dir), io, allocator);
+    defer sdb.deinit(io);
+
+    var cdb_run_task = try io.concurrent(wave.client.Database.run, .{ &cdb, io });
+    defer cdb_run_task.cancel(io) catch {};
+
+    var host_pair_task = try io.concurrent(startServerAndClient, .{ io, &cdb, &sdb });
     defer host_pair_task.cancel(io) catch {};
 
-    try runCli(io, &db);
+    try runCli(io, &cdb, &sdb);
 }
 
-fn runCli(io: Io, db: *wave.client.Database) !void {
+fn runCli(io: Io, cdb: *wave.client.Database, sdb: *wave.server.Database) !void {
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
     const reader = &stdin.interface;
 
-    var stdout = Io.File.stdout().writer(io, &.{});
-    print("s - scan, a - print all files, n - print files needing sync, q - quit\n", .{});
+    var stdout_file_writer = Io.File.stdout().writer(io, &.{});
+    const stdout = &stdout_file_writer.interface;
+
+    print("s - scan, a - print all files, n - print files needing sync, sa - print all files/folders (server), q - quit\n", .{});
     while (true) {
         var line: []const u8 = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.ReadFailed, error.EndOfStream => |e| return e,
@@ -52,23 +53,40 @@ fn runCli(io: Io, db: *wave.client.Database) !void {
         };
         reader.toss(1);
         line = std.mem.trimEnd(u8, line, "\r");
-        if (line.len != 1) continue;
-        switch (line[0]) {
-            'a' => {
-                try db.debug.printKnownFiles(&stdout.interface, io);
-                try stdout.interface.flush();
+
+        const Command = enum {
+            quit,
+            client_print_files,
+            client_print_sync_files,
+            client_scan,
+            server_print_files_folders,
+        };
+        const commands = std.StaticStringMap(Command).initComptime(.{
+            .{ "q", Command.quit },
+            .{ "a", Command.client_print_files },
+            .{ "n", Command.client_print_sync_files },
+            .{ "s", Command.client_scan },
+            .{ "sa", Command.server_print_files_folders },
+        });
+        switch (commands.get(line) orelse continue) {
+            .quit => break,
+            .client_print_files => {
+                try cdb.debug.printKnownFiles(stdout, io);
+                try stdout.flush();
             },
-            'n' => {
-                try db.debug.printFilesNeedingSync(&stdout.interface, io);
-                try stdout.interface.flush();
+            .client_print_sync_files => {
+                try cdb.debug.printFilesNeedingSync(stdout, io);
+                try stdout.flush();
             },
-            's' => {
-                try db.manualScan(io);
-                try stdout.interface.writeAll("scan complete\n");
-                try stdout.interface.flush();
+            .client_scan => {
+                try cdb.manualScan(io);
+                try stdout.writeAll("scan complete\n");
+                try stdout.flush();
             },
-            'q' => break,
-            else => continue,
+            .server_print_files_folders => {
+                try sdb.debug.printKnownFilesAndFolders(stdout, io);
+                try stdout.flush();
+            },
         }
     }
 }
@@ -99,13 +117,13 @@ const buffer_size = @max(wave.network.min_reader_writer_buffer_size, 128);
 fn startServerAndClient(
     io: Io,
     client_db: *wave.client.Database,
-    peer_sync_dir: wave.windows.Wtf16,
+    server_db: *wave.server.Database,
 ) !void {
     const addr = comptime Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
     var server = try addr.listen(io, .{});
     defer server.deinit(io);
 
-    var peer = try io.concurrent(startServer, .{ io, server.socket.address, peer_sync_dir });
+    var peer = try io.concurrent(startServer, .{ io, server_db, server.socket.address });
     defer peer.cancel(io) catch {};
 
     const stream = try server.accept(io);
@@ -137,7 +155,7 @@ fn startServerAndClient(
     try host.run(&diag, io, &reader.interface, &writer.interface);
 }
 
-fn startServer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16) !void {
+fn startServer(io: Io, server_db: *wave.server.Database, addr: Io.net.IpAddress) !void {
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
@@ -146,15 +164,8 @@ fn startServer(io: Io, addr: Io.net.IpAddress, sync_dir: wave.windows.Wtf16) !vo
     var write_buffer: [buffer_size]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
 
-    var dbg_allocator = std.heap.DebugAllocator(.{}).init;
-    defer assert(dbg_allocator.deinit() == .ok);
-    const allocator = dbg_allocator.allocator();
-
-    var db = try wave.server.Database.init(sync_dir, io, allocator);
-    defer db.deinit(io);
-
     const name = "server";
-    var host = wave.server.Host.init(&db, .{ .name = name });
+    var host = wave.server.Host.init(server_db, .{ .name = name });
     defer host.deinit();
     var diag: wave.server.Host.Diagnostics = .{};
     defer {

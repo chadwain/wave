@@ -18,12 +18,15 @@ pub const Database = struct {
     allocator: Allocator,
     mutex: Io.Mutex, // TODO: Compare with RwLock
 
-    file_path_arena: std.heap.ArenaAllocator.State,
+    path_arena: std.heap.ArenaAllocator.State,
     file_id_map: Win32RelativePathHashMap(network.FileId),
     next_file_id: ?std.meta.Tag(network.FileId),
     known_files: std.AutoHashMapUnmanaged(network.FileId, FileEntry),
+    known_folders: std.AutoHashMapUnmanaged(network.FileId, Wtf16),
 
     host_state: std.atomic.Value(Host.State),
+
+    debug: Debug,
 
     pub const FileMetadata = struct {
         local_file_id: w.LARGE_INTEGER,
@@ -67,12 +70,15 @@ pub const Database = struct {
             .allocator = allocator,
             .mutex = .init,
 
-            .file_path_arena = .{},
+            .path_arena = .{},
             .file_id_map = .empty,
             .next_file_id = 1,
             .known_files = .empty,
+            .known_folders = .empty,
 
             .host_state = .init(.{}),
+
+            .debug = .{},
         };
     }
 
@@ -80,11 +86,12 @@ pub const Database = struct {
         w.CloseHandle(db.sync_dir);
         db.sync_dir_io.close(io);
 
-        var file_path_arena = db.file_path_arena.promote(db.allocator);
-        file_path_arena.deinit();
+        var path_arena = db.path_arena.promote(db.allocator);
+        path_arena.deinit();
 
         db.file_id_map.deinit(db.allocator);
         db.known_files.deinit(db.allocator);
+        db.known_folders.deinit(db.allocator);
 
         db.* = undefined;
     }
@@ -93,23 +100,24 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
+        try registerIntermediateFolders(db, path);
+
         const gop = try db.file_id_map.getOrPut(db.allocator, path);
         if (gop.found_existing) return error.FileAlreadyExists;
         errdefer db.file_id_map.removeByPtr(gop.key_ptr);
 
         const file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
-        db.next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch null;
-        errdefer db.next_file_id = file_id_tag;
-        const file_id: network.FileId = @enumFromInt(file_id_tag);
 
-        var file_path_arena = db.file_path_arena.promote(db.allocator);
-        defer db.file_path_arena = file_path_arena.state;
-        const path_copy = try path.dupe(file_path_arena.allocator());
-        errdefer file_path_arena.allocator().free(path_copy.slice);
+        var path_arena = db.path_arena.promote(db.allocator);
+        defer db.path_arena = path_arena.state;
+        const path_copy = try path.dupe(path_arena.allocator());
+        errdefer path_arena.allocator().free(path_copy.slice);
 
         try db.known_files.ensureUnusedCapacity(db.allocator, 1);
         errdefer comptime unreachable;
 
+        const file_id: network.FileId = @enumFromInt(file_id_tag);
+        db.next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch null;
         db.known_files.putAssumeCapacityNoClobber(file_id, .{
             .path = path_copy,
             .state = .unsynced,
@@ -119,6 +127,48 @@ pub const Database = struct {
         gop.value_ptr.* = file_id;
 
         return file_id;
+    }
+
+    fn registerIntermediateFolders(db: *Database, path: Wtf16) !void {
+        const initial_file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
+        errdefer {
+            var file_id_tag: ?std.meta.Tag(network.FileId) = initial_file_id_tag;
+            while (file_id_tag) |tag| : (file_id_tag = std.math.add(std.meta.Tag(network.FileId), tag, 1) catch null) {
+                const file_id: network.FileId = @enumFromInt(tag);
+                const sub_folder_path = db.known_folders.fetchRemove(file_id).?;
+                assert(db.file_id_map.remove(sub_folder_path.value));
+            }
+            db.next_file_id = initial_file_id_tag;
+        }
+
+        const Iterator = std.fs.path.ComponentIterator(.windows, u16);
+        var it = Iterator.init(path.slice);
+        _ = it.last() orelse std.debug.panic("TODO empty file name", .{});
+
+        while (it.previous()) |sub_folder| {
+            const sub_path: Wtf16 = .wtf16Cast(sub_folder.path);
+
+            const gop = try db.file_id_map.getOrPut(db.allocator, sub_path);
+            if (gop.found_existing) break;
+            errdefer db.file_id_map.removeByPtr(gop.key_ptr);
+
+            const file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
+            const new_next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch return error.ExhaustedFileIds;
+
+            var path_arena = db.path_arena.promote(db.allocator);
+            defer db.path_arena = path_arena.state;
+            const sub_path_copy = try sub_path.dupe(path_arena.allocator());
+            errdefer path_arena.allocator().free(sub_path_copy.slice);
+
+            try db.known_folders.ensureUnusedCapacity(db.allocator, 1);
+            errdefer comptime unreachable;
+
+            const file_id: network.FileId = @enumFromInt(file_id_tag);
+            db.next_file_id = new_next_file_id;
+            db.known_folders.putAssumeCapacityNoClobber(file_id, sub_path_copy);
+            gop.key_ptr.* = sub_path_copy;
+            gop.value_ptr.* = file_id;
+        }
     }
 
     const CompareMetadataResult = union(enum) {
@@ -244,6 +294,7 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
+        // TODO delete folders
         const entry = db.known_files.getEntry(file_id) orelse return .unknown_file;
         const file_id_map_entry = db.file_id_map.getEntry(entry.value_ptr.path).?;
         assert(file_id_map_entry.value_ptr.* == file_id);
@@ -264,6 +315,34 @@ pub const Database = struct {
             return .{ .delete_file_err = err };
         }
     }
+
+    pub const Debug = struct {
+        pub fn printKnownFilesAndFolders(debug: *Debug, writer: *Io.Writer, io: Io) !void {
+            const db: *Database = @alignCast(@fieldParentPtr("debug", debug));
+            try db.mutex.lock(io);
+            defer db.mutex.unlock(io);
+
+            try writer.writeAll("Tracked files\n");
+            var it = db.known_files.iterator();
+            while (it.next()) |entry| {
+                try writer.print(
+                    "{}: {f}\n",
+                    .{ @intFromEnum(entry.key_ptr.*), entry.value_ptr.path.formatUtf8() },
+                );
+            }
+
+            try writer.writeAll("\nTracked folders\n");
+            var it2 = db.known_folders.iterator();
+            while (it2.next()) |entry| {
+                try writer.print(
+                    "{}: {f}\n",
+                    .{ @intFromEnum(entry.key_ptr.*), entry.value_ptr.formatUtf8() },
+                );
+            }
+
+            try writer.writeAll("\n");
+        }
+    };
 };
 
 pub const Host = struct {
