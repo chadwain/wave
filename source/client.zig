@@ -139,68 +139,89 @@ pub const Database = struct {
                 continue;
             }
 
-            if (try db.sendHostEvents(io)) |_| continue;
+            if (db.sendHostEvents(io)) {
+                continue;
+            } else |err| switch (err) {
+                error.NoEvents => {},
+                error.Canceled => |e| return e,
+            }
 
             db.alert.store(.off, .release);
             try io.futexWaitTimeout(Alert, &db.alert.raw, .off, .{ .deadline = next_scan_time });
         }
     }
 
-    /// `null` means that no events were sent
-    fn sendHostEvents(db: *Database, io: Io) !?void {
-        // TODO no mutex
-        try db.mutex.lock(io);
-        defer db.mutex.unlock(io);
+    fn sendHostEvents(db: *Database, io: Io) (error{NoEvents} || Io.Cancelable)!void {
+        const HostEventData = union(enum) {
+            new_file: struct {
+                path: Wtf16,
+                entry: FileEntry,
+            },
+            updated_file: struct {
+                path: Wtf16,
+                entry: FileEntry,
+                update: FileUpdate,
+            },
+        };
 
-        if (db.new_files.count() != 0 and db.acquireHostEvent() != null) {
-            var it = db.new_files.keyIterator();
-            const path = it.next().?;
-            const file_info = db.known_files.getPtr(path.*).?;
-            switch (file_info.status) {
-                .new => {},
-                .normal, .pending_deletion, .untracked => unreachable,
-            }
+        const host_event_data: HostEventData = blk: {
+            // TODO no mutex
+            try db.mutex.lock(io);
+            defer db.mutex.unlock(io);
 
-            db.out_path = path.*;
-            db.new_files.removeByPtr(path);
+            if (db.new_files.count() == 0 and db.updated_files.count() == 0) return error.NoEvents;
+            db.acquireHostEvent() orelse return error.NoEvents;
+            errdefer comptime unreachable;
 
-            db.releaseHostEvent(.get_global_file_id);
-            return io.futexWake(Host.State, &db.host_state.raw, 1);
-        } else if (db.updated_files.count() != 0 and db.acquireHostEvent() != null) {
-            var it = db.updated_files.iterator();
-            const updated_file = it.next().?;
-            const path = updated_file.key_ptr.*;
-            const file_entry = db.known_files.getPtr(path).?;
-            switch (updated_file.value_ptr.*) {
+            if (db.new_files.count() != 0) {
+                var it = db.new_files.keyIterator();
+                const path = it.next().?;
+                const file_info = db.known_files.get(path.*).?;
+                defer db.new_files.removeByPtr(path);
+                break :blk .{ .new_file = .{ .path = path.*, .entry = file_info } };
+            } else if (db.updated_files.count() != 0) {
+                var it = db.updated_files.iterator();
+                const entry = it.next().?;
+                const file_info = db.known_files.get(entry.key_ptr.*).?;
+                defer db.updated_files.removeByPtr(entry.key_ptr);
+                break :blk .{ .updated_file = .{ .path = entry.key_ptr.*, .entry = file_info, .update = entry.value_ptr.* } };
+            } else unreachable;
+        };
+
+        errdefer comptime unreachable;
+        const host_event: Host.State.Event = blk: switch (host_event_data) {
+            .new_file => |new_file| {
+                switch (new_file.entry.status) {
+                    .new => {},
+                    .normal, .pending_deletion, .untracked => unreachable,
+                }
+                db.out_path = new_file.path;
+                break :blk .get_global_file_id;
+            },
+            .updated_file => |updated_file| switch (updated_file.update) {
                 .modified => {
-                    switch (file_entry.status) {
+                    switch (updated_file.entry.status) {
                         .normal => {},
                         .new, .untracked, .pending_deletion => unreachable,
                     }
-
-                    db.out_file_id = file_entry.id;
-                    db.out_path = path;
-                    db.out_metadata = file_entry.metadata;
-
-                    db.releaseHostEvent(.sync_file);
+                    db.out_file_id = updated_file.entry.id;
+                    db.out_path = updated_file.path;
+                    db.out_metadata = updated_file.entry.metadata;
+                    break :blk .sync_file;
                 },
                 .deleted => {
-                    switch (file_entry.status) {
+                    switch (updated_file.entry.status) {
                         .pending_deletion => {},
                         .new, .normal, .untracked => unreachable,
                     }
-
-                    db.out_file_id = file_entry.id;
-                    db.out_path = path;
-
-                    db.releaseHostEvent(.delete_file);
+                    db.out_file_id = updated_file.entry.id;
+                    db.out_path = updated_file.path;
+                    break :blk .delete_file;
                 },
-            }
-            db.updated_files.removeByPtr(updated_file.key_ptr);
-            return io.futexWake(Host.State, &db.host_state.raw, 1);
-        }
-
-        return null;
+            },
+        };
+        db.releaseHostEvent(host_event);
+        io.futexWake(Host.State, &db.host_state.raw, 1);
     }
 
     fn sendAlert(db: *Database, io: Io) void {
