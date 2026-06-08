@@ -535,10 +535,15 @@ const scan = struct {
             .REPARSE_POINT = true,
             .ENCRYPTED = true,
         };
+        // TODO: Use @backingInt https://codeberg.org/ziglang/zig/issues/35602
         const set_to_untracked = @as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0;
 
         if (information.FileAttributes.DIRECTORY) {
             if (set_to_untracked) return;
+
+            const component_count: wave.PathComponentCount = @intCast(ctx.open_dir_handles.items.len - 1); // Don't count the sync dir itself as a component.
+            if (component_count == wave.max_path_components) return; // TODO: track the folder, but don't track its contents.
+
             const allocator = ctx.arena.allocator();
             const copied_name = try name.dupe(allocator);
             try ctx.pending_dirs.append(allocator, copied_name);

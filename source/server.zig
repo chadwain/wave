@@ -156,11 +156,14 @@ pub const Database = struct {
         var it = Iterator.init(path.slice);
         const last = it.last() orelse std.debug.panic("todo empty file name", .{});
 
+        var component_count: wave.PathComponentCount = 1;
+
         var path_arena = db.path_arena.promote(db.allocator);
         defer db.path_arena = path_arena.state;
         const path_arena_allocator = path_arena.allocator();
 
         var parent_path: ?Wtf16 = first_known_path: while (it.previous()) |item| {
+            component_count = std.math.add(wave.PathComponentCount, component_count, 1) catch return error.PathContainsTooManyComponents;
             const sub_path: Wtf16 = .wtf16Cast(item.path);
 
             const gop = try db.path_info.getOrPut(db.allocator, sub_path);
@@ -185,11 +188,11 @@ pub const Database = struct {
             gop.key_ptr.* = sub_path_copy;
             gop.value_ptr.* = .{ .id = file_id, .parent = undefined };
         } else break :first_known_path null;
-        errdefer comptime unreachable;
 
         {
             var it2 = it;
             while (it2.previous()) |item| {
+                component_count = std.math.add(wave.PathComponentCount, component_count, 1) catch return error.PathContainsTooManyComponents;
                 const sub_path: Wtf16 = .wtf16Cast(item.path);
                 const path_info = db.path_info.get(sub_path) orelse std.debug.panic("discrepancy between local and remote folder path", .{});
                 assert(db.known_folders.contains(path_info.id));
@@ -208,18 +211,18 @@ pub const Database = struct {
         return parent_path;
     }
 
-    fn getReverseFileIdPath(db: *Database, file_id: network.FileId, buffer: []network.FileId, io: Io) ![]network.FileId {
+    fn getReverseFileIdPath(db: *Database, file_id: network.FileId, buffer: *[wave.max_path_components]network.FileId, io: Io) ![]network.FileId {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
         var list: std.ArrayList(network.FileId) = .initBuffer(buffer);
-        try list.appendBounded(file_id);
+        list.appendBounded(file_id) catch unreachable;
 
         var path: ?Wtf16 = db.known_files.get(file_id).?.path;
         path = db.path_info.get(path.?).?.parent;
         while (path) |p| {
             const path_info = db.path_info.get(p).?;
-            try list.appendBounded(path_info.id);
+            list.appendBounded(path_info.id) catch unreachable;
             path = path_info.parent;
         }
 
@@ -719,6 +722,7 @@ pub const TxData = union(enum) {
                     .data = if (host.db.newFile(path, io)) |file_id| .{ .file_id = file_id } else |err| switch (err) {
                         error.FileAlreadyExists => .file_already_exists,
                         error.ExhaustedFileIds => .exhausted_file_ids,
+                        error.PathContainsTooManyComponents => std.debug.panic("TODO handle PathContainsTooManyComponents error", .{}),
                         error.InvalidFolder => std.debug.panic("TODO handle InvalidFolder error", .{}),
                         error.Canceled, error.OutOfMemory => |e| return e,
                     },
@@ -740,11 +744,8 @@ pub const TxData = union(enum) {
             const outgoing_tx_id: network.TransactionId = .invalid;
             switch (in_new_file.data) {
                 .file_id => |file_id| {
-                    var reverse_file_ids_buffer: [8]network.FileId = undefined; // TODO pick a bigger size
-                    const reversed_file_id_path = host.db.getReverseFileIdPath(file_id, &reverse_file_ids_buffer, io) catch |err| switch (err) {
-                        error.OutOfMemory => std.debug.panic("TODO path contains too many components", .{}),
-                        error.Canceled => |e| return e,
-                    };
+                    var reverse_file_ids_buffer: [wave.max_path_components]network.FileId = undefined;
+                    const reversed_file_id_path = try host.db.getReverseFileIdPath(file_id, &reverse_file_ids_buffer, io);
 
                     const action: network.Action = .server_registered_new_file;
                     host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
