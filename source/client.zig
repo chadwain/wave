@@ -45,6 +45,7 @@ pub const Database = struct {
 
     pub const FileState = enum {
         /// id is undefined
+        /// metadata.hash is undefined
         new,
         normal,
         /// metadata is undefined
@@ -252,7 +253,7 @@ pub const Database = struct {
         try scan.run(db, io);
     }
 
-    // client
+    // called from Host
     fn setNewFileId(db: *Database, path: Wtf16, global_file_id: network.FileId, io: Io) !void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
@@ -265,15 +266,33 @@ pub const Database = struct {
             .normal, .pending_deletion, .untracked => std.debug.panic("TODO: handle new file id for non-new file", .{}),
         }
 
+        // TODO: create a Database event that will compute the hash later
+        const hash = blk: {
+            const file = try wave.windows.openFile(db.sync_dir, path, .read);
+            defer w.CloseHandle(file);
+
+            const Information = w.FILE.STANDARD_INFORMATION;
+            var information: Information = undefined;
+            var iosb: w.IO_STATUS_BLOCK = undefined;
+            const status = w.ntdll.NtQueryInformationFile(file, &iosb, &information, @sizeOf(Information), .Standard);
+            switch (status) {
+                .SUCCESS => {},
+                else => return w.unexpectedStatus(status),
+            }
+
+            break :blk try computeFileHash(file, information.EndOfFile);
+        };
+
         try db.updated_files.put(db.allocator, path, .modified);
         errdefer comptime unreachable;
 
+        file_entry.metadata.hash = hash;
         file_entry.status = .normal;
         file_entry.id = global_file_id;
         // TODO: send alert here?
     }
 
-    // client
+    // called from Host
     fn confirmDeleteFile(db: *Database, path: Wtf16, io: Io) !void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
@@ -554,13 +573,7 @@ const scan = struct {
             try ctx.sub_path.appendSlice(allocator, name.slice);
             const path: Wtf16 = .wtf16Cast(ctx.sub_path.items);
 
-            // TODO: Do not compute the hash right now
-            const dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
-            const file = try wave.windows.openFile(dir, name, .read);
-            defer w.CloseHandle(file);
-            const hash = try computeFileHash(file, information.EndOfFile);
-
-            try queueUpdateFileEvent(db, path, information, &hash, set_to_untracked);
+            try queueUpdateFileEvent(db, path, information, set_to_untracked);
             _ = ctx.set_of_tracked_files.remove(path);
         }
     }
@@ -587,14 +600,13 @@ const scan = struct {
         db: *Database,
         path: Wtf16,
         information: *const NtQueryInformation,
-        hash: *const network.FileHash,
         set_to_untracked: bool,
     ) !void {
         const size = std.math.cast(w.ULARGE_INTEGER, information.EndOfFile) orelse return error.Unexpected;
 
-        const metadata = Database.FileMetadata{
+        var metadata = Database.FileMetadata{
             .local_file_id = information.FileId,
-            .hash = hash.*,
+            .hash = undefined,
             .modified_time = information.ChangeTime,
             .size = size,
         };
@@ -626,6 +638,13 @@ const scan = struct {
                         gop.value_ptr.status = .pending_deletion;
                         gop.value_ptr.metadata = undefined;
                     } else {
+                        // TODO: mark the file's hash as stale, compute it later
+                        metadata.hash = blk: {
+                            const file = try wave.windows.openFile(db.sync_dir, path, .read);
+                            defer w.CloseHandle(file);
+                            break :blk try computeFileHash(file, information.EndOfFile);
+                        };
+
                         if (gop.value_ptr.metadata.local_file_id == metadata.local_file_id and
                             gop.value_ptr.metadata.size == metadata.size and
                             gop.value_ptr.metadata.hash.eql(&metadata.hash)) return;

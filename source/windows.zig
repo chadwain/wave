@@ -8,6 +8,7 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 
 /// A WTF-16 encoded string, with the endianness of the host system.
 // TODO: make this non-empty
+// TODO: make it clear whether this holds a Win32 path or NT path
 pub const Wtf16 = struct {
     slice: []const w.WCHAR,
 

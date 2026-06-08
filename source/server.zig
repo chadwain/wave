@@ -163,7 +163,9 @@ pub const Database = struct {
         const path_arena_allocator = path_arena.allocator();
 
         var parent_path: ?Wtf16 = first_known_path: while (it.previous()) |item| {
-            component_count = std.math.add(wave.PathComponentCount, component_count, 1) catch return error.PathContainsTooManyComponents;
+            if (component_count == wave.max_path_components) return error.PathContainsTooManyComponents;
+            component_count += 1;
+
             const sub_path: Wtf16 = .wtf16Cast(item.path);
 
             const gop = try db.path_info.getOrPut(db.allocator, sub_path);
@@ -192,7 +194,9 @@ pub const Database = struct {
         {
             var it2 = it;
             while (it2.previous()) |item| {
-                component_count = std.math.add(wave.PathComponentCount, component_count, 1) catch return error.PathContainsTooManyComponents;
+                if (component_count == wave.max_path_components) return error.PathContainsTooManyComponents;
+                component_count += 1;
+
                 const sub_path: Wtf16 = .wtf16Cast(item.path);
                 const path_info = db.path_info.get(sub_path) orelse std.debug.panic("discrepancy between local and remote folder path", .{});
                 assert(db.known_folders.contains(path_info.id));
