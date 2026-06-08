@@ -40,6 +40,8 @@ pub const Action = enum(u8) {
     /// A client has seen a new file on its local filesystem.
     /// Payload: A path
     client_new_file,
+    /// Sent in response to a `client_new_file` message.
+    /// Payload: A sequence of `FileId`, one for each component of the requested path, in REVERSE order.
     server_registered_new_file,
     server_cant_register_new_files,
     server_new_file_exists,

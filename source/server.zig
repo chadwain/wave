@@ -15,11 +15,13 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 pub const Database = struct {
     sync_dir: w.HANDLE,
     sync_dir_io: Io.Dir,
-    allocator: Allocator,
-    mutex: Io.Mutex, // TODO: Compare with RwLock
 
+    mutex: Io.Mutex, // TODO: Compare with RwLock
+    allocator: Allocator,
     path_arena: std.heap.ArenaAllocator.State,
-    file_id_map: Win32RelativePathHashMap(network.FileId),
+    // works for both files and folders
+    // look in either known_files or known_folders to determine the file type
+    path_info: Win32RelativePathHashMap(PathInfo),
     next_file_id: ?std.meta.Tag(network.FileId),
     known_files: std.AutoHashMapUnmanaged(network.FileId, FileEntry),
     known_folders: std.AutoHashMapUnmanaged(network.FileId, Wtf16),
@@ -27,6 +29,12 @@ pub const Database = struct {
     host_state: std.atomic.Value(Host.State),
 
     debug: Debug,
+
+    pub const PathInfo = struct {
+        id: network.FileId,
+        /// The canonical path of the parent directory, or null if there is none.
+        parent: ?Wtf16,
+    };
 
     pub const FileMetadata = struct {
         local_file_id: w.LARGE_INTEGER,
@@ -71,7 +79,7 @@ pub const Database = struct {
             .mutex = .init,
 
             .path_arena = .{},
-            .file_id_map = .empty,
+            .path_info = .empty,
             .next_file_id = 1,
             .known_files = .empty,
             .known_folders = .empty,
@@ -89,7 +97,7 @@ pub const Database = struct {
         var path_arena = db.path_arena.promote(db.allocator);
         path_arena.deinit();
 
-        db.file_id_map.deinit(db.allocator);
+        db.path_info.deinit(db.allocator);
         db.known_files.deinit(db.allocator);
         db.known_folders.deinit(db.allocator);
 
@@ -100,11 +108,12 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        try registerIntermediateFolders(db, path);
+        const parent_path = try registerIntermediateFolders(db, path);
+        // TODO: need to errdefer and undo the work done in the registerIntermediateFolders function
 
-        const gop = try db.file_id_map.getOrPut(db.allocator, path);
+        const gop = try db.path_info.getOrPut(db.allocator, path);
         if (gop.found_existing) return error.FileAlreadyExists;
-        errdefer db.file_id_map.removeByPtr(gop.key_ptr);
+        errdefer db.path_info.removeByPtr(gop.key_ptr);
 
         const file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
 
@@ -124,41 +133,48 @@ pub const Database = struct {
             .metadata = undefined,
         });
         gop.key_ptr.* = path_copy;
-        gop.value_ptr.* = file_id;
+        gop.value_ptr.* = .{ .id = file_id, .parent = parent_path };
 
         return file_id;
     }
 
-    fn registerIntermediateFolders(db: *Database, path: Wtf16) !void {
+    /// Returns the canonical path of the new file's parent directory.
+    fn registerIntermediateFolders(db: *Database, path: Wtf16) !?Wtf16 {
         const initial_file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
         errdefer {
             var file_id_tag: ?std.meta.Tag(network.FileId) = initial_file_id_tag;
             while (file_id_tag) |tag| : (file_id_tag = std.math.add(std.meta.Tag(network.FileId), tag, 1) catch null) {
+                if (tag == db.next_file_id) break;
                 const file_id: network.FileId = @enumFromInt(tag);
                 const sub_folder_path = db.known_folders.fetchRemove(file_id).?;
-                assert(db.file_id_map.remove(sub_folder_path.value));
+                assert(db.path_info.remove(sub_folder_path.value));
             }
             db.next_file_id = initial_file_id_tag;
         }
 
         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
         var it = Iterator.init(path.slice);
-        _ = it.last() orelse std.debug.panic("TODO empty file name", .{});
+        const last = it.last() orelse std.debug.panic("todo empty file name", .{});
 
-        while (it.previous()) |sub_folder| {
-            const sub_path: Wtf16 = .wtf16Cast(sub_folder.path);
+        var path_arena = db.path_arena.promote(db.allocator);
+        defer db.path_arena = path_arena.state;
+        const path_arena_allocator = path_arena.allocator();
 
-            const gop = try db.file_id_map.getOrPut(db.allocator, sub_path);
-            if (gop.found_existing) break;
-            errdefer db.file_id_map.removeByPtr(gop.key_ptr);
+        var parent_path: ?Wtf16 = first_known_path: while (it.previous()) |item| {
+            const sub_path: Wtf16 = .wtf16Cast(item.path);
+
+            const gop = try db.path_info.getOrPut(db.allocator, sub_path);
+            if (gop.found_existing) {
+                if (!db.known_folders.contains(gop.value_ptr.id)) return error.InvalidFolder;
+                break :first_known_path gop.key_ptr.*;
+            }
+            errdefer db.path_info.removeByPtr(gop.key_ptr);
 
             const file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
             const new_next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch return error.ExhaustedFileIds;
 
-            var path_arena = db.path_arena.promote(db.allocator);
-            defer db.path_arena = path_arena.state;
-            const sub_path_copy = try sub_path.dupe(path_arena.allocator());
-            errdefer path_arena.allocator().free(sub_path_copy.slice);
+            const sub_path_copy = try sub_path.dupe(path_arena_allocator);
+            errdefer path_arena_allocator.free(sub_path_copy.slice);
 
             try db.known_folders.ensureUnusedCapacity(db.allocator, 1);
             errdefer comptime unreachable;
@@ -167,8 +183,47 @@ pub const Database = struct {
             db.next_file_id = new_next_file_id;
             db.known_folders.putAssumeCapacityNoClobber(file_id, sub_path_copy);
             gop.key_ptr.* = sub_path_copy;
-            gop.value_ptr.* = file_id;
+            gop.value_ptr.* = .{ .id = file_id, .parent = undefined };
+        } else break :first_known_path null;
+        errdefer comptime unreachable;
+
+        {
+            var it2 = it;
+            while (it2.previous()) |item| {
+                const sub_path: Wtf16 = .wtf16Cast(item.path);
+                const path_info = db.path_info.get(sub_path) orelse std.debug.panic("discrepancy between local and remote folder path", .{});
+                assert(db.known_folders.contains(path_info.id));
+            }
         }
+
+        var it_func = if (parent_path == null) &Iterator.first else &Iterator.next;
+        while (it_func(&it)) |item| : (it_func = &Iterator.next) {
+            if (item.path.len == last.path.len) break;
+            const sub_path: Wtf16 = .wtf16Cast(item.path);
+            const path_info = db.path_info.getEntry(sub_path).?;
+            path_info.value_ptr.parent = parent_path;
+            parent_path = path_info.key_ptr.*;
+        }
+
+        return parent_path;
+    }
+
+    fn getReverseFileIdPath(db: *Database, file_id: network.FileId, buffer: []network.FileId, io: Io) ![]network.FileId {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        var list: std.ArrayList(network.FileId) = .initBuffer(buffer);
+        try list.appendBounded(file_id);
+
+        var path: ?Wtf16 = db.known_files.get(file_id).?.path;
+        path = db.path_info.get(path.?).?.parent;
+        while (path) |p| {
+            const path_info = db.path_info.get(p).?;
+            try list.appendBounded(path_info.id);
+            path = path_info.parent;
+        }
+
+        return list.items;
     }
 
     const CompareMetadataResult = union(enum) {
@@ -296,8 +351,8 @@ pub const Database = struct {
 
         // TODO delete folders
         const entry = db.known_files.getEntry(file_id) orelse return .unknown_file;
-        const file_id_map_entry = db.file_id_map.getEntry(entry.value_ptr.path).?;
-        assert(file_id_map_entry.value_ptr.* == file_id);
+        const path_info_entry = db.path_info.getEntry(entry.value_ptr.path).?;
+        assert(path_info_entry.value_ptr.id == file_id);
         switch (entry.value_ptr.state) {
             .synced, .unsynced => {},
         }
@@ -307,7 +362,7 @@ pub const Database = struct {
         // TODO maybe don't perform the delete right away, but just queue it
         if (db.sync_dir_io.deleteFile(io, path_wtf8.slice())) |_| {
             db.known_files.removeByPtr(entry.key_ptr);
-            db.file_id_map.removeByPtr(file_id_map_entry.key_ptr);
+            db.path_info.removeByPtr(path_info_entry.key_ptr);
             return .success;
         } else |err| {
             // TODO: set the file entry to some errored state
@@ -664,6 +719,7 @@ pub const TxData = union(enum) {
                     .data = if (host.db.newFile(path, io)) |file_id| .{ .file_id = file_id } else |err| switch (err) {
                         error.FileAlreadyExists => .file_already_exists,
                         error.ExhaustedFileIds => .exhausted_file_ids,
+                        error.InvalidFolder => std.debug.panic("TODO handle InvalidFolder error", .{}),
                         error.Canceled, error.OutOfMemory => |e| return e,
                     },
                 },
@@ -684,13 +740,21 @@ pub const TxData = union(enum) {
             const outgoing_tx_id: network.TransactionId = .invalid;
             switch (in_new_file.data) {
                 .file_id => |file_id| {
+                    var reverse_file_ids_buffer: [8]network.FileId = undefined; // TODO pick a bigger size
+                    const reversed_file_id_path = host.db.getReverseFileIdPath(file_id, &reverse_file_ids_buffer, io) catch |err| switch (err) {
+                        error.OutOfMemory => std.debug.panic("TODO path contains too many components", .{}),
+                        error.Canceled => |e| return e,
+                    };
+
                     const action: network.Action = .server_registered_new_file;
                     host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
                     host.deleteTransaction(tx_id, .outgoing, io);
 
                     try writer.sendMessageHeaderNewTxReply(outgoing_tx_id, peer_tx_id);
                     try writer.sendAction(action);
-                    try writer.sendFileId(file_id);
+                    for (reversed_file_id_path) |sub_file_id| {
+                        try writer.sendFileId(sub_file_id);
+                    }
                 },
                 .file_already_exists => {
                     const action: network.Action = .server_new_file_exists;

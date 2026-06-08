@@ -801,6 +801,8 @@ pub const Host = struct {
     pub const SendMessagesError = Io.Writer.Error || Io.Cancelable || wave.windows.SendFileError;
 
     fn sendMessages(host: *Host, writer: network.Writer, io: Io) SendMessagesError!void {
+        // TODO: Send an initial message containing protocol version, etc.
+        // TODO: Send a nonce value with each transaction
         while (true) {
             while (true) {
                 const state = host.db.host_state.load(.monotonic);
@@ -1155,7 +1157,20 @@ pub const TxData = union(enum) {
 
             switch (action) {
                 .server_registered_new_file => {
+                    const num_path_components = blk: {
+                        const Iterator = std.fs.path.ComponentIterator(.windows, u16);
+                        var it = Iterator.init(out_new_file.path.slice);
+                        var count: u64 = 0;
+                        while (it.next()) |_| count += 1;
+                        break :blk count;
+                    };
+                    assert(num_path_components > 0);
                     const file_id = try reader.receiveFileId();
+                    for (0..num_path_components - 1) |_| {
+                        // TODO dont discard
+                        _ = try reader.receiveFileId();
+                    }
+
                     host.debugLog("received file id {} for file {f}\n", .{ file_id, out_new_file.path.formatUtf8() });
                     try host.db.setNewFileId(out_new_file.path, file_id, io);
                     host.deleteTransaction(tx_id, .incoming, io);
