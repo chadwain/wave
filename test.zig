@@ -71,11 +71,11 @@ fn runCli(io: Io, cdb: *wave.client.Database, sdb: *wave.server.Database) !void 
         switch (commands.get(line) orelse continue) {
             .quit => break,
             .client_print_files => {
-                try cdb.debug.printKnownFiles(stdout, io);
+                try cdb.debug.printFileEntries(stdout, io);
                 try stdout.flush();
             },
             .client_print_sync_files => {
-                try cdb.debug.printFilesNeedingSync(stdout, io);
+                try cdb.debug.printFileEvents(stdout, io);
                 try stdout.flush();
             },
             .client_scan => {

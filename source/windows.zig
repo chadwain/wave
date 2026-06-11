@@ -53,28 +53,55 @@ pub const Wtf16 = struct {
         assert(std.unicode.wtf16LeToWtf8(&path.buffer, self.slice) == len);
         return path;
     }
+
+    // TODO: hash and eql functions don't agree on path normalization rules
+    // TODO: Unicode case mappings???
+
+    fn hash(self: Wtf16) u32 {
+        // TODO: more efficient hashing
+        var hasher = std.hash.Wyhash.init(0);
+        for (self.slice) |c| {
+            // TODO get a userspace implementation of RtlUpcaseUnicodeChar
+            const uppercase = w.ntdll.RtlUpcaseUnicodeChar(c);
+            std.hash.autoHash(&hasher, uppercase);
+        }
+        return @truncate(hasher.final());
+    }
+
+    fn eql(a: Wtf16, b: Wtf16) bool {
+        // TODO get a userspace implementation of RtlEqualUnicodeString
+        return w.ntdll.RtlEqualUnicodeString(&.init(a.slice), &.init(b.slice), .TRUE).toBool();
+    }
 };
 
 pub fn Win32RelativePathHashMap(comptime V: type) type {
     // TODO: hash and eql functions don't agree on path normalization rules
+    // TODO: Unicode case mappings???
     const Context = struct {
         pub fn hash(_: @This(), self: Wtf16) u32 {
-            // TODO: more efficient hashing
-            var hasher = std.hash.Wyhash.init(0);
-            for (self.slice) |c| {
-                // TODO get a userspace implementation of RtlUpcaseUnicodeChar
-                const uppercase = w.ntdll.RtlUpcaseUnicodeChar(c);
-                std.hash.autoHash(&hasher, uppercase);
-            }
-            return @truncate(hasher.final());
+            return self.hash();
         }
 
         pub fn eql(_: @This(), a: Wtf16, b: Wtf16) bool {
-            // TODO get a userspace implementation of RtlEqualUnicodeString
-            return w.ntdll.RtlEqualUnicodeString(&.init(a.slice), &.init(b.slice), .TRUE).toBool();
+            return Wtf16.eql(a, b);
         }
     };
     return std.HashMapUnmanaged(Wtf16, V, Context, std.hash_map.default_max_load_percentage);
+}
+
+pub fn Win32RelativePathArrayHashMap(comptime V: type) type {
+    // TODO: hash and eql functions don't agree on path normalization rules
+    // TODO: Unicode case mappings???
+    const Context = struct {
+        pub fn hash(_: @This(), self: Wtf16) u32 {
+            return self.hash();
+        }
+
+        pub fn eql(_: @This(), a: Wtf16, b: Wtf16, _: usize) bool {
+            return Wtf16.eql(a, b);
+        }
+    };
+    return std.ArrayHashMapUnmanaged(Wtf16, V, Context, true);
 }
 
 /// Opens a directory capable of async operations and being waited on.
@@ -234,6 +261,7 @@ pub fn sendFile(
             else => return w.unexpectedStatus(status),
         }
     }
+    // TODO: the file could have been modified by another thread; consider locking
     if (written != file_size) return error.Unexpected;
 }
 
@@ -276,5 +304,6 @@ pub fn receiveFile(
             else => return w.unexpectedStatus(status),
         }
     }
+    // TODO: the file could have been modified by another thread; consider locking
     if (read != file_size) return error.Unexpected;
 }

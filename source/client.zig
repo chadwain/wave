@@ -9,59 +9,234 @@ const wave = @import("wave.zig");
 const network = wave.network;
 const Wtf16 = wave.windows.Wtf16;
 const Win32RelativePathHashMap = wave.windows.Win32RelativePathHashMap;
+const Win32RelativePathArrayHashMap = wave.windows.Win32RelativePathArrayHashMap;
 
 const cpu_endian = @import("builtin").cpu.arch.endian();
 
 pub const Database = struct {
     sync_dir: w.HANDLE,
     sync_dir_io: Io.Dir,
-    allocator: Allocator,
-    mutex: Io.Mutex, // TODO: Compare with RwLock
     debug: Debug,
 
+    mutex: Io.Mutex, // TODO: Compare with RwLock
+
+    // Begin fields protected by mutex
+
+    allocator: Allocator,
     path_arena: std.heap.ArenaAllocator.State,
     scan_arena: std.heap.ArenaAllocator.State,
+    tree: Tree,
 
-    /// There should be an entry for every file in the sync directory, regardless of its status
-    known_files: Win32RelativePathHashMap(FileEntry),
-    new_files: Win32RelativePathHashMap(void),
-    updated_files: Win32RelativePathHashMap(FileUpdate), // TODO change to a key value type of `FileId`
+    // End fields protected by mutex
 
     // Database-Host synchronization fields
     alert: std.atomic.Value(Alert),
     host_state: std.atomic.Value(Host.State),
     out_path: Wtf16,
     out_file_id: network.FileId,
-    out_metadata: FileMetadata,
+    out_metadata: struct {
+        size: w.ULARGE_INTEGER,
+        hash: network.FileHash,
+    },
 
     pub const Alert = enum(u32) { off, on };
 
-    pub const FileMetadata = struct {
-        local_file_id: w.LARGE_INTEGER,
-        hash: network.FileHash,
-        modified_time: w.LARGE_INTEGER,
-        size: w.ULARGE_INTEGER,
-    };
+    /// A re-representation of the contents of the sync directory.
+    pub const Tree = struct {
+        files: Win32RelativePathHashMap(Info),
+        /// Applies to all files
+        parent: Win32RelativePathHashMap(?Wtf16),
+        /// Applies only to directories
+        children: Win32RelativePathHashMap(std.ArrayList(Wtf16)),
+        /// Applies only to regular files
+        meta: Win32RelativePathHashMap(Metadata),
+        /// Applies only to regular files
+        hash: Win32RelativePathHashMap(network.FileHash),
+        new_events: Win32RelativePathArrayHashMap(Event),
+        in_progress_events: Win32RelativePathArrayHashMap(Event),
 
-    pub const FileState = enum {
-        /// id is undefined
-        /// metadata.hash is undefined
-        new,
-        normal,
-        /// metadata is undefined
-        pending_deletion,
-        /// metadata is undefined
-        /// id is undefined
-        untracked,
-    };
+        fn deinit(tree: *Tree, allocator: Allocator) void {
+            var it = tree.children.valueIterator();
+            while (it.next()) |list| list.deinit(allocator);
 
-    pub const FileEntry = struct {
-        status: FileState,
-        metadata: FileMetadata,
-        id: network.FileId,
-    };
+            tree.files.deinit(allocator);
+            tree.parent.deinit(allocator);
+            tree.children.deinit(allocator);
+            tree.meta.deinit(allocator);
+            tree.hash.deinit(allocator);
+            tree.new_events.deinit(allocator);
+            tree.in_progress_events.deinit(allocator);
 
-    pub const FileUpdate = enum { modified, deleted };
+            tree.* = undefined;
+        }
+
+        pub const Info = struct {
+            directory: bool,
+            status: Status,
+            local_file_id: w.LARGE_INTEGER,
+            global_file_id: network.FileId,
+        };
+
+        pub const Status = enum {
+            /// A file which was previously untracked and is now known to exist.
+            ///
+            /// global_file_id is undefined
+            /// hash is undefined
+            new,
+            /// A file which is being tracked.
+            tracked,
+            /// A file which is being tracked, and is now known to be deleted from the filesystem.
+            /// Deleting this file from the server will remove it from the database, but
+            /// if the file is found once again, it may return to the "tracked" state instead.
+            ///
+            /// meta is undefined
+            /// hash is undefined
+            pending_deletion,
+            /// A file whose existence is known, but will not be synced to the server for one or more reasons.
+            ///
+            /// meta is undefined
+            /// global_file_id is undefined
+            /// hash is undefined
+            untracked,
+        };
+
+        pub const Metadata = struct {
+            modified_time: w.LARGE_INTEGER,
+            size: w.ULARGE_INTEGER,
+        };
+
+        pub const Event = enum {
+            new,
+            modified,
+            deleted,
+        };
+
+        fn addNewRegularFile(
+            tree: *Tree,
+            allocator: Allocator,
+            path: Wtf16,
+            parent: ?Wtf16,
+            local_file_id: w.LARGE_INTEGER,
+            meta: Metadata,
+        ) !void {
+            try tree.files.ensureUnusedCapacity(allocator, 1);
+            try tree.parent.ensureUnusedCapacity(allocator, 1);
+            try tree.meta.ensureUnusedCapacity(allocator, 1);
+            try tree.hash.ensureUnusedCapacity(allocator, 1);
+
+            try tree.new_events.putNoClobber(allocator, path, .new);
+            errdefer comptime unreachable;
+
+            const gop = tree.files.getOrPutAssumeCapacity(path);
+            if (gop.found_existing) std.debug.panic("TODO addNewRegularFile file already exists", .{});
+            gop.value_ptr.* = .{
+                .directory = false,
+                .status = .new,
+                .local_file_id = local_file_id,
+                .global_file_id = undefined,
+            };
+            tree.parent.putAssumeCapacityNoClobber(path, parent);
+            tree.meta.putAssumeCapacityNoClobber(path, meta);
+            tree.hash.putAssumeCapacityNoClobber(path, undefined);
+        }
+
+        fn updateNewRegularFile(
+            tree: *Tree,
+            path: Wtf16,
+            local_file_id: w.LARGE_INTEGER,
+            meta: Metadata,
+        ) void {
+            const info = tree.files.getPtr(path).?;
+            info.local_file_id = local_file_id;
+            tree.meta.getPtr(path).?.* = meta;
+        }
+
+        fn addUntrackedRegularFile(
+            tree: *Tree,
+            allocator: Allocator,
+            path: Wtf16,
+            parent: ?Wtf16,
+            local_file_id: w.LARGE_INTEGER,
+        ) !void {
+            try tree.files.ensureUnusedCapacity(allocator, 1);
+            try tree.parent.ensureUnusedCapacity(allocator, 1);
+            try tree.meta.ensureUnusedCapacity(allocator, 1);
+            try tree.hash.ensureUnusedCapacity(allocator, 1);
+
+            errdefer comptime unreachable;
+
+            const gop = tree.files.getOrPutAssumeCapacity(path);
+            if (gop.found_existing) std.debug.panic("TODO addUntrackedRegularFile file already exists", .{});
+            gop.value_ptr.* = .{
+                .directory = false,
+                .status = .untracked,
+                .local_file_id = local_file_id,
+                .global_file_id = undefined,
+            };
+            tree.parent.putAssumeCapacityNoClobber(path, parent);
+            tree.meta.putAssumeCapacityNoClobber(path, undefined);
+            tree.hash.putAssumeCapacityNoClobber(path, undefined);
+        }
+
+        fn changeUntrackedRegularFileToNew(
+            tree: *Tree,
+            allocator: Allocator,
+            path: Wtf16,
+            local_file_id: w.LARGE_INTEGER,
+            meta: Metadata,
+        ) !void {
+            const info = tree.files.getEntry(path).?;
+
+            assert(!tree.in_progress_events.contains(path));
+            try tree.new_events.putNoClobber(allocator, info.key_ptr.*, .new);
+            errdefer comptime unreachable;
+
+            info.value_ptr.status = .new;
+            info.value_ptr.local_file_id = local_file_id;
+            tree.meta.getPtr(path).?.* = meta;
+        }
+
+        fn updateTrackedRegularFile(
+            tree: *Tree,
+            allocator: Allocator,
+            path: Wtf16,
+            local_file_id: w.LARGE_INTEGER,
+            meta: Metadata,
+            hash: *const network.FileHash,
+        ) !void {
+            const info = tree.files.getEntry(path).?;
+            const meta_ptr = tree.meta.getPtr(path).?;
+            const hash_ptr = tree.hash.getPtr(path).?;
+
+            if (info.value_ptr.local_file_id == local_file_id and
+                meta_ptr.size == meta.size and
+                hash_ptr.eql(hash)) return;
+
+            if (tree.in_progress_events.contains(path)) std.debug.panic("TODO file was modified while having an event: {f}", .{path.formatUtf8()});
+            try tree.new_events.putNoClobber(allocator, info.key_ptr.*, .modified);
+            errdefer comptime unreachable;
+
+            info.value_ptr.local_file_id = local_file_id;
+            meta_ptr.* = meta;
+            hash_ptr.* = hash.*;
+        }
+
+        fn deleteTrackedRegularFile(
+            tree: *Tree,
+            allocator: Allocator,
+            path: Wtf16,
+        ) !void {
+            const info = tree.files.getEntry(path).?;
+
+            if (tree.in_progress_events.contains(path)) std.debug.panic("TODO file was deleted while having an event: {f}", .{path.formatUtf8()});
+            try tree.new_events.putNoClobber(allocator, info.key_ptr.*, .deleted);
+            errdefer comptime unreachable;
+
+            info.value_ptr.status = .pending_deletion;
+            tree.meta.getPtr(path).?.* = undefined;
+            tree.hash.getPtr(path).?.* = undefined;
+        }
+    };
 
     pub fn init(sync_dir_path: Wtf16, io: Io, allocator: Allocator) !Database {
         if (cpu_endian != .little) @compileError("TODO big endian");
@@ -87,16 +262,21 @@ pub const Database = struct {
         return .{
             .sync_dir = sync_dir,
             .sync_dir_io = sync_dir_io,
-            .allocator = allocator,
-            .mutex = .init,
             .debug = .{},
 
+            .mutex = .init,
+            .allocator = allocator,
             .path_arena = .{},
             .scan_arena = .{},
-
-            .known_files = .empty,
-            .new_files = .empty,
-            .updated_files = .empty,
+            .tree = .{
+                .files = .empty,
+                .parent = .empty,
+                .children = .empty,
+                .meta = .empty,
+                .hash = .empty,
+                .new_events = .empty,
+                .in_progress_events = .empty,
+            },
 
             .alert = .init(.off),
             .host_state = .init(.{}),
@@ -115,9 +295,7 @@ pub const Database = struct {
         var scan_arena = db.scan_arena.promote(db.allocator);
         scan_arena.deinit();
 
-        db.known_files.deinit(db.allocator);
-        db.new_files.deinit(db.allocator);
-        db.updated_files.deinit(db.allocator);
+        db.tree.deinit(db.allocator);
 
         db.* = undefined;
     }
@@ -134,7 +312,7 @@ pub const Database = struct {
             if (Io.Clock.Timestamp.now(io, .boot).compare(.gte, next_scan_time)) {
                 try scan.run(db, io);
                 try stderr.interface.writeAll("Scan complete\n");
-                try db.debug.printFilesNeedingSync(&stderr.interface, io);
+                try db.debug.printFileEvents(&stderr.interface, io);
                 try stderr.interface.flush();
                 next_scan_time = Io.Clock.Timestamp.now(io, clock).addDuration(max_wait_time);
                 continue;
@@ -144,7 +322,7 @@ pub const Database = struct {
                 continue;
             } else |err| switch (err) {
                 error.NoEvents => {},
-                error.Canceled => |e| return e,
+                error.OutOfMemory, error.Canceled => |e| return e,
             }
 
             db.alert.store(.off, .release);
@@ -152,75 +330,55 @@ pub const Database = struct {
         }
     }
 
-    fn sendHostEvents(db: *Database, io: Io) (error{NoEvents} || Io.Cancelable)!void {
-        const HostEventData = union(enum) {
-            new_file: struct {
-                path: Wtf16,
-                entry: FileEntry,
-            },
-            updated_file: struct {
-                path: Wtf16,
-                entry: FileEntry,
-                update: FileUpdate,
-            },
-        };
-
-        const host_event_data: HostEventData = blk: {
+    fn sendHostEvents(db: *Database, io: Io) (error{NoEvents} || Allocator.Error || Io.Cancelable)!void {
+        const host_event: Host.State.Event = blk: {
             // TODO no mutex
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
-            if (db.new_files.count() == 0 and db.updated_files.count() == 0) return error.NoEvents;
+            if (db.tree.new_events.count() == 0) return error.NoEvents;
+            try db.tree.in_progress_events.ensureUnusedCapacity(db.allocator, 1);
             db.acquireHostEvent() orelse return error.NoEvents;
             errdefer comptime unreachable;
 
-            if (db.new_files.count() != 0) {
-                var it = db.new_files.keyIterator();
-                const path = it.next().?;
-                const file_info = db.known_files.get(path.*).?;
-                defer db.new_files.removeByPtr(path);
-                break :blk .{ .new_file = .{ .path = path.*, .entry = file_info } };
-            } else if (db.updated_files.count() != 0) {
-                var it = db.updated_files.iterator();
-                const entry = it.next().?;
-                const file_info = db.known_files.get(entry.key_ptr.*).?;
-                defer db.updated_files.removeByPtr(entry.key_ptr);
-                break :blk .{ .updated_file = .{ .path = entry.key_ptr.*, .entry = file_info, .update = entry.value_ptr.* } };
-            } else unreachable;
-        };
-
-        errdefer comptime unreachable;
-        const host_event: Host.State.Event = blk: switch (host_event_data) {
-            .new_file => |new_file| {
-                switch (new_file.entry.status) {
-                    .new => {},
-                    .normal, .pending_deletion, .untracked => unreachable,
-                }
-                db.out_path = new_file.path;
-                break :blk .get_global_file_id;
-            },
-            .updated_file => |updated_file| switch (updated_file.update) {
+            const kv = db.tree.new_events.pop().?;
+            const info = db.tree.files.get(kv.key).?;
+            assert(!info.directory);
+            db.tree.in_progress_events.putAssumeCapacityNoClobber(kv.key, kv.value);
+            switch (kv.value) {
+                .new => {
+                    switch (info.status) {
+                        .new => {},
+                        .tracked, .pending_deletion, .untracked => unreachable,
+                    }
+                    db.out_path = kv.key;
+                    break :blk .get_global_file_id;
+                },
                 .modified => {
-                    switch (updated_file.entry.status) {
-                        .normal => {},
+                    switch (info.status) {
+                        .tracked => {},
                         .new, .untracked, .pending_deletion => unreachable,
                     }
-                    db.out_file_id = updated_file.entry.id;
-                    db.out_path = updated_file.path;
-                    db.out_metadata = updated_file.entry.metadata;
+                    db.out_file_id = info.global_file_id;
+                    db.out_path = kv.key;
+                    db.out_metadata = .{
+                        .size = db.tree.meta.get(kv.key).?.size,
+                        .hash = db.tree.hash.get(kv.key).?,
+                    };
                     break :blk .sync_file;
                 },
                 .deleted => {
-                    switch (updated_file.entry.status) {
+                    switch (info.status) {
                         .pending_deletion => {},
-                        .new, .normal, .untracked => unreachable,
+                        .new, .tracked, .untracked => unreachable,
                     }
-                    db.out_file_id = updated_file.entry.id;
-                    db.out_path = updated_file.path;
+                    db.out_file_id = info.global_file_id;
+                    db.out_path = kv.key;
                     break :blk .delete_file;
                 },
-            },
+            }
         };
+
         db.releaseHostEvent(host_event);
         io.futexWake(Host.State, &db.host_state.raw, 1);
     }
@@ -258,12 +416,14 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        const file_entry = db.known_files.getPtr(path) orelse
+        assert(db.tree.in_progress_events.fetchSwapRemove(path).?.value == .new);
+
+        const info = db.tree.files.getPtr(path) orelse
             std.debug.panic("received file id for unknown file: {f}", .{path.formatUtf8()});
         // TODO make sure this is actually the same file that the event was created for
-        switch (file_entry.status) {
+        switch (info.status) {
             .new => {},
-            .normal, .pending_deletion, .untracked => std.debug.panic("TODO: handle new file id for non-new file", .{}),
+            .tracked, .pending_deletion, .untracked => std.debug.panic("TODO: handle new file id for non-new file", .{}),
         }
 
         // TODO: create a Database event that will compute the hash later
@@ -283,12 +443,13 @@ pub const Database = struct {
             break :blk try computeFileHash(file, information.EndOfFile);
         };
 
-        try db.updated_files.put(db.allocator, path, .modified);
+        try db.tree.new_events.ensureUnusedCapacity(db.allocator, 1);
         errdefer comptime unreachable;
 
-        file_entry.metadata.hash = hash;
-        file_entry.status = .normal;
-        file_entry.id = global_file_id;
+        info.status = .tracked;
+        info.global_file_id = global_file_id;
+        db.tree.hash.getPtr(path).?.* = hash;
+        db.tree.new_events.putAssumeCapacityNoClobber(path, .modified);
         // TODO: send alert here?
     }
 
@@ -297,16 +458,17 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        const file_entry = db.known_files.getEntry(path) orelse
+        assert(db.tree.in_progress_events.fetchSwapRemove(path).?.value == .deleted);
+
+        const info = db.tree.files.getEntry(path) orelse
             std.debug.panic("received delete confirmation for unknown file: {f}", .{path.formatUtf8()});
         // TODO make sure this is actually the same file that the event was created for
-        switch (file_entry.value_ptr.status) {
+        switch (info.value_ptr.status) {
             .pending_deletion => {},
-            .new, .normal, .untracked => std.debug.panic("TODO: handle new file id for non-pending-delete file", .{}),
+            .new, .tracked, .untracked => std.debug.panic("TODO: handle new file id for non-pending-delete file", .{}),
         }
 
-        db.known_files.removeByPtr(file_entry.key_ptr);
-        if (db.updated_files.fetchRemove(path)) |_| std.debug.panic("TODO: a 2nd updated_files entry was found", .{});
+        db.tree.files.removeByPtr(info.key_ptr);
     }
 
     fn markFileAsSynced(db: *Database, path: Wtf16) void {
@@ -323,73 +485,80 @@ pub const Database = struct {
     }
 
     pub const Debug = struct {
-        pub fn printKnownFiles(debug: *Debug, writer: *Io.Writer, io: Io) !void {
+        pub fn printFileEntries(debug: *Debug, writer: *Io.Writer, io: Io) !void {
             const db: *Database = @alignCast(@fieldParentPtr("debug", debug));
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
             try writer.writeAll("Tracked files\n");
-            var it = db.known_files.iterator();
+            var it = db.tree.files.iterator();
             while (it.next()) |entry| {
                 switch (entry.value_ptr.status) {
-                    .new, .normal => {},
-                    .pending_deletion, .untracked => continue,
+                    .tracked => {},
+                    .new, .pending_deletion, .untracked => continue,
                 }
+                const meta = db.tree.meta.get(entry.key_ptr.*).?;
                 try writer.print(
-                    "{f}: hash({f}) modified({}) size({})\n",
+                    "{f}: modified({}) size({}) hash({?f})\n",
                     .{
                         entry.key_ptr.formatUtf8(),
-                        entry.value_ptr.metadata.hash,
-                        entry.value_ptr.metadata.modified_time,
-                        entry.value_ptr.metadata.size,
+                        meta.modified_time,
+                        meta.size,
+                        db.tree.hash.get(entry.key_ptr.*),
+                    },
+                );
+            }
+
+            try writer.writeAll("New files\n");
+            it = db.tree.files.iterator();
+            while (it.next()) |entry| {
+                switch (entry.value_ptr.status) {
+                    .new => {},
+                    .tracked, .pending_deletion, .untracked => continue,
+                }
+                const meta = db.tree.meta.get(entry.key_ptr.*).?;
+                try writer.print(
+                    "{f}: modified({}) size({})\n",
+                    .{
+                        entry.key_ptr.formatUtf8(),
+                        meta.modified_time,
+                        meta.size,
                     },
                 );
             }
 
             try writer.writeAll("\nUntracked files\n");
-            it = db.known_files.iterator();
+            it = db.tree.files.iterator();
             while (it.next()) |entry| {
                 switch (entry.value_ptr.status) {
-                    .new, .normal => continue,
+                    .new, .tracked => continue,
                     .pending_deletion, .untracked => {},
                 }
                 try writer.print("{f}\n", .{entry.key_ptr.formatUtf8()});
             }
+
+            try writer.writeAll("\n");
         }
 
-        pub fn printFilesNeedingSync(debug: *Debug, writer: *Io.Writer, io: Io) !void {
+        pub fn printFileEvents(debug: *Debug, writer: *Io.Writer, io: Io) !void {
             const db: *Database = @alignCast(@fieldParentPtr("debug", debug));
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
-            {
-                try writer.writeAll("Locally new files\n");
-                var it = db.new_files.iterator();
+            inline for (&[_]struct { Tree.Event, []const u8 }{
+                .{ .new, "Locally new files\n" },
+                .{ .modified, "Locally modified files\n" },
+                .{ .deleted, "Locally deleted files\n" },
+            }) |item| {
+                const status, const text = item;
+                try writer.writeAll(text);
+                var it = db.tree.new_events.iterator();
                 while (it.next()) |entry| {
+                    if (entry.value_ptr.* != status) continue;
                     try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()});
                 }
+                try writer.writeAll("\n");
             }
-            {
-                try writer.writeAll("\nLocally modified files\n");
-                var it = db.updated_files.iterator();
-                while (it.next()) |entry| {
-                    switch (entry.value_ptr.*) {
-                        .modified => try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()}),
-                        .deleted => continue,
-                    }
-                }
-            }
-            {
-                try writer.writeAll("\nLocally untracked/deleted files\n");
-                var it = db.updated_files.iterator();
-                while (it.next()) |entry| {
-                    switch (entry.value_ptr.*) {
-                        .deleted => try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()}),
-                        .modified => continue,
-                    }
-                }
-            }
-            try writer.writeAll("\n");
         }
     };
 };
@@ -401,24 +570,31 @@ const scan = struct {
         sub_path: std.ArrayList(w.WCHAR),
         component_delimeters: std.ArrayList(u16),
         open_dir_handles: std.ArrayList(w.HANDLE),
-        set_of_tracked_files: Win32RelativePathHashMap(Database.FileState),
+        parent_paths: std.ArrayList(?Wtf16),
+        set_of_tracked_files: SetOfTrackedFiles,
+
+        const SetOfTrackedFiles = Win32RelativePathHashMap(struct {
+            status: Database.Tree.Status,
+            already_seen: bool,
+        });
     };
 
     fn initContext(db: *const Database, arena: *std.heap.ArenaAllocator) !Context {
         const allocator = arena.allocator();
 
+        var parent_paths: std.ArrayList(?Wtf16) = .empty;
+        try parent_paths.append(allocator, null);
+
         var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
         try open_dir_handles.append(allocator, db.sync_dir);
 
-        var set_of_tracked_files: Win32RelativePathHashMap(Database.FileState) = .empty;
-        try set_of_tracked_files.ensureTotalCapacity(allocator, db.known_files.count());
-        var it = db.known_files.iterator();
+        var set_of_tracked_files: Context.SetOfTrackedFiles = .empty;
+        try set_of_tracked_files.ensureTotalCapacity(allocator, db.tree.files.count());
+        var it = db.tree.files.iterator();
         while (it.next()) |entry| {
+            if (entry.value_ptr.directory) continue;
             const status = entry.value_ptr.status;
-            switch (status) {
-                .new, .normal => set_of_tracked_files.putAssumeCapacityNoClobber(entry.key_ptr.*, status),
-                .pending_deletion, .untracked => {},
-            }
+            set_of_tracked_files.putAssumeCapacityNoClobber(entry.key_ptr.*, .{ .status = status, .already_seen = false });
         }
 
         return .{
@@ -427,6 +603,7 @@ const scan = struct {
             .sub_path = .empty,
             .component_delimeters = .empty,
             .open_dir_handles = open_dir_handles,
+            .parent_paths = parent_paths,
             .set_of_tracked_files = set_of_tracked_files,
         };
     }
@@ -486,8 +663,8 @@ const scan = struct {
             }
 
             const dir_path = dir_path_ptr.*;
-            dir_path_ptr.* = .wtf16Cast(&.{});
-            try enterDir(&ctx, dir_path);
+            dir_path_ptr.* = .{ .slice = &.{} };
+            try enterDir(&ctx, db, dir_path);
             try scanOneDirectory(db, &ctx);
         }
 
@@ -573,130 +750,127 @@ const scan = struct {
             try ctx.sub_path.appendSlice(allocator, name.slice);
             const path: Wtf16 = .wtf16Cast(ctx.sub_path.items);
 
-            try queueUpdateFileEvent(db, path, information, set_to_untracked);
-            _ = ctx.set_of_tracked_files.remove(path);
+            try processRegularFile(db, ctx, path, information, set_to_untracked);
         }
     }
 
-    fn enterDir(ctx: *Context, dir_path: Wtf16) !void {
+    fn enterDir(ctx: *Context, db: *Database, dir_path: Wtf16) !void {
+        const delimeter = comptime wtf16("\\");
         const allocator = ctx.arena.allocator();
-        try ctx.component_delimeters.append(allocator, @intCast(ctx.sub_path.items.len));
-        try ctx.sub_path.appendSlice(allocator, dir_path.slice);
-        try ctx.sub_path.appendSlice(allocator, comptime wtf16("\\"));
+        try ctx.component_delimeters.ensureTotalCapacity(allocator, 1);
+        try ctx.sub_path.ensureUnusedCapacity(allocator, dir_path.slice.len + delimeter.len);
+        try ctx.parent_paths.ensureUnusedCapacity(allocator, 1);
+        try ctx.open_dir_handles.ensureUnusedCapacity(allocator, 1);
+
+        ctx.component_delimeters.appendAssumeCapacity(@intCast(ctx.sub_path.items.len));
+        ctx.sub_path.appendSliceAssumeCapacity(dir_path.slice);
+        const parent_path_temp = ctx.sub_path.items;
+        ctx.sub_path.appendSliceAssumeCapacity(delimeter);
+
+        var path_arena = db.path_arena.promote(db.allocator);
+        defer db.path_arena = path_arena.state;
+        const key = db.tree.files.getKey(.wtf16Cast(parent_path_temp));
+        const parent_path = key orelse Wtf16.wtf16Cast(try path_arena.allocator().dupe(w.WCHAR, parent_path_temp));
+        errdefer if (key == null) path_arena.allocator().free(parent_path.slice);
+        ctx.parent_paths.appendAssumeCapacity(parent_path);
 
         const parent_dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
         const dir = try wave.windows.openDir(parent_dir, dir_path);
-        try ctx.open_dir_handles.append(allocator, dir);
+        errdefer comptime unreachable;
+        ctx.open_dir_handles.appendAssumeCapacity(dir);
     }
 
     fn exitDir(ctx: *Context) void {
         const component_delimeter_index = ctx.component_delimeters.pop().?;
         ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
+        _ = ctx.parent_paths.pop();
         const dir = ctx.open_dir_handles.pop().?;
         w.CloseHandle(dir);
     }
 
-    fn queueUpdateFileEvent(
+    fn processRegularFile(
         db: *Database,
+        ctx: *Context,
         path: Wtf16,
         information: *const NtQueryInformation,
         set_to_untracked: bool,
     ) !void {
+        const local_file_id = information.FileId;
         const size = std.math.cast(w.ULARGE_INTEGER, information.EndOfFile) orelse return error.Unexpected;
-
-        var metadata = Database.FileMetadata{
-            .local_file_id = information.FileId,
-            .hash = undefined,
+        const meta = Database.Tree.Metadata{
             .modified_time = information.ChangeTime,
             .size = size,
         };
 
-        const gop = try db.known_files.getOrPut(db.allocator, path);
+        const allocator = ctx.arena.allocator();
+        const gop = try ctx.set_of_tracked_files.getOrPut(allocator, path);
         if (gop.found_existing) {
+            if (gop.value_ptr.already_seen) std.debug.panic("TODO saw file more than once while scanning: {f}", .{path.formatUtf8()});
+            gop.value_ptr.already_seen = true;
+
             switch (gop.value_ptr.status) {
                 .new => {
-                    gop.value_ptr.metadata = metadata;
+                    if (set_to_untracked) std.debug.panic("TODO set a new file to untracked: {f}", .{path.formatUtf8()});
+                    db.tree.updateNewRegularFile(path, local_file_id, meta);
                 },
                 .untracked => {
                     if (set_to_untracked) return;
-
-                    try db.new_files.put(db.allocator, gop.key_ptr.*, {});
-                    errdefer comptime unreachable;
-
-                    gop.value_ptr.* = .{ .status = .new, .metadata = metadata, .id = undefined };
+                    try db.tree.changeUntrackedRegularFileToNew(db.allocator, path, local_file_id, meta);
+                    gop.value_ptr.status = .new;
                 },
                 .pending_deletion => {
                     if (set_to_untracked) return;
-
                     std.debug.panic("TODO: file was created while pending deletion: {f}", .{path.formatUtf8()});
                 },
-                .normal => {
+                .tracked => {
                     if (set_to_untracked) {
-                        try db.updated_files.put(db.allocator, gop.key_ptr.*, .deleted);
-                        errdefer comptime unreachable;
-
+                        try db.tree.deleteTrackedRegularFile(db.allocator, path);
                         gop.value_ptr.status = .pending_deletion;
-                        gop.value_ptr.metadata = undefined;
                     } else {
                         // TODO: mark the file's hash as stale, compute it later
-                        metadata.hash = blk: {
+                        const hash = blk: {
                             const file = try wave.windows.openFile(db.sync_dir, path, .read);
                             defer w.CloseHandle(file);
                             break :blk try computeFileHash(file, information.EndOfFile);
                         };
 
-                        if (gop.value_ptr.metadata.local_file_id == metadata.local_file_id and
-                            gop.value_ptr.metadata.size == metadata.size and
-                            gop.value_ptr.metadata.hash.eql(&metadata.hash)) return;
-
-                        try db.updated_files.put(db.allocator, gop.key_ptr.*, .modified);
-                        errdefer comptime unreachable;
-
-                        gop.value_ptr.metadata = metadata;
+                        try db.tree.updateTrackedRegularFile(db.allocator, path, local_file_id, meta, &hash);
                     }
                 },
             }
         } else {
-            errdefer db.known_files.removeByPtr(gop.key_ptr);
-
+            errdefer ctx.set_of_tracked_files.removeByPtr(gop.key_ptr);
             var path_arena = db.path_arena.promote(db.allocator);
             defer db.path_arena = path_arena.state;
             const file_path_allocator = path_arena.allocator();
 
-            gop.key_ptr.* = try path.dupe(file_path_allocator);
-            errdefer file_path_allocator.free(gop.key_ptr.slice);
+            const path_copy = try path.dupe(file_path_allocator);
+            errdefer file_path_allocator.free(path_copy.slice);
 
+            gop.key_ptr.* = path_copy;
+            gop.value_ptr.* = .{ .status = undefined, .already_seen = true };
+
+            const parent = ctx.parent_paths.getLast();
             if (set_to_untracked) {
-                gop.value_ptr.* = .{ .status = .untracked, .metadata = undefined, .id = undefined };
-                return;
+                try db.tree.addUntrackedRegularFile(db.allocator, path_copy, parent, local_file_id);
+                gop.value_ptr.status = .untracked;
+            } else {
+                try db.tree.addNewRegularFile(db.allocator, path_copy, parent, local_file_id, meta);
+                gop.value_ptr.status = .new;
             }
-
-            try db.new_files.put(db.allocator, gop.key_ptr.*, {});
-            errdefer comptime unreachable;
-
-            gop.value_ptr.* = .{ .status = .new, .metadata = metadata, .id = undefined };
         }
     }
 
     fn deleteFiles(db: *Database, ctx: *Context) !void {
-        try db.updated_files.ensureUnusedCapacity(db.allocator, ctx.set_of_tracked_files.count());
-        errdefer comptime unreachable;
-
         var it = ctx.set_of_tracked_files.iterator();
-        while (it.next()) |file| {
-            const path = file.key_ptr.*;
-            switch (file.value_ptr.*) {
-                .new => {
-                    assert(db.known_files.remove(path));
-                    assert(db.new_files.remove(path));
-                },
-                .normal => {
-                    const file_entry = db.known_files.getPtr(path).?;
-                    file_entry.status = .pending_deletion;
-                    file_entry.metadata = undefined;
-                    db.updated_files.putAssumeCapacity(path, .deleted);
-                },
-                .pending_deletion, .untracked => unreachable,
+        while (it.next()) |entry| {
+            if (entry.value_ptr.already_seen) continue;
+            const path = entry.key_ptr.*;
+            switch (entry.value_ptr.status) {
+                .new => std.debug.panic("TODO delete a new file: {f}", .{path.formatUtf8()}),
+                .tracked => try db.tree.deleteTrackedRegularFile(db.allocator, path),
+                .pending_deletion => {},
+                .untracked => std.debug.panic("TODO delete and untracked file: {f}", .{path.formatUtf8()}),
             }
         }
     }
@@ -718,6 +892,7 @@ fn computeFileHash(file: w.HANDLE, file_size: w.LARGE_INTEGER) !network.FileHash
             else => return w.unexpectedStatus(status),
         }
     }
+    // TODO: the file could have been modified by another thread, making this assertion false; consider locking
     assert(written == file_size);
 
     var result: network.FileHash = undefined;
