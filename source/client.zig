@@ -52,7 +52,9 @@ pub const Database = struct {
         meta: Win32RelativePathHashMap(Metadata),
         /// Applies only to regular files
         hash: Win32RelativePathHashMap(network.FileHash),
+        // TODO this should have `network.FileId` as a key
         new_events: Win32RelativePathArrayHashMap(Event),
+        // TODO this should have `network.FileId` as a key
         in_progress_events: Win32RelativePathArrayHashMap(Event),
 
         fn deinit(tree: *Tree, allocator: Allocator) void {
@@ -450,7 +452,8 @@ pub const Database = struct {
         info.global_file_id = global_file_id;
         db.tree.hash.getPtr(path).?.* = hash;
         db.tree.new_events.putAssumeCapacityNoClobber(path, .modified);
-        // TODO: send alert here?
+
+        db.sendAlert(io);
     }
 
     // called from Host
@@ -471,9 +474,12 @@ pub const Database = struct {
         db.tree.files.removeByPtr(info.key_ptr);
     }
 
-    fn markFileAsSynced(db: *Database, path: Wtf16) void {
-        // TODO do something here
-        _ = .{ db, path };
+    // called from Host
+    fn markFileAsSynced(db: *Database, path: Wtf16, io: Io) !void {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        assert(db.tree.in_progress_events.fetchSwapRemove(path).?.value == .modified);
     }
 
     fn openFileReadOnly(db: *const Database, path: Wtf16) !w.HANDLE {
@@ -546,18 +552,26 @@ pub const Database = struct {
             defer db.mutex.unlock(io);
 
             inline for (&[_]struct { Tree.Event, []const u8 }{
-                .{ .new, "Locally new files\n" },
-                .{ .modified, "Locally modified files\n" },
-                .{ .deleted, "Locally deleted files\n" },
+                .{ .new, "Locally new files:\n" },
+                .{ .modified, "Locally modified files:\n" },
+                .{ .deleted, "Locally deleted files:\n" },
             }) |item| {
                 const status, const text = item;
                 try writer.writeAll(text);
-                var it = db.tree.new_events.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.* != status) continue;
-                    try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()});
+                {
+                    var it = db.tree.new_events.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.value_ptr.* != status) continue;
+                        try writer.print("\t{f}\n", .{entry.key_ptr.formatUtf8()});
+                    }
                 }
-                try writer.writeAll("\n");
+                {
+                    var it = db.tree.in_progress_events.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.value_ptr.* != status) continue;
+                        try writer.print("\t{f} (P)\n", .{entry.key_ptr.formatUtf8()});
+                    }
+                }
             }
         }
     };
@@ -1390,7 +1404,7 @@ pub const TxData = union(enum) {
     pub const OutFileContents = struct {
         state: State,
         file_id: network.FileId,
-        path: Wtf16,
+        path: Wtf16, // TODO: this field shouldn't be needed
         size: w.ULARGE_INTEGER,
         hash: network.FileHash,
 
@@ -1491,11 +1505,11 @@ pub const TxData = union(enum) {
         ) !void {
             switch (action) {
                 .transfer_file_success => {
-                    host.db.markFileAsSynced(out_file_contents.path);
+                    try host.db.markFileAsSynced(out_file_contents.path, io);
                 },
                 .transfer_file_failure => {
                     // TODO mark file as failed to sync
-                    host.db.markFileAsSynced(out_file_contents.path);
+                    try host.db.markFileAsSynced(out_file_contents.path, io);
                 },
                 else => return error.InvalidAction,
             }

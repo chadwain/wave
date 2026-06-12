@@ -42,7 +42,28 @@ fn runCli(io: Io, cdb: *wave.client.Database, sdb: *wave.server.Database) !void 
     var stdout_file_writer = Io.File.stdout().writer(io, &.{});
     const stdout = &stdout_file_writer.interface;
 
-    print("s - scan, a - print all files, n - print files needing sync, sa - print all files/folders (server), q - quit\n", .{});
+    const Command = enum {
+        quit,
+        client_print_files,
+        client_print_file_events,
+        client_scan,
+        server_print_files_folders,
+    };
+    const commands = std.StaticStringMap(Command).initComptime(.{
+        .{ "q", Command.quit },
+        .{ "a", Command.client_print_files },
+        .{ "e", Command.client_print_file_events },
+        .{ "s", Command.client_scan },
+        .{ "sa", Command.server_print_files_folders },
+    });
+
+    print(comptime blk: {
+        var msg: []const u8 = "";
+        for (commands.keys(), commands.values(), 0..) |k, v, i| {
+            msg = msg ++ k ++ " - " ++ @tagName(v) ++ (if (i != commands.kvs.len - 1) ", " else "\n");
+        }
+        break :blk msg;
+    }, .{});
     while (true) {
         var line: []const u8 = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.ReadFailed, error.EndOfStream => |e| return e,
@@ -54,27 +75,13 @@ fn runCli(io: Io, cdb: *wave.client.Database, sdb: *wave.server.Database) !void 
         reader.toss(1);
         line = std.mem.trimEnd(u8, line, "\r");
 
-        const Command = enum {
-            quit,
-            client_print_files,
-            client_print_sync_files,
-            client_scan,
-            server_print_files_folders,
-        };
-        const commands = std.StaticStringMap(Command).initComptime(.{
-            .{ "q", Command.quit },
-            .{ "a", Command.client_print_files },
-            .{ "n", Command.client_print_sync_files },
-            .{ "s", Command.client_scan },
-            .{ "sa", Command.server_print_files_folders },
-        });
         switch (commands.get(line) orelse continue) {
             .quit => break,
             .client_print_files => {
                 try cdb.debug.printFileEntries(stdout, io);
                 try stdout.flush();
             },
-            .client_print_sync_files => {
+            .client_print_file_events => {
                 try cdb.debug.printFileEvents(stdout, io);
                 try stdout.flush();
             },
