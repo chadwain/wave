@@ -84,7 +84,7 @@ fn runCli(io: Io, cdb: *wave.client.Database, sdb: *wave.server.Database) !void 
                 try stdout.flush();
             },
             .server_print_files_folders => {
-                try sdb.debug.printKnownFilesAndFolders(stdout, io);
+                try sdb.debug.printFileEntries(stdout, io);
                 try stdout.flush();
             },
         }

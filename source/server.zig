@@ -19,12 +19,11 @@ pub const Database = struct {
     mutex: Io.Mutex, // TODO: Compare with RwLock
     allocator: Allocator,
     path_arena: std.heap.ArenaAllocator.State,
-    // works for both files and folders
-    // look in either known_files or known_folders to determine the file type
+
     path_info: Win32RelativePathHashMap(PathInfo),
     next_file_id: ?std.meta.Tag(network.FileId),
-    known_files: std.AutoHashMapUnmanaged(network.FileId, FileEntry),
-    known_folders: std.AutoHashMapUnmanaged(network.FileId, Wtf16),
+    files: std.AutoHashMapUnmanaged(network.FileId, FileInfo),
+    regular_file_info: std.AutoHashMapUnmanaged(network.FileId, RegularFileEntry),
 
     host_state: std.atomic.Value(Host.State),
 
@@ -36,19 +35,19 @@ pub const Database = struct {
         parent: ?Wtf16,
     };
 
-    pub const FileMetadata = struct {
+    pub const FileInfo = struct {
+        directory: bool,
+        path: Wtf16,
+    };
+
+    pub const RegularFileEntry = struct {
+        status: Status,
         local_file_id: w.LARGE_INTEGER,
         hash: network.FileHash,
         modified_time: w.LARGE_INTEGER,
         size: w.ULARGE_INTEGER,
-    };
 
-    pub const FileState = enum { unsynced, synced };
-
-    pub const FileEntry = struct {
-        path: Wtf16,
-        state: FileState,
-        metadata: FileMetadata,
+        pub const Status = enum { unsynced, synced };
     };
 
     pub fn init(sync_dir_path: Wtf16, io: Io, allocator: Allocator) !Database {
@@ -81,8 +80,8 @@ pub const Database = struct {
             .path_arena = .{},
             .path_info = .empty,
             .next_file_id = 1,
-            .known_files = .empty,
-            .known_folders = .empty,
+            .files = .empty,
+            .regular_file_info = .empty,
 
             .host_state = .init(.{}),
 
@@ -98,8 +97,8 @@ pub const Database = struct {
         path_arena.deinit();
 
         db.path_info.deinit(db.allocator);
-        db.known_files.deinit(db.allocator);
-        db.known_folders.deinit(db.allocator);
+        db.files.deinit(db.allocator);
+        db.regular_file_info.deinit(db.allocator);
 
         db.* = undefined;
     }
@@ -119,18 +118,26 @@ pub const Database = struct {
 
         var path_arena = db.path_arena.promote(db.allocator);
         defer db.path_arena = path_arena.state;
-        const path_copy = try path.dupe(path_arena.allocator());
-        errdefer path_arena.allocator().free(path_copy.slice);
+        const path_allocator = path_arena.allocator();
+        const path_copy = try path.dupe(path_allocator);
+        errdefer path_allocator.free(path_copy.slice);
 
-        try db.known_files.ensureUnusedCapacity(db.allocator, 1);
+        try db.files.ensureUnusedCapacity(db.allocator, 1);
+        try db.regular_file_info.ensureUnusedCapacity(db.allocator, 1);
         errdefer comptime unreachable;
 
         const file_id: network.FileId = @enumFromInt(file_id_tag);
         db.next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch null;
-        db.known_files.putAssumeCapacityNoClobber(file_id, .{
+        db.files.putAssumeCapacityNoClobber(file_id, .{
+            .directory = false,
             .path = path_copy,
-            .state = .unsynced,
-            .metadata = undefined,
+        });
+        db.regular_file_info.putAssumeCapacityNoClobber(file_id, .{
+            .status = .unsynced,
+            .local_file_id = undefined,
+            .hash = undefined,
+            .modified_time = undefined,
+            .size = undefined,
         });
         gop.key_ptr.* = path_copy;
         gop.value_ptr.* = .{ .id = file_id, .parent = parent_path };
@@ -146,8 +153,11 @@ pub const Database = struct {
             while (file_id_tag) |tag| : (file_id_tag = std.math.add(std.meta.Tag(network.FileId), tag, 1) catch null) {
                 if (tag == db.next_file_id) break;
                 const file_id: network.FileId = @enumFromInt(tag);
-                const sub_folder_path = db.known_folders.fetchRemove(file_id).?;
-                assert(db.path_info.remove(sub_folder_path.value));
+                const info = db.files.fetchRemove(file_id).?;
+                if (!info.value.directory) {
+                    assert(db.regular_file_info.remove(file_id));
+                }
+                assert(db.path_info.remove(info.value.path));
             }
             db.next_file_id = initial_file_id_tag;
         }
@@ -170,7 +180,7 @@ pub const Database = struct {
 
             const gop = try db.path_info.getOrPut(db.allocator, sub_path);
             if (gop.found_existing) {
-                if (!db.known_folders.contains(gop.value_ptr.id)) return error.InvalidFolder;
+                if (!db.files.get(gop.value_ptr.id).?.directory) return error.InvalidFolder;
                 break :first_known_path gop.key_ptr.*;
             }
             errdefer db.path_info.removeByPtr(gop.key_ptr);
@@ -181,12 +191,15 @@ pub const Database = struct {
             const sub_path_copy = try sub_path.dupe(path_arena_allocator);
             errdefer path_arena_allocator.free(sub_path_copy.slice);
 
-            try db.known_folders.ensureUnusedCapacity(db.allocator, 1);
+            try db.files.ensureUnusedCapacity(db.allocator, 1);
             errdefer comptime unreachable;
 
             const file_id: network.FileId = @enumFromInt(file_id_tag);
             db.next_file_id = new_next_file_id;
-            db.known_folders.putAssumeCapacityNoClobber(file_id, sub_path_copy);
+            db.files.putAssumeCapacityNoClobber(file_id, .{
+                .directory = true,
+                .path = sub_path_copy,
+            });
             gop.key_ptr.* = sub_path_copy;
             gop.value_ptr.* = .{ .id = file_id, .parent = undefined };
         } else break :first_known_path null;
@@ -199,7 +212,7 @@ pub const Database = struct {
 
                 const sub_path: Wtf16 = .wtf16Cast(item.path);
                 const path_info = db.path_info.get(sub_path) orelse std.debug.panic("discrepancy between local and remote folder path", .{});
-                assert(db.known_folders.contains(path_info.id));
+                assert(db.files.get(path_info.id).?.directory);
             }
         }
 
@@ -222,8 +235,9 @@ pub const Database = struct {
         var list: std.ArrayList(network.FileId) = .initBuffer(buffer);
         list.appendBounded(file_id) catch unreachable;
 
-        var path: ?Wtf16 = db.known_files.get(file_id).?.path;
-        path = db.path_info.get(path.?).?.parent;
+        // TODO Store the parent file id in `db.files`
+        const file_info = db.files.get(file_id) orelse std.debug.panic("TODO file not found", .{});
+        var path = db.path_info.get(file_info.path).?.parent;
         while (path) |p| {
             const path_info = db.path_info.get(p).?;
             list.appendBounded(path_info.id) catch unreachable;
@@ -242,6 +256,7 @@ pub const Database = struct {
             path: Wtf16,
         },
         file_doesnt_exist,
+        is_a_directory,
     };
 
     fn compareMetadata(
@@ -252,17 +267,19 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        const entry = db.known_files.getPtr(metadata.file_id) orelse return .file_doesnt_exist;
-        switch (entry.state) {
-            .unsynced => return .{ .file_is_uninitialized = .{ .path = entry.path } },
+        const info = db.files.getPtr(metadata.file_id) orelse return .file_doesnt_exist;
+        if (info.directory) return .is_a_directory;
+        const regular_info = db.regular_file_info.getPtr(metadata.file_id).?;
+        switch (regular_info.status) {
+            .unsynced => return .{ .file_is_uninitialized = .{ .path = info.path } },
             .synced => {},
         }
         const equals =
-            entry.metadata.size == metadata.file_size and
-            std.mem.eql(u8, &entry.metadata.hash.blake3, &metadata.hash.blake3);
+            regular_info.size == metadata.file_size and
+            regular_info.hash.eql(&metadata.hash);
 
         return .{ .file_exists = .{
-            .path = entry.path,
+            .path = info.path,
             .comparison = if (equals) .equals else .differs,
         } };
     }
@@ -302,6 +319,12 @@ pub const Database = struct {
         hash: *const network.FileHash,
         file_size: w.LARGE_INTEGER,
     ) !void {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        const file_info = db.files.get(file_id) orelse std.debug.panic("TODO file not found", .{});
+        if (file_info.directory) std.debug.panic("TODO directory", .{});
+
         const basic_information = blk: {
             var iosb: w.IO_STATUS_BLOCK = undefined;
             var information: w.FILE.BASIC_INFORMATION = undefined;
@@ -333,17 +356,13 @@ pub const Database = struct {
             }
         };
 
-        try db.mutex.lock(io);
-        defer db.mutex.unlock(io);
-
-        const entry = db.known_files.getPtr(file_id).?;
-        entry.metadata = .{
+        db.regular_file_info.getPtr(file_id).?.* = .{
+            .status = .synced,
             .local_file_id = internal_information.IndexNumber,
             .hash = hash.*,
             .modified_time = basic_information.ChangeTime,
             .size = @intCast(file_size),
         };
-        entry.state = .synced;
     }
 
     const DeleteGlobalFileResult = union(enum) {
@@ -356,19 +375,22 @@ pub const Database = struct {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
+        const file_info = db.files.getEntry(file_id) orelse return .unknown_file;
         // TODO delete folders
-        const entry = db.known_files.getEntry(file_id) orelse return .unknown_file;
-        const path_info_entry = db.path_info.getEntry(entry.value_ptr.path).?;
+        if (file_info.value_ptr.directory) std.debug.panic("TODO", .{});
+        const regular_info = db.regular_file_info.getEntry(file_id).?;
+        const path_info_entry = db.path_info.getEntry(file_info.value_ptr.path).?;
         assert(path_info_entry.value_ptr.id == file_id);
-        switch (entry.value_ptr.state) {
+        switch (regular_info.value_ptr.status) {
             .synced, .unsynced => {},
         }
 
         // TODO janky, use NT functions
-        const path_wtf8 = try entry.value_ptr.path.toWtf8Path();
+        const path_wtf8 = try file_info.value_ptr.path.toWtf8Path();
         // TODO maybe don't perform the delete right away, but just queue it
         if (db.sync_dir_io.deleteFile(io, path_wtf8.slice())) |_| {
-            db.known_files.removeByPtr(entry.key_ptr);
+            db.files.removeByPtr(file_info.key_ptr);
+            db.regular_file_info.removeByPtr(regular_info.key_ptr);
             db.path_info.removeByPtr(path_info_entry.key_ptr);
             return .success;
         } else |err| {
@@ -379,30 +401,19 @@ pub const Database = struct {
     }
 
     pub const Debug = struct {
-        pub fn printKnownFilesAndFolders(debug: *Debug, writer: *Io.Writer, io: Io) !void {
+        pub fn printFileEntries(debug: *Debug, writer: *Io.Writer, io: Io) !void {
             const db: *Database = @alignCast(@fieldParentPtr("debug", debug));
             try db.mutex.lock(io);
             defer db.mutex.unlock(io);
 
             try writer.writeAll("Tracked files\n");
-            var it = db.known_files.iterator();
+            var it = db.files.iterator();
             while (it.next()) |entry| {
                 try writer.print(
                     "{}: {f}\n",
                     .{ @intFromEnum(entry.key_ptr.*), entry.value_ptr.path.formatUtf8() },
                 );
             }
-
-            try writer.writeAll("\nTracked folders\n");
-            var it2 = db.known_folders.iterator();
-            while (it2.next()) |entry| {
-                try writer.print(
-                    "{}: {f}\n",
-                    .{ @intFromEnum(entry.key_ptr.*), entry.value_ptr.formatUtf8() },
-                );
-            }
-
-            try writer.writeAll("\n");
         }
     };
 };
@@ -814,7 +825,7 @@ pub const TxData = union(enum) {
                     },
                 },
                 .file_is_uninitialized => |res| .{ res.path, .accept },
-                .file_doesnt_exist => std.debug.panic("TODO", .{}),
+                .file_doesnt_exist, .is_a_directory => std.debug.panic("TODO", .{}),
             };
             const data: TxData = .{
                 .in_file_contents = .{
