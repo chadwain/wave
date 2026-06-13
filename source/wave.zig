@@ -9,3 +9,9 @@ pub const PathComponentCount = u8;
 /// The maximum number of components in a file/folder path that will be recognized.
 /// If a path has more components than this, the file/folder will not be tracked.
 pub const max_path_components: PathComponentCount = @import("std").math.maxInt(PathComponentCount);
+
+pub fn print(message: []const u8) void {
+    @import("std").debug.print("{s}\n", .{message});
+}
+
+pub const printf = @import("std").debug.print;

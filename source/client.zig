@@ -7,6 +7,8 @@ const Io = std.Io;
 
 const wave = @import("wave.zig");
 const network = wave.network;
+const print = wave.print;
+const printf = wave.printf;
 const Wtf16 = wave.windows.Wtf16;
 const Win32RelativePathHashMap = wave.windows.Win32RelativePathHashMap;
 const Win32RelativePathArrayHashMap = wave.windows.Win32RelativePathArrayHashMap;
@@ -34,6 +36,7 @@ pub const Database = struct {
     host_state: std.atomic.Value(Host.State),
     out_path: Wtf16,
     out_file_id: network.FileId,
+    out_file_kind: network.FileKind,
     out_metadata: struct {
         size: w.ULARGE_INTEGER,
         hash: network.FileHash,
@@ -47,7 +50,7 @@ pub const Database = struct {
         /// Applies to all files
         parent: Win32RelativePathHashMap(?Wtf16),
         /// Applies only to directories
-        children: Win32RelativePathHashMap(std.ArrayList(Wtf16)),
+        children: Win32RelativePathHashMap(Win32RelativePathHashMap(void)),
         /// Applies only to regular files
         meta: Win32RelativePathHashMap(Metadata),
         /// Applies only to regular files
@@ -113,36 +116,67 @@ pub const Database = struct {
             deleted,
         };
 
-        fn addNewRegularFile(
+        fn addFile(
             tree: *Tree,
+            comptime directory: bool,
+            comptime status: Status,
             allocator: Allocator,
             path: Wtf16,
             parent: ?Wtf16,
             local_file_id: w.LARGE_INTEGER,
-            meta: Metadata,
+            meta: switch (status) {
+                .new => Metadata,
+                .untracked => void,
+                .tracked, .pending_deletion => unreachable,
+            },
         ) !void {
             try tree.files.ensureUnusedCapacity(allocator, 1);
             try tree.parent.ensureUnusedCapacity(allocator, 1);
             try tree.meta.ensureUnusedCapacity(allocator, 1);
-            try tree.hash.ensureUnusedCapacity(allocator, 1);
+            switch (directory) {
+                false => try tree.hash.ensureUnusedCapacity(allocator, 1),
+                true => try tree.children.ensureUnusedCapacity(allocator, 1),
+            }
+            const parent_children = if (parent) |p| blk: {
+                const ptr = tree.children.getPtr(p).?;
+                try ptr.ensureUnusedCapacity(allocator, 1);
+                break :blk ptr;
+            } else null;
 
-            try tree.new_events.putNoClobber(allocator, path, .new);
+            switch (status) {
+                .new => try tree.new_events.ensureUnusedCapacity(allocator, 1),
+                .untracked => {},
+                .tracked, .pending_deletion => comptime unreachable,
+            }
             errdefer comptime unreachable;
 
             const gop = tree.files.getOrPutAssumeCapacity(path);
-            if (gop.found_existing) std.debug.panic("TODO addNewRegularFile file already exists", .{});
+            if (gop.found_existing) std.debug.panic("TODO addFile file already exists", .{});
             gop.value_ptr.* = .{
-                .directory = false,
-                .status = .new,
+                .directory = directory,
+                .status = status,
                 .local_file_id = local_file_id,
                 .global_file_id = undefined,
             };
             tree.parent.putAssumeCapacityNoClobber(path, parent);
-            tree.meta.putAssumeCapacityNoClobber(path, meta);
-            tree.hash.putAssumeCapacityNoClobber(path, undefined);
+            tree.meta.putAssumeCapacityNoClobber(path, switch (status) {
+                .new => meta,
+                .untracked => undefined,
+                .tracked, .pending_deletion => unreachable,
+            });
+            switch (directory) {
+                false => tree.hash.putAssumeCapacityNoClobber(path, undefined),
+                true => tree.children.putAssumeCapacityNoClobber(path, .empty),
+            }
+            if (parent_children) |pc| pc.putAssumeCapacityNoClobber(path, {});
+            switch (status) {
+                .new => tree.new_events.putAssumeCapacityNoClobber(path, .new),
+                .untracked => {},
+                .tracked, .pending_deletion => comptime unreachable,
+            }
         }
 
-        fn updateNewRegularFile(
+        fn updateNewFile(
             tree: *Tree,
             path: Wtf16,
             local_file_id: w.LARGE_INTEGER,
@@ -153,34 +187,7 @@ pub const Database = struct {
             tree.meta.getPtr(path).?.* = meta;
         }
 
-        fn addUntrackedRegularFile(
-            tree: *Tree,
-            allocator: Allocator,
-            path: Wtf16,
-            parent: ?Wtf16,
-            local_file_id: w.LARGE_INTEGER,
-        ) !void {
-            try tree.files.ensureUnusedCapacity(allocator, 1);
-            try tree.parent.ensureUnusedCapacity(allocator, 1);
-            try tree.meta.ensureUnusedCapacity(allocator, 1);
-            try tree.hash.ensureUnusedCapacity(allocator, 1);
-
-            errdefer comptime unreachable;
-
-            const gop = tree.files.getOrPutAssumeCapacity(path);
-            if (gop.found_existing) std.debug.panic("TODO addUntrackedRegularFile file already exists", .{});
-            gop.value_ptr.* = .{
-                .directory = false,
-                .status = .untracked,
-                .local_file_id = local_file_id,
-                .global_file_id = undefined,
-            };
-            tree.parent.putAssumeCapacityNoClobber(path, parent);
-            tree.meta.putAssumeCapacityNoClobber(path, undefined);
-            tree.hash.putAssumeCapacityNoClobber(path, undefined);
-        }
-
-        fn changeUntrackedRegularFileToNew(
+        fn changeUntrackedFileToNew(
             tree: *Tree,
             allocator: Allocator,
             path: Wtf16,
@@ -221,6 +228,17 @@ pub const Database = struct {
             info.value_ptr.local_file_id = local_file_id;
             meta_ptr.* = meta;
             hash_ptr.* = hash.*;
+        }
+
+        fn updateTrackedDirectoryFile(
+            tree: *Tree,
+            path: Wtf16,
+            local_file_id: w.LARGE_INTEGER,
+            meta: Metadata,
+        ) void {
+            const info = tree.files.getPtr(path).?;
+            info.local_file_id = local_file_id;
+            tree.meta.getPtr(path).?.* = meta;
         }
 
         fn deleteTrackedRegularFile(
@@ -284,6 +302,7 @@ pub const Database = struct {
             .host_state = .init(.{}),
             .out_path = undefined,
             .out_file_id = undefined,
+            .out_file_kind = undefined,
             .out_metadata = undefined,
         };
     }
@@ -303,6 +322,7 @@ pub const Database = struct {
     }
 
     pub fn run(db: *Database, io: Io) !void {
+        std.debug.print("client db running on thread {}\n", .{std.os.windows.GetCurrentThreadId()});
         var stderr = Io.File.stderr().writer(io, &.{});
 
         const clock: Io.Clock = .boot;
@@ -345,7 +365,6 @@ pub const Database = struct {
 
             const kv = db.tree.new_events.pop().?;
             const info = db.tree.files.get(kv.key).?;
-            assert(!info.directory);
             db.tree.in_progress_events.putAssumeCapacityNoClobber(kv.key, kv.value);
             switch (kv.value) {
                 .new => {
@@ -354,6 +373,7 @@ pub const Database = struct {
                         .tracked, .pending_deletion, .untracked => unreachable,
                     }
                     db.out_path = kv.key;
+                    db.out_file_kind = if (info.directory) .directory else .regular;
                     break :blk .get_global_file_id;
                 },
                 .modified => {
@@ -428,32 +448,37 @@ pub const Database = struct {
             .tracked, .pending_deletion, .untracked => std.debug.panic("TODO: handle new file id for non-new file", .{}),
         }
 
-        // TODO: create a Database event that will compute the hash later
-        const hash = blk: {
-            const file = try wave.windows.openFile(db.sync_dir, path, .read);
-            defer w.CloseHandle(file);
+        if (!info.directory) {
+            // TODO: create a Database event that will compute the hash later
+            const hash = blk: {
+                const file = try wave.windows.openFile(db.sync_dir, path, .read);
+                defer w.CloseHandle(file);
 
-            const Information = w.FILE.STANDARD_INFORMATION;
-            var information: Information = undefined;
-            var iosb: w.IO_STATUS_BLOCK = undefined;
-            const status = w.ntdll.NtQueryInformationFile(file, &iosb, &information, @sizeOf(Information), .Standard);
-            switch (status) {
-                .SUCCESS => {},
-                else => return w.unexpectedStatus(status),
-            }
+                const Information = w.FILE.STANDARD_INFORMATION;
+                var information: Information = undefined;
+                var iosb: w.IO_STATUS_BLOCK = undefined;
+                const status = w.ntdll.NtQueryInformationFile(file, &iosb, &information, @sizeOf(Information), .Standard);
+                switch (status) {
+                    .SUCCESS => {},
+                    else => return w.unexpectedStatus(status),
+                }
 
-            break :blk try computeFileHash(file, information.EndOfFile);
-        };
+                break :blk try computeFileHash(file, information.EndOfFile);
+            };
 
-        try db.tree.new_events.ensureUnusedCapacity(db.allocator, 1);
-        errdefer comptime unreachable;
+            try db.tree.new_events.ensureUnusedCapacity(db.allocator, 1);
+            errdefer comptime unreachable;
 
-        info.status = .tracked;
-        info.global_file_id = global_file_id;
-        db.tree.hash.getPtr(path).?.* = hash;
-        db.tree.new_events.putAssumeCapacityNoClobber(path, .modified);
+            info.status = .tracked;
+            info.global_file_id = global_file_id;
+            db.tree.hash.getPtr(path).?.* = hash;
+            db.tree.new_events.putAssumeCapacityNoClobber(path, .modified);
 
-        db.sendAlert(io);
+            db.sendAlert(io);
+        } else {
+            info.status = .tracked;
+            info.global_file_id = global_file_id;
+        }
     }
 
     // called from Host
@@ -464,14 +489,22 @@ pub const Database = struct {
         assert(db.tree.in_progress_events.fetchSwapRemove(path).?.value == .deleted);
 
         const info = db.tree.files.getEntry(path) orelse
-            std.debug.panic("received delete confirmation for unknown file: {f}", .{path.formatUtf8()});
+            std.debug.panic("TODO received delete confirmation for unknown file: {f}", .{path.formatUtf8()});
         // TODO make sure this is actually the same file that the event was created for
         switch (info.value_ptr.status) {
             .pending_deletion => {},
-            .new, .tracked, .untracked => std.debug.panic("TODO: handle new file id for non-pending-delete file", .{}),
+            .new, .tracked, .untracked => std.debug.panic("TODO: handle delete confirmation for non-pending-delete file: {f}", .{path.formatUtf8()}),
         }
+        if (info.value_ptr.directory) std.debug.panic("TODO delete confirmation for directory: {f}", .{path.formatUtf8()});
 
         db.tree.files.removeByPtr(info.key_ptr);
+        const parent = db.tree.parent.fetchRemove(path).?.value;
+        assert(db.tree.meta.remove(path));
+        assert(db.tree.hash.remove(path));
+        if (parent) |p| {
+            const parent_children = db.tree.children.getPtr(p).?;
+            assert(parent_children.remove(path));
+        }
     }
 
     // called from Host
@@ -589,6 +622,7 @@ const scan = struct {
 
         const SetOfTrackedFiles = Win32RelativePathHashMap(struct {
             status: Database.Tree.Status,
+            directory: bool,
             already_seen: bool,
         });
     };
@@ -606,9 +640,11 @@ const scan = struct {
         try set_of_tracked_files.ensureTotalCapacity(allocator, db.tree.files.count());
         var it = db.tree.files.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.directory) continue;
-            const status = entry.value_ptr.status;
-            set_of_tracked_files.putAssumeCapacityNoClobber(entry.key_ptr.*, .{ .status = status, .already_seen = false });
+            set_of_tracked_files.putAssumeCapacityNoClobber(entry.key_ptr.*, .{
+                .status = entry.value_ptr.status,
+                .directory = entry.value_ptr.directory,
+                .already_seen = false,
+            });
         }
 
         return .{
@@ -748,22 +784,21 @@ const scan = struct {
         // TODO: Use @backingInt https://codeberg.org/ziglang/zig/issues/35602
         const set_to_untracked = @as(w.ULONG, @bitCast(rejected)) & @as(w.ULONG, @bitCast(information.FileAttributes)) != 0;
 
+        const allocator = ctx.arena.allocator();
+        const component_delimeter_index = ctx.sub_path.items.len;
+        defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
+        try ctx.sub_path.appendSlice(allocator, name.slice);
+        const path: Wtf16 = .wtf16Cast(ctx.sub_path.items);
+
         if (information.FileAttributes.DIRECTORY) {
-            if (set_to_untracked) return;
+            try processDirectoryFile(db, ctx, path, information, set_to_untracked);
 
             const component_count: wave.PathComponentCount = @intCast(ctx.open_dir_handles.items.len - 1); // Don't count the sync dir itself as a component.
             if (component_count == wave.max_path_components) return; // TODO: track the folder, but don't track its contents.
 
-            const allocator = ctx.arena.allocator();
             const copied_name = try name.dupe(allocator);
             try ctx.pending_dirs.append(allocator, copied_name);
         } else {
-            const allocator = ctx.arena.allocator();
-            const component_delimeter_index = ctx.sub_path.items.len;
-            defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
-            try ctx.sub_path.appendSlice(allocator, name.slice);
-            const path: Wtf16 = .wtf16Cast(ctx.sub_path.items);
-
             try processRegularFile(db, ctx, path, information, set_to_untracked);
         }
     }
@@ -783,9 +818,10 @@ const scan = struct {
 
         var path_arena = db.path_arena.promote(db.allocator);
         defer db.path_arena = path_arena.state;
+        const path_allocator = path_arena.allocator();
         const key = db.tree.files.getKey(.wtf16Cast(parent_path_temp));
-        const parent_path = key orelse Wtf16.wtf16Cast(try path_arena.allocator().dupe(w.WCHAR, parent_path_temp));
-        errdefer if (key == null) path_arena.allocator().free(parent_path.slice);
+        const parent_path = key orelse Wtf16.wtf16Cast(try path_allocator.dupe(w.WCHAR, parent_path_temp));
+        errdefer if (key == null) path_allocator.free(parent_path.slice);
         ctx.parent_paths.appendAssumeCapacity(parent_path);
 
         const parent_dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
@@ -821,15 +857,16 @@ const scan = struct {
         if (gop.found_existing) {
             if (gop.value_ptr.already_seen) std.debug.panic("TODO saw file more than once while scanning: {f}", .{path.formatUtf8()});
             gop.value_ptr.already_seen = true;
+            if (gop.value_ptr.directory) std.debug.panic("TODO a directory was changed to a regular file: {f}", .{path.formatUtf8()});
 
             switch (gop.value_ptr.status) {
                 .new => {
                     if (set_to_untracked) std.debug.panic("TODO set a new file to untracked: {f}", .{path.formatUtf8()});
-                    db.tree.updateNewRegularFile(path, local_file_id, meta);
+                    db.tree.updateNewFile(path, local_file_id, meta);
                 },
                 .untracked => {
                     if (set_to_untracked) return;
-                    try db.tree.changeUntrackedRegularFileToNew(db.allocator, path, local_file_id, meta);
+                    try db.tree.changeUntrackedFileToNew(db.allocator, path, local_file_id, meta);
                     gop.value_ptr.status = .new;
                 },
                 .pending_deletion => {
@@ -854,6 +891,7 @@ const scan = struct {
             }
         } else {
             errdefer ctx.set_of_tracked_files.removeByPtr(gop.key_ptr);
+
             var path_arena = db.path_arena.promote(db.allocator);
             defer db.path_arena = path_arena.state;
             const file_path_allocator = path_arena.allocator();
@@ -862,14 +900,72 @@ const scan = struct {
             errdefer file_path_allocator.free(path_copy.slice);
 
             gop.key_ptr.* = path_copy;
-            gop.value_ptr.* = .{ .status = undefined, .already_seen = true };
+            gop.value_ptr.* = .{ .status = undefined, .directory = false, .already_seen = true };
 
             const parent = ctx.parent_paths.getLast();
             if (set_to_untracked) {
-                try db.tree.addUntrackedRegularFile(db.allocator, path_copy, parent, local_file_id);
+                try db.tree.addFile(false, .untracked, db.allocator, path_copy, parent, local_file_id, {});
                 gop.value_ptr.status = .untracked;
             } else {
-                try db.tree.addNewRegularFile(db.allocator, path_copy, parent, local_file_id, meta);
+                try db.tree.addFile(false, .new, db.allocator, path_copy, parent, local_file_id, meta);
+                gop.value_ptr.status = .new;
+            }
+        }
+    }
+
+    fn processDirectoryFile(
+        db: *Database,
+        ctx: *Context,
+        path: Wtf16,
+        information: *const NtQueryInformation,
+        set_to_untracked: bool,
+    ) !void {
+        const local_file_id = information.FileId;
+        const meta = Database.Tree.Metadata{
+            .modified_time = information.ChangeTime,
+            .size = 0,
+        };
+
+        const allocator = ctx.arena.allocator();
+        const gop = try ctx.set_of_tracked_files.getOrPut(allocator, path);
+        if (gop.found_existing) {
+            if (gop.value_ptr.already_seen) std.debug.panic("TODO saw file more than once while scanning: {f}", .{path.formatUtf8()});
+            gop.value_ptr.already_seen = true;
+            if (!gop.value_ptr.directory) std.debug.panic("TODO a regular file was changed into a directory: {f}", .{path.formatUtf8()});
+
+            switch (gop.value_ptr.status) {
+                .new => {
+                    if (set_to_untracked) std.debug.panic("TODO set a new file to untracked: {f}", .{path.formatUtf8()});
+                    db.tree.updateNewFile(path, local_file_id, meta);
+                },
+                .untracked => std.debug.panic("TODO handle untracked folder: {f}", .{path.formatUtf8()}),
+                .pending_deletion => {
+                    if (set_to_untracked) return;
+                    std.debug.panic("TODO: file was created while pending deletion: {f}", .{path.formatUtf8()});
+                },
+                .tracked => {
+                    if (set_to_untracked) std.debug.panic("TODO set a tracked directory to untracked: {f}", .{path.formatUtf8()});
+                    db.tree.updateTrackedDirectoryFile(path, local_file_id, meta);
+                },
+            }
+        } else {
+            errdefer ctx.set_of_tracked_files.removeByPtr(gop.key_ptr);
+
+            var path_arena = db.path_arena.promote(db.allocator);
+            defer db.path_arena = path_arena.state;
+            const path_allocator = path_arena.allocator();
+
+            const path_copy = try path.dupe(path_allocator);
+            errdefer path_allocator.free(path_copy.slice);
+
+            gop.key_ptr.* = path_copy;
+            gop.value_ptr.* = .{ .status = undefined, .directory = true, .already_seen = true };
+
+            const parent = ctx.parent_paths.getLast();
+            if (set_to_untracked) {
+                std.debug.panic("TODO handle untracked folder: {f}", .{path.formatUtf8()});
+            } else {
+                try db.tree.addFile(true, .new, db.allocator, path_copy, parent, local_file_id, meta);
                 gop.value_ptr.status = .new;
             }
         }
@@ -882,9 +978,12 @@ const scan = struct {
             const path = entry.key_ptr.*;
             switch (entry.value_ptr.status) {
                 .new => std.debug.panic("TODO delete a new file: {f}", .{path.formatUtf8()}),
-                .tracked => try db.tree.deleteTrackedRegularFile(db.allocator, path),
+                .tracked => switch (entry.value_ptr.directory) {
+                    true => try db.tree.deleteTrackedRegularFile(db.allocator, path),
+                    false => std.debug.panic("TODO delete a tracked directory: {f}", .{path.formatUtf8()}),
+                },
                 .pending_deletion => {},
-                .untracked => std.debug.panic("TODO delete and untracked file: {f}", .{path.formatUtf8()}),
+                .untracked => std.debug.panic("TODO delete an untracked file: {f}", .{path.formatUtf8()}),
             }
         }
     }
@@ -1014,6 +1113,7 @@ pub const Host = struct {
     pub const SendMessagesError = Io.Writer.Error || Io.Cancelable || wave.windows.SendFileError;
 
     fn sendMessages(host: *Host, writer: network.Writer, io: Io) SendMessagesError!void {
+        host.debugLog("sending on thread {}", .{std.os.windows.GetCurrentThreadId()});
         // TODO: Send an initial message containing protocol version, etc.
         // TODO: Send a nonce value with each transaction
         while (true) {
@@ -1058,6 +1158,7 @@ pub const Host = struct {
                     .out_new_file = .{
                         .state = .send_path,
                         .path = host.db.out_path,
+                        .kind = host.db.out_file_kind,
                     },
                 };
                 host.tx.peer_tx_id = .invalid;
@@ -1128,6 +1229,7 @@ pub const Host = struct {
         Io.Cancelable || Allocator.Error || AddOutgoingTxError || wave.windows.ReceiveFileError;
 
     fn receiveMessages(host: *Host, reader: network.Reader, io: Io) ReceiveMessagesError!void {
+        host.debugLog("receiving on thread {}", .{std.os.windows.GetCurrentThreadId()});
         while (true) {
             const header = try reader.receiveMessageHeader();
             if (header.tag == .disconnect) break;
@@ -1322,6 +1424,7 @@ pub const TxData = union(enum) {
     pub const OutNewFile = struct {
         state: State,
         path: Wtf16,
+        kind: network.FileKind,
 
         pub const State = enum {
             send_path,
@@ -1347,7 +1450,7 @@ pub const TxData = union(enum) {
 
             try writer.sendMessageHeaderNewTx(tx_id);
             try writer.sendAction(action);
-            try writer.sendFileKind(.regular); // TODO hardcoded value
+            try writer.sendFileKind(out_new_file.kind);
             try writer.sendNewFilePath(
                 switch (cpu_endian) {
                     .big => @compileError("TODO big endian"),
