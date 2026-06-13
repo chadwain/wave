@@ -98,51 +98,10 @@ pub const Database = struct {
         db.* = undefined;
     }
 
-    fn newFile(db: *Database, path: Wtf16, io: Io) !network.FileId {
+    fn newFile(db: *Database, path: Wtf16, kind: network.FileKind, io: Io) !network.FileId {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
-        const parent = try registerIntermediateFolders(db, path);
-        // TODO: need to errdefer and undo the work done in the registerIntermediateFolders function
-
-        const gop = try db.path_map.getOrPut(db.allocator, path);
-        if (gop.found_existing) return error.FileAlreadyExists;
-        errdefer db.path_map.removeByPtr(gop.key_ptr);
-
-        const file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
-
-        var path_arena = db.path_arena.promote(db.allocator);
-        defer db.path_arena = path_arena.state;
-        const path_allocator = path_arena.allocator();
-        const path_copy = try path.dupe(path_allocator);
-        errdefer path_allocator.free(path_copy.slice);
-
-        try db.files.ensureUnusedCapacity(db.allocator, 1);
-        try db.regular_file_info.ensureUnusedCapacity(db.allocator, 1);
-        errdefer comptime unreachable;
-
-        const file_id: network.FileId = @enumFromInt(file_id_tag);
-        db.next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch null;
-        db.files.putAssumeCapacityNoClobber(file_id, .{
-            .directory = false,
-            .path = path_copy,
-            .parent = parent,
-        });
-        db.regular_file_info.putAssumeCapacityNoClobber(file_id, .{
-            .status = .unsynced,
-            .local_file_id = undefined,
-            .hash = undefined,
-            .modified_time = undefined,
-            .size = undefined,
-        });
-        gop.key_ptr.* = path_copy;
-        gop.value_ptr.* = file_id;
-
-        return file_id;
-    }
-
-    /// Returns the file id of the new file's parent directory.
-    fn registerIntermediateFolders(db: *Database, path: Wtf16) !?network.FileId {
         const initial_file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
         errdefer {
             var file_id_tag: ?std.meta.Tag(network.FileId) = initial_file_id_tag;
@@ -158,69 +117,80 @@ pub const Database = struct {
             db.next_file_id = initial_file_id_tag;
         }
 
-        const Iterator = std.fs.path.ComponentIterator(.windows, u16);
-        var it = Iterator.init(path.slice);
-        const last = it.last() orelse std.debug.panic("todo empty file name", .{});
-
-        var component_count: wave.PathComponentCount = 1;
+        var file_id_buffer: [wave.max_path_components]network.FileId = undefined;
+        var file_id_list: std.ArrayList(network.FileId) = .initBuffer(&file_id_buffer);
 
         var path_arena = db.path_arena.promote(db.allocator);
         defer db.path_arena = path_arena.state;
-        const path_arena_allocator = path_arena.allocator();
+        const path_allocator = path_arena.allocator();
 
-        var parent: ?network.FileId = first_known_directory: while (it.previous()) |item| {
-            if (component_count == wave.max_path_components) return error.PathContainsTooManyComponents;
-            component_count += 1;
-
+        const Iterator = std.fs.path.ComponentIterator(.windows, u16);
+        var it = Iterator.init(path.slice);
+        var is_last = true;
+        var parent: ?network.FileId = first_known_directory: while (if (is_last) it.last() else it.previous()) |item| : (is_last = false) {
             const sub_path: Wtf16 = .wtf16Cast(item.path);
-
             const gop = try db.path_map.getOrPut(db.allocator, sub_path);
             if (gop.found_existing) {
                 const file_info = db.files.getEntry(gop.value_ptr.*).?;
+                if (is_last) {
+                    switch (kind) {
+                        .regular => if (file_info.value_ptr.directory) return error.WrongFileKind,
+                        .directory => if (!file_info.value_ptr.directory) return error.WrongFileKind,
+                    }
+                    return gop.value_ptr.*;
+                }
                 if (!file_info.value_ptr.directory) return error.InvalidFolder;
-                break :first_known_directory file_info.key_ptr.*;
+                break :first_known_directory gop.value_ptr.*;
             }
             errdefer db.path_map.removeByPtr(gop.key_ptr);
 
+            const list_item_ptr = file_id_list.addOneBounded() catch return error.PathContainsTooManyComponents;
             const file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
-            const new_next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch return error.ExhaustedFileIds;
 
-            const sub_path_copy = try sub_path.dupe(path_arena_allocator);
-            errdefer path_arena_allocator.free(sub_path_copy.slice);
+            const sub_path_copy = try sub_path.dupe(path_allocator);
+            errdefer path_allocator.free(sub_path_copy.slice);
 
             try db.files.ensureUnusedCapacity(db.allocator, 1);
+            const is_regular = switch (kind) {
+                .regular => is_last,
+                .directory => false,
+            };
+            if (is_regular) try db.regular_file_info.ensureUnusedCapacity(db.allocator, 1);
             errdefer comptime unreachable;
 
             const file_id: network.FileId = @enumFromInt(file_id_tag);
-            db.next_file_id = new_next_file_id;
+            db.next_file_id = std.math.add(std.meta.Tag(network.FileId), file_id_tag, 1) catch null;
             db.files.putAssumeCapacityNoClobber(file_id, .{
-                .directory = true,
+                .directory = !is_regular,
                 .path = sub_path_copy,
                 .parent = undefined,
             });
+            if (is_regular) db.regular_file_info.putAssumeCapacityNoClobber(file_id, .{
+                .status = .unsynced,
+                .local_file_id = undefined,
+                .hash = undefined,
+                .modified_time = undefined,
+                .size = undefined,
+            });
             gop.key_ptr.* = sub_path_copy;
             gop.value_ptr.* = file_id;
+            list_item_ptr.* = file_id;
         } else break :first_known_directory null;
 
-        {
-            var it2 = it;
-            while (it2.previous()) |_| {
-                if (component_count == wave.max_path_components) return error.PathContainsTooManyComponents;
-                component_count += 1;
-            }
+        const file_id_range = file_id_list.items;
+
+        while (it.previous()) |_| {
+            _ = file_id_list.addOneBounded() catch return error.PathContainsTooManyComponents;
         }
 
-        var it_func = if (parent == null) &Iterator.first else &Iterator.next;
-        while (it_func(&it)) |item| : (it_func = &Iterator.next) {
-            if (item.path.len == last.path.len) break;
-            const sub_path: Wtf16 = .wtf16Cast(item.path);
-            const file_id = db.path_map.get(sub_path).?;
+        for (0..file_id_range.len) |i| {
+            const file_id = file_id_range[file_id_range.len - 1 - i];
             const file_info = db.files.getPtr(file_id).?;
             file_info.parent = parent;
             parent = file_id;
         }
 
-        return parent;
+        return file_id_range[0];
     }
 
     fn getReverseFileIdPath(db: *Database, file_id: network.FileId, buffer: *[wave.max_path_components]network.FileId, io: Io) ![]network.FileId {
@@ -228,6 +198,7 @@ pub const Database = struct {
         defer db.mutex.unlock(io);
 
         var file_info = db.files.get(file_id) orelse std.debug.panic("TODO file not found", .{});
+        // TODO reuse the list that was generated in `newFile`
         var list: std.ArrayList(network.FileId) = .initBuffer(buffer);
 
         list.appendBounded(file_id) catch unreachable;
@@ -531,7 +502,7 @@ pub const Host = struct {
         WrongPeerTxId,
         InvalidAction,
         InvalidHeader,
-    } || network.Reader.ReceiveActionError || network.Reader.ReceiveFileMetadataError || network.Reader.ReceiveNewFilePathError ||
+    } || network.Reader.ReceiveActionError || network.Reader.ReceiveFileMetadataError || network.Reader.ReceiveNewFilePathError || network.Reader.ReceiveFileKindError ||
         Io.Cancelable || Allocator.Error || AddOutgoingTxError || wave.windows.ReceiveFileError || Database.CreateFileError;
 
     fn receiveIncomingTxs(host: *Host, reader: network.Reader, io: Io) RecvError!void {
@@ -547,7 +518,7 @@ pub const Host = struct {
                     if (header.tx_id != .invalid) return error.InvalidTxId;
                     if (header.peer_tx_id == .invalid) return error.InvalidPeerTxId;
                     switch (action) {
-                        .client_new_file => {
+                        .resolve_path => {
                             try TxData.InNewFile.newTx(host, header.peer_tx_id, io, reader);
                         },
                         .transfer_file_metadata => {
@@ -702,10 +673,12 @@ pub const TxData = union(enum) {
     pub const InNewFile = struct {
         data: NewFileResult,
 
-        const NewFileResult = union(enum) {
-            file_id: network.FileId,
-            file_already_exists,
+        pub const NewFileResult = union(network.ResolvePathResponse) {
+            success: network.FileId,
             exhausted_file_ids,
+            too_many_components,
+            invalid_folder,
+            wrong_file_kind,
         };
 
         fn newTx(
@@ -714,6 +687,8 @@ pub const TxData = union(enum) {
             io: Io,
             reader: network.Reader,
         ) !void {
+            const kind = try reader.receiveFileKind();
+
             var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
             const path_info = try reader.receiveNewFilePath(&file_path_buffer);
             // TODO ensure it's a relative path
@@ -725,11 +700,13 @@ pub const TxData = union(enum) {
             };
             const data: TxData = .{
                 .in_new_file = .{
-                    .data = if (host.db.newFile(path, io)) |file_id| .{ .file_id = file_id } else |err| switch (err) {
-                        error.FileAlreadyExists => .file_already_exists,
+                    .data = if (host.db.newFile(path, kind, io)) |file_id|
+                        .{ .success = file_id }
+                    else |err| switch (err) {
                         error.ExhaustedFileIds => .exhausted_file_ids,
-                        error.PathContainsTooManyComponents => std.debug.panic("TODO handle PathContainsTooManyComponents error", .{}),
-                        error.InvalidFolder => std.debug.panic("TODO handle InvalidFolder error", .{}),
+                        error.PathContainsTooManyComponents => .too_many_components,
+                        error.InvalidFolder => .invalid_folder,
+                        error.WrongFileKind => .wrong_file_kind,
                         error.Canceled, error.OutOfMemory => |e| return e,
                     },
                 },
@@ -748,36 +725,34 @@ pub const TxData = union(enum) {
             assert(peer_tx_id != .invalid);
 
             const outgoing_tx_id: network.TransactionId = .invalid;
+
+            const action: network.Action = .resolve_path_response;
+            host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+
             switch (in_new_file.data) {
-                .file_id => |file_id| {
+                .success => |file_id| {
                     var reverse_file_ids_buffer: [wave.max_path_components]network.FileId = undefined;
                     const reversed_file_id_path = try host.db.getReverseFileIdPath(file_id, &reverse_file_ids_buffer, io);
 
-                    const action: network.Action = .server_registered_new_file;
-                    host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
                     host.deleteTransaction(tx_id, .outgoing, io);
 
                     try writer.sendMessageHeaderNewTxReply(outgoing_tx_id, peer_tx_id);
                     try writer.sendAction(action);
+                    try writer.sendResolvePathResponse(.success);
                     for (reversed_file_id_path) |sub_file_id| {
                         try writer.sendFileId(sub_file_id);
                     }
                 },
-                .file_already_exists => {
-                    const action: network.Action = .server_new_file_exists;
-                    host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+                .exhausted_file_ids,
+                .too_many_components,
+                .invalid_folder,
+                .wrong_file_kind,
+                => {
                     host.deleteTransaction(tx_id, .outgoing, io);
 
                     try writer.sendMessageHeaderNewTxReply(outgoing_tx_id, peer_tx_id);
                     try writer.sendAction(action);
-                },
-                .exhausted_file_ids => {
-                    const action: network.Action = .server_cant_register_new_files;
-                    host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
-                    host.deleteTransaction(tx_id, .outgoing, io);
-
-                    try writer.sendMessageHeaderNewTxReply(outgoing_tx_id, peer_tx_id);
-                    try writer.sendAction(action);
+                    try writer.sendResolvePathResponse(in_new_file.data);
                 },
             }
             try writer.flush();

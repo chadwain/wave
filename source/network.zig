@@ -37,14 +37,15 @@ pub const MessageHeader = packed struct(u8) {
 };
 
 pub const Action = enum(u8) {
-    /// A client has seen a new file on its local filesystem.
-    /// Payload: A path
-    client_new_file,
-    /// Sent in response to a `client_new_file` message.
-    /// Payload: A sequence of `FileId`, one for each component of the requested path, in REVERSE order.
-    server_registered_new_file,
-    server_cant_register_new_files,
-    server_new_file_exists,
+    /// The client asks the server to resolve a file path.
+    /// If successful, the server will ensure there is a `FileId` for every sub-component within the path.
+    /// Sender: client
+    /// Payload: `FileKind` + A path
+    resolve_path,
+    /// Sent in response to a `resolve_path` message.
+    /// Payload: A `ResolvePathResponse`
+    /// Payload(success): A sequence of `FileId`, one for each component of the requested path, in REVERSE order.
+    resolve_path_response,
 
     transfer_file_metadata,
     transfer_file_accept,
@@ -77,6 +78,8 @@ pub const FileId = enum(u32) { _ };
 
 pub const FileSize = u64;
 
+pub const FileKind = enum(u8) { regular, directory };
+
 pub const PathEncoding = enum(u8) {
     wtf16le,
 };
@@ -84,6 +87,14 @@ pub const PathEncoding = enum(u8) {
 pub const PathByteCount = u16;
 
 pub const FilePathBuffer = [1 << @bitSizeOf(PathByteCount)]u8;
+
+pub const ResolvePathResponse = enum(u8) {
+    success,
+    exhausted_file_ids,
+    too_many_components,
+    invalid_folder,
+    wrong_file_kind,
+};
 
 pub const min_reader_writer_buffer_size = FileHash.byte_size;
 
@@ -139,6 +150,10 @@ pub const Writer = struct {
         try writer.writeEnum(FileId, id);
     }
 
+    pub fn sendFileKind(writer: Writer, kind: FileKind) Io.Writer.Error!void {
+        try writer.writeEnum(FileKind, kind);
+    }
+
     pub fn sendNewFilePath(
         writer: Writer,
         path_encoding: PathEncoding,
@@ -158,6 +173,10 @@ pub const Writer = struct {
         try writer.sendFileId(file_id);
         try writer.io.writeInt(FileSize, file_size, endian);
         try writer.io.writeAll(&hash.blake3);
+    }
+
+    pub fn sendResolvePathResponse(writer: Writer, response: ResolvePathResponse) Io.Writer.Error!void {
+        try writer.writeEnum(ResolvePathResponse, response);
     }
 };
 
@@ -188,6 +207,12 @@ pub const Reader = struct {
     pub fn receiveFileId(reader: Reader) Io.Reader.Error!FileId {
         // All values of FileId are valid
         return reader.io.takeEnumNonexhaustive(FileId, endian);
+    }
+
+    pub const ReceiveFileKindError = error{UnknownFileKind} || Io.Reader.Error;
+
+    pub fn receiveFileKind(reader: Reader) ReceiveFileKindError!FileKind {
+        return try reader.readEnum(FileKind) orelse error.UnknownFileKind;
     }
 
     pub const IncomingNewFilePath = struct {
@@ -235,5 +260,11 @@ pub const Reader = struct {
             .file_size = file_size,
             .hash = hash,
         };
+    }
+
+    pub const ReceiveResolvePathResponseError = error{UnknownResolvePathResponse} || Io.Reader.Error;
+
+    pub fn receiveResolvePathResponse(reader: Reader) ReceiveResolvePathResponseError!ResolvePathResponse {
+        return try reader.readEnum(ResolvePathResponse) orelse error.UnknownResolvePathResponse;
     }
 };

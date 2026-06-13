@@ -1124,7 +1124,7 @@ pub const Host = struct {
         WrongPeerTxId,
         InvalidAction,
         InvalidHeader,
-    } || network.Reader.ReceiveActionError || network.Reader.ReceiveFileMetadataError || network.Reader.ReceiveNewFilePathError ||
+    } || network.Reader.ReceiveActionError || network.Reader.ReceiveFileMetadataError || network.Reader.ReceiveNewFilePathError || network.Reader.ReceiveResolvePathResponseError ||
         Io.Cancelable || Allocator.Error || AddOutgoingTxError || wave.windows.ReceiveFileError;
 
     fn receiveMessages(host: *Host, reader: network.Reader, io: Io) ReceiveMessagesError!void {
@@ -1238,9 +1238,10 @@ pub const Host = struct {
         tx_id: network.TransactionId,
         io: Io,
     ) void {
+        // TODO: This function might need to be `acq_rel` instead of `release`
         assert(@intFromEnum(tx_id) == 0); // TODO: hardcoded value
         switch (to) {
-            .init, .acquired => unreachable,
+            .init, .acquired => comptime unreachable,
             .outgoing => {
                 host.releaseNewTxStatus(.incoming, to);
                 io.futexWake(State, &host.db.host_state.raw, 1);
@@ -1338,7 +1339,7 @@ pub const TxData = union(enum) {
             assert(out_new_file.state == .send_path);
             assert(peer_tx_id == .invalid);
 
-            const action: network.Action = .client_new_file;
+            const action: network.Action = .resolve_path;
             host.logMessage(.outgoing, tx_id, action, peer_tx_id);
 
             out_new_file.state = .receive_decision;
@@ -1346,6 +1347,7 @@ pub const TxData = union(enum) {
 
             try writer.sendMessageHeaderNewTx(tx_id);
             try writer.sendAction(action);
+            try writer.sendFileKind(.regular); // TODO hardcoded value
             try writer.sendNewFilePath(
                 switch (cpu_endian) {
                     .big => @compileError("TODO big endian"),
@@ -1367,9 +1369,11 @@ pub const TxData = union(enum) {
         ) !void {
             assert(out_new_file.state == .receive_decision);
             if (peer_tx_id != .invalid) return error.InvalidPeerTxId;
+            if (action != .resolve_path_response) return error.InvalidAction;
 
-            switch (action) {
-                .server_registered_new_file => {
+            const response = try reader.receiveResolvePathResponse();
+            switch (response) {
+                .success => {
                     const num_path_components = blk: {
                         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
                         var it = Iterator.init(out_new_file.path.slice);
@@ -1384,19 +1388,14 @@ pub const TxData = union(enum) {
                         _ = try reader.receiveFileId();
                     }
 
-                    host.debugLog("received file id {} for file {f}\n", .{ file_id, out_new_file.path.formatUtf8() });
+                    host.debugLog("received file id {} for file {f}\n", .{ @intFromEnum(file_id), out_new_file.path.formatUtf8() });
                     try host.db.setNewFileId(out_new_file.path, file_id, io);
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
-                .server_cant_register_new_files => {
-                    host.debugLog("server can't register file {f}\n", .{out_new_file.path.formatUtf8()});
+                else => {
+                    host.debugLog("error '{s}' while resolving path {f}\n", .{ @tagName(response), out_new_file.path.formatUtf8() });
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
-                .server_new_file_exists => {
-                    host.debugLog("new file already exists: {f}\n", .{out_new_file.path.formatUtf8()});
-                    host.deleteTransaction(tx_id, .incoming, io);
-                },
-                else => return error.InvalidAction,
             }
         }
     };
@@ -1506,10 +1505,12 @@ pub const TxData = union(enum) {
             switch (action) {
                 .transfer_file_success => {
                     try host.db.markFileAsSynced(out_file_contents.path, io);
+                    host.debugLog("successfully synced file: {f}\n", .{out_file_contents.path.formatUtf8()});
                 },
                 .transfer_file_failure => {
                     // TODO mark file as failed to sync
                     try host.db.markFileAsSynced(out_file_contents.path, io);
+                    host.debugLog("failed to sync file: {f}\n", .{out_file_contents.path.formatUtf8()});
                 },
                 else => return error.InvalidAction,
             }

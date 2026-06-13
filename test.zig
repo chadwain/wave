@@ -48,6 +48,7 @@ fn runCli(io: Io, cdb: *wave.client.Database, sdb: *wave.server.Database) !void 
         client_print_file_events,
         client_scan,
         server_print_files_folders,
+        help,
     };
     const commands = std.StaticStringMap(Command).initComptime(.{
         .{ "q", Command.quit },
@@ -55,15 +56,17 @@ fn runCli(io: Io, cdb: *wave.client.Database, sdb: *wave.server.Database) !void 
         .{ "e", Command.client_print_file_events },
         .{ "s", Command.client_scan },
         .{ "sa", Command.server_print_files_folders },
+        .{ "?", Command.help },
     });
 
-    print(comptime blk: {
+    const help = comptime blk: {
         var msg: []const u8 = "";
         for (commands.keys(), commands.values(), 0..) |k, v, i| {
-            msg = msg ++ k ++ " - " ++ @tagName(v) ++ (if (i != commands.kvs.len - 1) ", " else "\n");
+            msg = msg ++ "[" ++ k ++ "] " ++ @tagName(v) ++ (if (i != commands.kvs.len - 1) ", " else "\n");
         }
         break :blk msg;
-    }, .{});
+    };
+    print("{s}", .{help});
     while (true) {
         var line: []const u8 = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.ReadFailed, error.EndOfStream => |e| return e,
@@ -94,6 +97,7 @@ fn runCli(io: Io, cdb: *wave.client.Database, sdb: *wave.server.Database) !void 
                 try sdb.debug.printFileEntries(stdout, io);
                 try stdout.flush();
             },
+            .help => print("{s}", .{help}),
         }
     }
 }
