@@ -28,6 +28,7 @@ pub const Database = struct {
     path_arena: std.heap.ArenaAllocator.State,
     scan_arena: std.heap.ArenaAllocator.State,
     tree: Tree,
+    file_id_map: std.AutoHashMapUnmanaged(network.FileId, Wtf16),
 
     // End fields protected by mutex
 
@@ -156,7 +157,7 @@ pub const Database = struct {
                 .directory = directory,
                 .status = status,
                 .local_file_id = local_file_id,
-                .global_file_id = undefined,
+                .global_file_id = .unknown,
             };
             tree.parent.putAssumeCapacityNoClobber(path, parent);
             tree.meta.putAssumeCapacityNoClobber(path, switch (status) {
@@ -297,6 +298,7 @@ pub const Database = struct {
                 .new_events = .empty,
                 .in_progress_events = .empty,
             },
+            .file_id_map = .empty,
 
             .alert = .init(.off),
             .host_state = .init(.{}),
@@ -317,6 +319,7 @@ pub const Database = struct {
         scan_arena.deinit();
 
         db.tree.deinit(db.allocator);
+        db.file_id_map.deinit(db.allocator);
 
         db.* = undefined;
     }
@@ -434,7 +437,7 @@ pub const Database = struct {
     }
 
     // called from Host
-    fn setNewFileId(db: *Database, path: Wtf16, global_file_id: network.FileId, io: Io) !void {
+    fn setNewFileId(db: *Database, path: Wtf16, kind: network.FileKind, file_id_list: []const network.FileId, io: Io) !void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
@@ -447,42 +450,67 @@ pub const Database = struct {
             .new => {},
             .tracked, .pending_deletion, .untracked => std.debug.panic("TODO: handle new file id for non-new file", .{}),
         }
+        switch (kind) {
+            .regular => if (info.directory) std.debug.panic("TODO", .{}),
+            .directory => if (!info.directory) std.debug.panic("TODO", .{}),
+        }
 
+        try db.file_id_map.ensureUnusedCapacity(db.allocator, @as(wave.PathComponentCount, @intCast(file_id_list.len)));
+
+        // TODO: create a Database event that will compute the hash later
+        const hash = if (!info.directory) blk: {
+            const file = try wave.windows.openFile(db.sync_dir, path, .read);
+            defer w.CloseHandle(file);
+
+            const Information = w.FILE.STANDARD_INFORMATION;
+            var information: Information = undefined;
+            var iosb: w.IO_STATUS_BLOCK = undefined;
+            const status = w.ntdll.NtQueryInformationFile(file, &iosb, &information, @sizeOf(Information), .Standard);
+            switch (status) {
+                .SUCCESS => {},
+                else => return w.unexpectedStatus(status),
+            }
+
+            break :blk try computeFileHash(file, information.EndOfFile);
+        } else undefined;
+
+        if (!info.directory) try db.tree.new_events.ensureUnusedCapacity(db.allocator, 1);
+        errdefer comptime unreachable;
+
+        const Iterator = std.fs.path.ComponentIterator(.windows, u16);
+        var it = Iterator.init(path.slice);
+        var i: wave.PathComponentCount = 0;
+        while (if (i == 0) it.last() else it.previous()) |component| : (i += 1) {
+            const file_id = file_id_list[i];
+            const path_info = db.tree.files.getEntry(.wtf16Cast(component.path)).?;
+            switch (path_info.value_ptr.global_file_id) {
+                .unknown => {
+                    path_info.value_ptr.global_file_id = file_id;
+                    db.file_id_map.putAssumeCapacityNoClobber(file_id, path_info.key_ptr.*);
+                    wave.log.debug("db: set file id {} for {f}", .{ @intFromEnum(file_id), path_info.key_ptr.formatUtf8() });
+                },
+                _ => {
+                    if (path_info.value_ptr.global_file_id != file_id) {
+                        std.debug.panic(
+                            "TODO client/server conflict detected: {f} has client id {} and server id {}",
+                            .{ path_info.key_ptr.formatUtf8(), path_info.value_ptr.global_file_id, file_id },
+                        );
+                    }
+                },
+            }
+        }
+        assert(i == file_id_list.len);
+
+        info.status = .tracked;
         if (!info.directory) {
-            // TODO: create a Database event that will compute the hash later
-            const hash = blk: {
-                const file = try wave.windows.openFile(db.sync_dir, path, .read);
-                defer w.CloseHandle(file);
-
-                const Information = w.FILE.STANDARD_INFORMATION;
-                var information: Information = undefined;
-                var iosb: w.IO_STATUS_BLOCK = undefined;
-                const status = w.ntdll.NtQueryInformationFile(file, &iosb, &information, @sizeOf(Information), .Standard);
-                switch (status) {
-                    .SUCCESS => {},
-                    else => return w.unexpectedStatus(status),
-                }
-
-                break :blk try computeFileHash(file, information.EndOfFile);
-            };
-
-            try db.tree.new_events.ensureUnusedCapacity(db.allocator, 1);
-            errdefer comptime unreachable;
-
-            info.status = .tracked;
-            info.global_file_id = global_file_id;
             db.tree.hash.getPtr(path).?.* = hash;
             db.tree.new_events.putAssumeCapacityNoClobber(path, .modified);
-
             db.sendAlert(io);
-        } else {
-            info.status = .tracked;
-            info.global_file_id = global_file_id;
         }
     }
 
     // called from Host
-    fn confirmDeleteFile(db: *Database, path: Wtf16, io: Io) !void {
+    fn confirmDeleteFile(db: *Database, path: Wtf16, file_id: network.FileId, io: Io) !void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
@@ -497,7 +525,6 @@ pub const Database = struct {
         }
         if (info.value_ptr.directory) std.debug.panic("TODO delete confirmation for directory: {f}", .{path.formatUtf8()});
 
-        db.tree.files.removeByPtr(info.key_ptr);
         const parent = db.tree.parent.fetchRemove(path).?.value;
         assert(db.tree.meta.remove(path));
         assert(db.tree.hash.remove(path));
@@ -505,6 +532,8 @@ pub const Database = struct {
             const parent_children = db.tree.children.getPtr(p).?;
             assert(parent_children.remove(path));
         }
+        db.tree.files.removeByPtr(info.key_ptr);
+        assert(db.file_id_map.remove(file_id));
     }
 
     // called from Host
@@ -1477,22 +1506,18 @@ pub const TxData = union(enum) {
             const response = try reader.receiveResolvePathResponse();
             switch (response) {
                 .success => {
-                    const num_path_components = blk: {
-                        const Iterator = std.fs.path.ComponentIterator(.windows, u16);
-                        var it = Iterator.init(out_new_file.path.slice);
-                        var count: u64 = 0;
-                        while (it.next()) |_| count += 1;
-                        break :blk count;
-                    };
-                    assert(num_path_components > 0);
-                    const file_id = try reader.receiveFileId();
-                    for (0..num_path_components - 1) |_| {
-                        // TODO dont discard
-                        _ = try reader.receiveFileId();
+                    // TODO Store this in Database somewhere instead
+                    var file_id_buffer: [wave.max_path_components]network.FileId = undefined;
+                    var file_id_list: std.ArrayList(network.FileId) = .initBuffer(&file_id_buffer);
+                    const Iterator = std.fs.path.ComponentIterator(.windows, u16);
+                    var it = Iterator.init(out_new_file.path.slice);
+                    while (it.next()) |_| {
+                        const ptr = file_id_list.addOneBounded() catch unreachable;
+                        ptr.* = try reader.receiveFileId();
                     }
 
-                    host.debugLog("received file id {} for file {f}\n", .{ @intFromEnum(file_id), out_new_file.path.formatUtf8() });
-                    try host.db.setNewFileId(out_new_file.path, file_id, io);
+                    try host.db.setNewFileId(out_new_file.path, out_new_file.kind, file_id_list.items, io);
+                    host.debugLog("received file id {} for file {f}\n", .{ @intFromEnum(file_id_list.items[0]), out_new_file.path.formatUtf8() });
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
                 else => {
@@ -1663,7 +1688,7 @@ pub const TxData = union(enum) {
 
             switch (action) {
                 .delete_file_confirm => {
-                    try host.db.confirmDeleteFile(out_delete_file.path, io);
+                    try host.db.confirmDeleteFile(out_delete_file.path, out_delete_file.file_id, io);
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
                 else => return error.InvalidAction,

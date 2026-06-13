@@ -74,7 +74,7 @@ pub const FileHash = struct {
     }
 };
 
-pub const FileId = enum(u32) { _ };
+pub const FileId = enum(u32) { unknown = 0, _ };
 
 pub const FileSize = u64;
 
