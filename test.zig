@@ -6,24 +6,21 @@ const Io = std.Io;
 
 const wave = @import("wave");
 
-// TODO: Become long-path aware on Windows
-// https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation
-
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
     const args = try Args.init(init.minimal.args, init.arena);
 
-    const sync_dir = try std.unicode.wtf8ToWtf16LeAlloc(allocator, args.syncDir());
+    const sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.syncDir());
     defer allocator.free(sync_dir);
-    const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAlloc(allocator, args.peerSyncDir());
+    const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.peerSyncDir());
     defer allocator.free(peer_sync_dir);
 
-    var cdb = try wave.client.Database.init(.wtf16Cast(sync_dir), io, allocator);
-    defer cdb.deinit(io);
+    var cdb = try wave.client.Database.init(sync_dir, allocator);
+    defer cdb.deinit();
 
-    var sdb = try wave.server.Database.init(.wtf16Cast(peer_sync_dir), io, allocator);
-    defer sdb.deinit(io);
+    var sdb = try wave.server.Database.init(peer_sync_dir, allocator);
+    defer sdb.deinit();
 
     var cdb_run_task = try io.concurrent(wave.client.Database.run, .{ &cdb, io });
     defer cdb_run_task.cancel(io) catch {};

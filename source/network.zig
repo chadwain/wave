@@ -3,6 +3,8 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+const wave = @import("wave.zig");
+
 /// The endianness of message contents, except for file paths, which have their own encoding.
 pub const endian: std.builtin.Endian = .little;
 
@@ -154,14 +156,16 @@ pub const Writer = struct {
         try writer.writeEnum(FileKind, kind);
     }
 
-    pub fn sendNewFilePath(
-        writer: Writer,
-        path_encoding: PathEncoding,
-        path: []const u8, // TODO: Make a Path struct
-    ) !void {
-        try writer.writeEnum(PathEncoding, path_encoding);
-        try writer.io.writeInt(PathByteCount, @intCast(path.len), endian);
-        try writer.io.writeAll(path);
+    pub fn sendPathEncoding(writer: Writer, encoding: PathEncoding) Io.Writer.Error!void {
+        try writer.writeEnum(PathEncoding, encoding);
+    }
+
+    pub fn sendPathByteCount(writer: Writer, byte_count: PathByteCount) Io.Writer.Error!void {
+        try writer.io.writeInt(PathByteCount, byte_count, endian);
+    }
+
+    pub fn sendWindowsPath(writer: Writer, path: wave.windows.Path) Io.Writer.Error!void {
+        try writer.io.writeAll(@ptrCast(path.slice));
     }
 
     pub fn sendFileMetadata(
@@ -215,29 +219,32 @@ pub const Reader = struct {
         return try reader.readEnum(FileKind) orelse error.UnknownFileKind;
     }
 
-    pub const IncomingNewFilePath = struct {
-        path_encoding: PathEncoding,
-        path_byte_count: PathByteCount,
-    };
+    pub const ReceivePathEncodingError = error{UnknownPathEncoding} || Io.Reader.Error;
 
-    pub const ReceiveNewFilePathError = error{UnknownPathEncoding} || Io.Reader.StreamError;
+    pub fn receivePathEncoding(reader: Reader) ReceivePathEncodingError!PathEncoding {
+        return try reader.readEnum(PathEncoding) orelse error.UnknownPathEncoding;
+    }
 
-    pub fn receiveNewFilePath(
+    pub fn receivePathByteCount(reader: Reader) Io.Reader.Error!PathByteCount {
+        return try reader.io.takeInt(PathByteCount, endian);
+    }
+
+    pub const ReceiveWindowsPathError = error{InvalidPath} || Io.Reader.StreamError;
+
+    pub fn receiveWindowsPath(
         reader: Reader,
-        file_path_buffer: *FilePathBuffer,
-    ) ReceiveNewFilePathError!IncomingNewFilePath {
-        const path_encoding = try reader.readEnum(PathEncoding) orelse return error.UnknownPathEncoding;
-        const path_byte_count = try reader.io.takeInt(PathByteCount, endian);
-        // TODO: Ensure path is not empty, and maybe some other sanity checks
+        byte_count: PathByteCount,
+        encoding: PathEncoding,
+        buffer: *align(2) FilePathBuffer,
+    ) !wave.windows.Path {
+        switch (encoding) {
+            .wtf16le => {},
+        }
 
-        // TODO: Do path encoding verification here
-        var file_path_writer: Io.Writer = .fixed(file_path_buffer);
-        try reader.io.streamExact(&file_path_writer, path_byte_count);
-
-        return .{
-            .path_encoding = path_encoding,
-            .path_byte_count = path_byte_count,
-        };
+        var file_path_writer: Io.Writer = .fixed(buffer);
+        try reader.io.streamExact(&file_path_writer, byte_count);
+        const path = buffer[0..byte_count];
+        return try .fromSlice(@ptrCast(path));
     }
 
     pub const IncomingFileMetadata = struct {

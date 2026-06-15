@@ -7,20 +7,19 @@ const Io = std.Io;
 
 const wave = @import("wave.zig");
 const network = wave.network;
-const Wtf16 = wave.windows.Wtf16;
-const Win32RelativePathHashMap = wave.windows.Win32RelativePathHashMap;
+const Path = wave.windows.Path;
+const PathHashMap = wave.windows.PathHashMap;
 
 const cpu_endian = @import("builtin").cpu.arch.endian();
 
 pub const Database = struct {
     sync_dir: w.HANDLE,
-    sync_dir_io: Io.Dir,
 
     mutex: Io.Mutex, // TODO: Compare with RwLock
     allocator: Allocator,
     path_arena: std.heap.ArenaAllocator.State,
 
-    path_map: Win32RelativePathHashMap(network.FileId),
+    path_map: PathHashMap(network.FileId),
     next_file_id: ?std.meta.Tag(network.FileId),
     files: std.AutoHashMapUnmanaged(network.FileId, FileInfo),
     regular_file_info: std.AutoHashMapUnmanaged(network.FileId, RegularFileEntry),
@@ -31,7 +30,7 @@ pub const Database = struct {
 
     pub const FileInfo = struct {
         directory: bool,
-        path: Wtf16,
+        path: Path,
         parent: ?network.FileId,
     };
 
@@ -45,30 +44,13 @@ pub const Database = struct {
         pub const Status = enum { unsynced, synced };
     };
 
-    pub fn init(sync_dir_path: Wtf16, io: Io, allocator: Allocator) !Database {
-        if (cpu_endian != .little) @compileError("TODO big endian");
-        switch (std.fs.path.getWin32PathType(u16, sync_dir_path.slice)) {
-            .drive_absolute => {},
-            else => {
-                // TODO: Potentially support more path types
-                return error.NotADriveAbsoluteSyncDirPath;
-            },
-        }
-        const sync_dir = blk: {
-            // TODO: Proper Win32 -> NT path conversion
-            const normalized = try std.mem.concat(allocator, w.WCHAR, &.{ wtf16("\\??\\"), sync_dir_path.slice });
-            defer allocator.free(normalized);
-            break :blk try wave.windows.openDir(null, .wtf16Cast(normalized));
-        };
-        errdefer w.CloseHandle(sync_dir);
-
-        const sync_dir_path_wtf8 = try sync_dir_path.toWtf8Path();
-        const sync_dir_io = try Io.Dir.cwd().openDir(io, sync_dir_path_wtf8.slice(), .{});
+    pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
+        const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
+        const sync_dir = try wave.windows.openSyncDir(sync_dir_path_nt.span());
         errdefer comptime unreachable;
 
         return .{
             .sync_dir = sync_dir,
-            .sync_dir_io = sync_dir_io,
             .allocator = allocator,
             .mutex = .init,
 
@@ -84,9 +66,8 @@ pub const Database = struct {
         };
     }
 
-    pub fn deinit(db: *Database, io: Io) void {
-        w.CloseHandle(db.sync_dir);
-        db.sync_dir_io.close(io);
+    pub fn deinit(db: *Database) void {
+        wave.windows.closeSyncDir(db.sync_dir);
 
         var path_arena = db.path_arena.promote(db.allocator);
         path_arena.deinit();
@@ -98,7 +79,7 @@ pub const Database = struct {
         db.* = undefined;
     }
 
-    fn newFile(db: *Database, path: Wtf16, kind: network.FileKind, io: Io) !network.FileId {
+    fn newFile(db: *Database, path: Path, kind: network.FileKind, io: Io) !network.FileId {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
@@ -128,9 +109,10 @@ pub const Database = struct {
         var it = Iterator.init(path.slice);
         var is_last = true;
         var parent: ?network.FileId = first_known_directory: while (if (is_last) it.last() else it.previous()) |item| : (is_last = false) {
-            const sub_path: Wtf16 = .wtf16Cast(item.path);
+            const sub_path: Path = .assumeValidPath(item.path);
             const gop = try db.path_map.getOrPut(db.allocator, sub_path);
             if (gop.found_existing) {
+                // TODO: This is a server/client conflict.
                 const file_info = db.files.getEntry(gop.value_ptr.*).?;
                 if (is_last) {
                     switch (kind) {
@@ -211,11 +193,11 @@ pub const Database = struct {
 
     const CompareMetadataResult = union(enum) {
         file_exists: struct {
-            path: Wtf16,
+            path: Path,
             comparison: enum { equals, differs },
         },
         file_is_uninitialized: struct {
-            path: Wtf16,
+            path: Path,
         },
         file_doesnt_exist,
         is_a_directory,
@@ -246,31 +228,66 @@ pub const Database = struct {
         } };
     }
 
-    fn openFileReadOnly(db: *const Database, path: Wtf16) !w.HANDLE {
+    fn openFileReadOnly(db: *const Database, path: Path) !w.HANDLE {
         return wave.windows.openFile(db.sync_dir, path, .read);
     }
 
-    const CreateFileError = Io.Dir.CreateDirPathError || Wtf16.ToWtf8PathError || error{EmptyPath};
+    const CreateFileError = error{ CreateDirFail, Unexpected };
 
-    // TODO create temporary files instead
-    fn createFile(db: *const Database, io: Io, path: Wtf16, file_size: w.LARGE_INTEGER) CreateFileError!w.HANDLE {
-        // TODO janky
-        const path_wtf8 = try path.toWtf8Path();
-        var it = std.fs.path.componentIterator(path_wtf8.slice());
-        _ = it.last() orelse return error.EmptyPath;
-        if (it.previous()) |previous| {
-            try db.sync_dir_io.createDirPath(io, previous.path);
+    fn createFile(db: *const Database, path: Path, file_size: w.LARGE_INTEGER) CreateFileError!w.HANDLE {
+        // TODO create a temporary file instead
+
+        if (wave.windows.createFile(db.sync_dir, path, .{ .initial_size = file_size })) |handle| {
+            return handle;
+        } else |err| switch (err) {
+            error.ParentDirNotFound => {},
+            error.Unexpected => |e| return e,
         }
 
-        return wave.windows.openFile(
-            db.sync_dir,
-            path,
-            .{ .create = .{ .initial_size = file_size } },
-        );
+        var it = path.componentIterator();
+        const first = it.first().?;
+        const last = it.last().?;
+        var handle = blk: while (it.previous()) |component| {
+            const handle = wave.windows.createDir(db.sync_dir, .assumeValidPath(component.path)) catch |err| switch (err) {
+                error.ParentDirNotFound => continue,
+                error.Unexpected => |e| return e,
+            };
+            if (component.path.len != first.path.len) _ = it.next().?;
+            break :blk handle;
+        } else return error.CreateDirFail;
+        defer wave.windows.closeHandle(handle);
+
+        while (it.next()) |component| {
+            if (component.path.len == last.path.len) break;
+            const child_handle = wave.windows.createDir(handle, .assumeValidPath(component.name)) catch |err| switch (err) {
+                error.ParentDirNotFound => {
+                    // TODO: The directory we just created was deleted.
+                    //       Either try to re-create it, or obtain exclusive delete access to it.
+                    return error.CreateDirFail;
+                },
+                error.Unexpected => |e| return e,
+            };
+            errdefer comptime unreachable;
+            wave.windows.closeHandle(handle);
+            handle = child_handle;
+        }
+
+        return wave.windows.createFile(
+            handle,
+            .assumeValidPath(last.name),
+            .{ .initial_size = file_size },
+        ) catch |err| switch (err) {
+            error.ParentDirNotFound => {
+                // TODO: The directory we just created was deleted.
+                //       Either try to re-create it, or obtain exclusive delete access to it.
+                return error.CreateDirFail;
+            },
+            error.Unexpected => |e| return e,
+        };
     }
 
     fn closeFile(_: *const Database, file: w.HANDLE) void {
-        w.CloseHandle(file);
+        wave.windows.closeHandle(file);
     }
 
     fn finishReceiveFileContents(
@@ -330,7 +347,7 @@ pub const Database = struct {
     const DeleteGlobalFileResult = union(enum) {
         success,
         unknown_file,
-        delete_file_err: Io.Dir.DeleteFileError,
+        delete_file_err,
     };
 
     fn deleteGlobalFile(db: *Database, file_id: network.FileId, io: Io) !DeleteGlobalFileResult {
@@ -347,18 +364,16 @@ pub const Database = struct {
             .synced, .unsynced => {},
         }
 
-        // TODO janky, use NT functions
-        const path_wtf8 = try file_info.value_ptr.path.toWtf8Path();
         // TODO maybe don't perform the delete right away, but just queue it
-        if (db.sync_dir_io.deleteFile(io, path_wtf8.slice())) |_| {
+        if (wave.windows.deleteFile(db.sync_dir, file_info.value_ptr.path)) |_| {
             db.files.removeByPtr(file_info.key_ptr);
             db.regular_file_info.removeByPtr(regular_info.key_ptr);
             db.path_map.removeByPtr(path_info_entry.key_ptr);
             return .success;
-        } else |err| {
+        } else |_| {
             // TODO: set the file entry to some errored state
             // TODO: retry the deletion
-            return .{ .delete_file_err = err };
+            return .delete_file_err;
         }
     }
 
@@ -502,8 +517,17 @@ pub const Host = struct {
         WrongPeerTxId,
         InvalidAction,
         InvalidHeader,
-    } || network.Reader.ReceiveActionError || network.Reader.ReceiveFileMetadataError || network.Reader.ReceiveNewFilePathError || network.Reader.ReceiveFileKindError ||
-        Io.Cancelable || Allocator.Error || AddOutgoingTxError || wave.windows.ReceiveFileError || Database.CreateFileError;
+    } ||
+        network.Reader.ReceiveActionError ||
+        network.Reader.ReceiveFileMetadataError ||
+        network.Reader.ReceivePathEncodingError ||
+        network.Reader.ReceiveWindowsPathError ||
+        network.Reader.ReceiveFileKindError ||
+        Io.Cancelable ||
+        Allocator.Error ||
+        AddOutgoingTxError ||
+        wave.windows.ReceiveFileError ||
+        Database.CreateFileError;
 
     fn receiveIncomingTxs(host: *Host, reader: network.Reader, io: Io) RecvError!void {
         while (true) {
@@ -688,16 +712,12 @@ pub const TxData = union(enum) {
             reader: network.Reader,
         ) !void {
             const kind = try reader.receiveFileKind();
+            const encoding = try reader.receivePathEncoding();
+            const path_byte_count = try reader.receivePathByteCount();
 
             var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
-            const path_info = try reader.receiveNewFilePath(&file_path_buffer);
-            // TODO ensure it's a relative path
-            const path: Wtf16 = switch (path_info.path_encoding) {
-                .wtf16le => switch (cpu_endian) {
-                    .big => @compileError("TODO big endian"),
-                    .little => .wtf16Cast(@ptrCast(file_path_buffer[0..path_info.path_byte_count])),
-                },
-            };
+            const path = try reader.receiveWindowsPath(path_byte_count, encoding, &file_path_buffer);
+
             const data: TxData = .{
                 .in_new_file = .{
                     .data = if (host.db.newFile(path, kind, io)) |file_id|
@@ -762,7 +782,7 @@ pub const TxData = union(enum) {
     pub const InFileContents = struct {
         state: State,
         file_id: network.FileId,
-        path: Wtf16,
+        path: Path,
         size: w.LARGE_INTEGER,
         hash: network.FileHash,
 
@@ -782,7 +802,7 @@ pub const TxData = union(enum) {
             reader: network.Reader,
         ) !void {
             const metadata = try reader.receiveFileMetadata();
-            const path: Wtf16, const decision: State.SendDecision = switch (try host.db.compareMetadata(&metadata, io)) {
+            const path: Path, const decision: State.SendDecision = switch (try host.db.compareMetadata(&metadata, io)) {
                 .file_exists => |res| .{
                     res.path,
                     switch (res.comparison) {
@@ -847,7 +867,7 @@ pub const TxData = union(enum) {
             assert(in_file_contents.state == .receive_file_contents);
             switch (action) {
                 .transfer_file_contents => {
-                    const handle = try host.db.createFile(io, in_file_contents.path, in_file_contents.size);
+                    const handle = try host.db.createFile(in_file_contents.path, in_file_contents.size);
                     defer host.db.closeFile(handle);
                     try wave.windows.receiveFile(reader.io, handle, in_file_contents.size);
                     try host.db.finishReceiveFileContents(

@@ -9,15 +9,14 @@ const wave = @import("wave.zig");
 const network = wave.network;
 const print = wave.print;
 const printf = wave.printf;
-const Wtf16 = wave.windows.Wtf16;
-const Win32RelativePathHashMap = wave.windows.Win32RelativePathHashMap;
-const Win32RelativePathArrayHashMap = wave.windows.Win32RelativePathArrayHashMap;
+const Path = wave.windows.Path;
+const PathHashMap = wave.windows.PathHashMap;
+const PathArrayHashMap = wave.windows.PathArrayHashMap;
 
 const cpu_endian = @import("builtin").cpu.arch.endian();
 
 pub const Database = struct {
     sync_dir: w.HANDLE,
-    sync_dir_io: Io.Dir,
     debug: Debug,
 
     mutex: Io.Mutex, // TODO: Compare with RwLock
@@ -28,14 +27,14 @@ pub const Database = struct {
     path_arena: std.heap.ArenaAllocator.State,
     scan_arena: std.heap.ArenaAllocator.State,
     tree: Tree,
-    file_id_map: std.AutoHashMapUnmanaged(network.FileId, Wtf16),
+    file_id_map: std.AutoHashMapUnmanaged(network.FileId, Path),
 
     // End fields protected by mutex
 
     // Database-Host synchronization fields
     alert: std.atomic.Value(Alert),
     host_state: std.atomic.Value(Host.State),
-    out_path: Wtf16,
+    out_path: Path,
     out_file_id: network.FileId,
     out_file_kind: network.FileKind,
     out_metadata: struct {
@@ -47,19 +46,19 @@ pub const Database = struct {
 
     /// A re-representation of the contents of the sync directory.
     pub const Tree = struct {
-        files: Win32RelativePathHashMap(Info),
+        files: PathHashMap(Info),
         /// Applies to all files
-        parent: Win32RelativePathHashMap(?Wtf16),
+        parent: PathHashMap(?Path),
         /// Applies only to directories
-        children: Win32RelativePathHashMap(Win32RelativePathHashMap(void)),
+        children: PathHashMap(PathHashMap(void)),
         /// Applies only to regular files
-        meta: Win32RelativePathHashMap(Metadata),
+        meta: PathHashMap(Metadata),
         /// Applies only to regular files
-        hash: Win32RelativePathHashMap(network.FileHash),
+        hash: PathHashMap(network.FileHash),
         // TODO this should have `network.FileId` as a key
-        new_events: Win32RelativePathArrayHashMap(Event),
+        new_events: PathArrayHashMap(Event),
         // TODO this should have `network.FileId` as a key
-        in_progress_events: Win32RelativePathArrayHashMap(Event),
+        in_progress_events: PathArrayHashMap(Event),
 
         fn deinit(tree: *Tree, allocator: Allocator) void {
             var it = tree.children.valueIterator();
@@ -122,8 +121,8 @@ pub const Database = struct {
             comptime directory: bool,
             comptime status: Status,
             allocator: Allocator,
-            path: Wtf16,
-            parent: ?Wtf16,
+            path: Path,
+            parent: ?Path,
             local_file_id: w.LARGE_INTEGER,
             meta: switch (status) {
                 .new => Metadata,
@@ -179,7 +178,7 @@ pub const Database = struct {
 
         fn updateNewFile(
             tree: *Tree,
-            path: Wtf16,
+            path: Path,
             local_file_id: w.LARGE_INTEGER,
             meta: Metadata,
         ) void {
@@ -191,7 +190,7 @@ pub const Database = struct {
         fn changeUntrackedFileToNew(
             tree: *Tree,
             allocator: Allocator,
-            path: Wtf16,
+            path: Path,
             local_file_id: w.LARGE_INTEGER,
             meta: Metadata,
         ) !void {
@@ -209,7 +208,7 @@ pub const Database = struct {
         fn updateTrackedRegularFile(
             tree: *Tree,
             allocator: Allocator,
-            path: Wtf16,
+            path: Path,
             local_file_id: w.LARGE_INTEGER,
             meta: Metadata,
             hash: *const network.FileHash,
@@ -233,7 +232,7 @@ pub const Database = struct {
 
         fn updateTrackedDirectoryFile(
             tree: *Tree,
-            path: Wtf16,
+            path: Path,
             local_file_id: w.LARGE_INTEGER,
             meta: Metadata,
         ) void {
@@ -245,7 +244,7 @@ pub const Database = struct {
         fn deleteTrackedRegularFile(
             tree: *Tree,
             allocator: Allocator,
-            path: Wtf16,
+            path: Path,
         ) !void {
             const info = tree.files.getEntry(path).?;
 
@@ -259,30 +258,13 @@ pub const Database = struct {
         }
     };
 
-    pub fn init(sync_dir_path: Wtf16, io: Io, allocator: Allocator) !Database {
-        if (cpu_endian != .little) @compileError("TODO big endian");
-        switch (std.fs.path.getWin32PathType(u16, sync_dir_path.slice)) {
-            .drive_absolute => {},
-            else => {
-                // TODO: Potentially support more path types
-                return error.NotADriveAbsoluteSyncDirPath;
-            },
-        }
-        const sync_dir = blk: {
-            // TODO: Proper Win32 -> NT path conversion
-            const normalized = try std.mem.concat(allocator, w.WCHAR, &.{ wtf16("\\??\\"), sync_dir_path.slice });
-            defer allocator.free(normalized);
-            break :blk try wave.windows.openDir(null, .wtf16Cast(normalized));
-        };
-        errdefer w.CloseHandle(sync_dir);
-
-        const sync_dir_path_wtf8 = try sync_dir_path.toWtf8Path();
-        const sync_dir_io = try Io.Dir.cwd().openDir(io, sync_dir_path_wtf8.slice(), .{});
+    pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
+        const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
+        const sync_dir = try wave.windows.openSyncDir(sync_dir_path_nt.span());
         errdefer comptime unreachable;
 
         return .{
             .sync_dir = sync_dir,
-            .sync_dir_io = sync_dir_io,
             .debug = .{},
 
             .mutex = .init,
@@ -309,9 +291,8 @@ pub const Database = struct {
         };
     }
 
-    pub fn deinit(db: *Database, io: Io) void {
-        w.CloseHandle(db.sync_dir);
-        db.sync_dir_io.close(io);
+    pub fn deinit(db: *Database) void {
+        wave.windows.closeHandle(db.sync_dir);
 
         var path_arena = db.path_arena.promote(db.allocator);
         path_arena.deinit();
@@ -437,7 +418,7 @@ pub const Database = struct {
     }
 
     // called from Host
-    fn setNewFileId(db: *Database, path: Wtf16, kind: network.FileKind, file_id_list: []const network.FileId, io: Io) !void {
+    fn setNewFileId(db: *Database, path: Path, kind: network.FileKind, file_id_list: []const network.FileId, io: Io) !void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
@@ -460,7 +441,7 @@ pub const Database = struct {
         // TODO: create a Database event that will compute the hash later
         const hash = if (!info.directory) blk: {
             const file = try wave.windows.openFile(db.sync_dir, path, .read);
-            defer w.CloseHandle(file);
+            defer wave.windows.closeHandle(file);
 
             const Information = w.FILE.STANDARD_INFORMATION;
             var information: Information = undefined;
@@ -482,7 +463,7 @@ pub const Database = struct {
         var i: wave.PathComponentCount = 0;
         while (if (i == 0) it.last() else it.previous()) |component| : (i += 1) {
             const file_id = file_id_list[i];
-            const path_info = db.tree.files.getEntry(.wtf16Cast(component.path)).?;
+            const path_info = db.tree.files.getEntry(.assumeValidPath(component.path)).?;
             switch (path_info.value_ptr.global_file_id) {
                 .unknown => {
                     path_info.value_ptr.global_file_id = file_id;
@@ -510,7 +491,7 @@ pub const Database = struct {
     }
 
     // called from Host
-    fn confirmDeleteFile(db: *Database, path: Wtf16, file_id: network.FileId, io: Io) !void {
+    fn confirmDeleteFile(db: *Database, path: Path, file_id: network.FileId, io: Io) !void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
@@ -537,19 +518,19 @@ pub const Database = struct {
     }
 
     // called from Host
-    fn markFileAsSynced(db: *Database, path: Wtf16, io: Io) !void {
+    fn markFileAsSynced(db: *Database, path: Path, io: Io) !void {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
         assert(db.tree.in_progress_events.fetchSwapRemove(path).?.value == .modified);
     }
 
-    fn openFileReadOnly(db: *const Database, path: Wtf16) !w.HANDLE {
+    fn openFileReadOnly(db: *const Database, path: Path) !w.HANDLE {
         return wave.windows.openFile(db.sync_dir, path, .read);
     }
 
     fn closeFile(_: *const Database, file: w.HANDLE) void {
-        w.CloseHandle(file);
+        wave.windows.closeHandle(file);
     }
 
     pub const Debug = struct {
@@ -642,14 +623,14 @@ pub const Database = struct {
 const scan = struct {
     const Context = struct {
         arena: *std.heap.ArenaAllocator,
-        pending_dirs: std.ArrayList(Wtf16),
-        sub_path: std.ArrayList(w.WCHAR),
+        pending_dirs: std.ArrayList([]const u16),
+        sub_path: std.ArrayList(u16),
         component_delimeters: std.ArrayList(u16),
         open_dir_handles: std.ArrayList(w.HANDLE),
-        parent_paths: std.ArrayList(?Wtf16),
+        parent_paths: std.ArrayList(?Path),
         set_of_tracked_files: SetOfTrackedFiles,
 
-        const SetOfTrackedFiles = Win32RelativePathHashMap(struct {
+        const SetOfTrackedFiles = PathHashMap(struct {
             status: Database.Tree.Status,
             directory: bool,
             already_seen: bool,
@@ -659,7 +640,7 @@ const scan = struct {
     fn initContext(db: *const Database, arena: *std.heap.ArenaAllocator) !Context {
         const allocator = arena.allocator();
 
-        var parent_paths: std.ArrayList(?Wtf16) = .empty;
+        var parent_paths: std.ArrayList(?Path) = .empty;
         try parent_paths.append(allocator, null);
 
         var open_dir_handles: std.ArrayList(w.HANDLE) = .empty;
@@ -735,14 +716,14 @@ const scan = struct {
         try scanOneDirectory(db, &ctx);
         while (ctx.pending_dirs.items.len > 0) {
             const dir_path_ptr = &ctx.pending_dirs.items[ctx.pending_dirs.items.len - 1];
-            if (dir_path_ptr.slice.len == 0) {
+            if (dir_path_ptr.len == 0) {
                 _ = ctx.pending_dirs.pop();
                 exitDir(&ctx);
                 continue;
             }
 
             const dir_path = dir_path_ptr.*;
-            dir_path_ptr.* = .{ .slice = &.{} };
+            dir_path_ptr.* = &.{};
             try enterDir(&ctx, db, dir_path);
             try scanOneDirectory(db, &ctx);
         }
@@ -786,11 +767,11 @@ const scan = struct {
 
                 const offset_of_file_name = @offsetOf(NtQueryInformation, "FileName");
                 const file_name_bytes = buffer[offset + offset_of_file_name ..][0..info.FileNameLength];
-                const file_name: Wtf16 = .wtf16Cast(@ptrCast(@alignCast(file_name_bytes)));
+                const file_name: []const u16 = @ptrCast(@alignCast(file_name_bytes));
 
-                if (info.FileNameLength > w.NAME_MAX or
-                    std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".")) or
-                    std.mem.eql(w.WCHAR, file_name.slice, comptime wtf16(".."))) continue;
+                if (std.mem.eql(u16, file_name, comptime wtf16(".")) or
+                    std.mem.eql(u16, file_name, comptime wtf16(".."))) continue;
+                // TODO: file_name needs to be normalized
 
                 try processFile(db, ctx, file_name, info);
             }
@@ -800,7 +781,7 @@ const scan = struct {
     fn processFile(
         db: *Database,
         ctx: *Context,
-        name: Wtf16,
+        name: []const u16,
         information: *const NtQueryInformation,
     ) !void {
         const rejected: w.FILE.ATTRIBUTE = .{
@@ -816,8 +797,8 @@ const scan = struct {
         const allocator = ctx.arena.allocator();
         const component_delimeter_index = ctx.sub_path.items.len;
         defer ctx.sub_path.shrinkRetainingCapacity(component_delimeter_index);
-        try ctx.sub_path.appendSlice(allocator, name.slice);
-        const path: Wtf16 = .wtf16Cast(ctx.sub_path.items);
+        try ctx.sub_path.appendSlice(allocator, name);
+        const path: Path = .assumeValidPath(ctx.sub_path.items);
 
         if (information.FileAttributes.DIRECTORY) {
             try processDirectoryFile(db, ctx, path, information, set_to_untracked);
@@ -825,36 +806,36 @@ const scan = struct {
             const component_count: wave.PathComponentCount = @intCast(ctx.open_dir_handles.items.len - 1); // Don't count the sync dir itself as a component.
             if (component_count == wave.max_path_components) return; // TODO: track the folder, but don't track its contents.
 
-            const copied_name = try name.dupe(allocator);
+            const copied_name = try allocator.dupe(u16, name);
             try ctx.pending_dirs.append(allocator, copied_name);
         } else {
             try processRegularFile(db, ctx, path, information, set_to_untracked);
         }
     }
 
-    fn enterDir(ctx: *Context, db: *Database, dir_path: Wtf16) !void {
+    fn enterDir(ctx: *Context, db: *Database, dir_name: []const u16) !void {
         const delimeter = comptime wtf16("\\");
         const allocator = ctx.arena.allocator();
         try ctx.component_delimeters.ensureTotalCapacity(allocator, 1);
-        try ctx.sub_path.ensureUnusedCapacity(allocator, dir_path.slice.len + delimeter.len);
+        try ctx.sub_path.ensureUnusedCapacity(allocator, dir_name.len + delimeter.len);
         try ctx.parent_paths.ensureUnusedCapacity(allocator, 1);
         try ctx.open_dir_handles.ensureUnusedCapacity(allocator, 1);
 
         ctx.component_delimeters.appendAssumeCapacity(@intCast(ctx.sub_path.items.len));
-        ctx.sub_path.appendSliceAssumeCapacity(dir_path.slice);
+        ctx.sub_path.appendSliceAssumeCapacity(dir_name);
         const parent_path_temp = ctx.sub_path.items;
         ctx.sub_path.appendSliceAssumeCapacity(delimeter);
 
         var path_arena = db.path_arena.promote(db.allocator);
         defer db.path_arena = path_arena.state;
         const path_allocator = path_arena.allocator();
-        const key = db.tree.files.getKey(.wtf16Cast(parent_path_temp));
-        const parent_path = key orelse Wtf16.wtf16Cast(try path_allocator.dupe(w.WCHAR, parent_path_temp));
+        const key = db.tree.files.getKey(.assumeValidPath(parent_path_temp));
+        const parent_path = key orelse Path.assumeValidPath(try path_allocator.dupe(u16, parent_path_temp));
         errdefer if (key == null) path_allocator.free(parent_path.slice);
         ctx.parent_paths.appendAssumeCapacity(parent_path);
 
         const parent_dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
-        const dir = try wave.windows.openDir(parent_dir, dir_path);
+        const dir = try wave.windows.openDir(parent_dir, .assumeValidPath(dir_name));
         errdefer comptime unreachable;
         ctx.open_dir_handles.appendAssumeCapacity(dir);
     }
@@ -870,7 +851,7 @@ const scan = struct {
     fn processRegularFile(
         db: *Database,
         ctx: *Context,
-        path: Wtf16,
+        path: Path,
         information: *const NtQueryInformation,
         set_to_untracked: bool,
     ) !void {
@@ -945,7 +926,7 @@ const scan = struct {
     fn processDirectoryFile(
         db: *Database,
         ctx: *Context,
-        path: Wtf16,
+        path: Path,
         information: *const NtQueryInformation,
         set_to_untracked: bool,
     ) !void {
@@ -1008,8 +989,8 @@ const scan = struct {
             switch (entry.value_ptr.status) {
                 .new => std.debug.panic("TODO delete a new file: {f}", .{path.formatUtf8()}),
                 .tracked => switch (entry.value_ptr.directory) {
-                    true => try db.tree.deleteTrackedRegularFile(db.allocator, path),
-                    false => std.debug.panic("TODO delete a tracked directory: {f}", .{path.formatUtf8()}),
+                    false => try db.tree.deleteTrackedRegularFile(db.allocator, path),
+                    true => std.debug.panic("TODO delete a tracked directory: {f}", .{path.formatUtf8()}),
                 },
                 .pending_deletion => {},
                 .untracked => std.debug.panic("TODO delete an untracked file: {f}", .{path.formatUtf8()}),
@@ -1254,7 +1235,7 @@ pub const Host = struct {
         WrongPeerTxId,
         InvalidAction,
         InvalidHeader,
-    } || network.Reader.ReceiveActionError || network.Reader.ReceiveFileMetadataError || network.Reader.ReceiveNewFilePathError || network.Reader.ReceiveResolvePathResponseError ||
+    } || network.Reader.ReceiveActionError || network.Reader.ReceiveFileMetadataError || network.Reader.ReceiveResolvePathResponseError ||
         Io.Cancelable || Allocator.Error || AddOutgoingTxError || wave.windows.ReceiveFileError;
 
     fn receiveMessages(host: *Host, reader: network.Reader, io: Io) ReceiveMessagesError!void {
@@ -1452,7 +1433,7 @@ pub const TxData = union(enum) {
 
     pub const OutNewFile = struct {
         state: State,
-        path: Wtf16,
+        path: Path,
         kind: network.FileKind,
 
         pub const State = enum {
@@ -1480,13 +1461,9 @@ pub const TxData = union(enum) {
             try writer.sendMessageHeaderNewTx(tx_id);
             try writer.sendAction(action);
             try writer.sendFileKind(out_new_file.kind);
-            try writer.sendNewFilePath(
-                switch (cpu_endian) {
-                    .big => @compileError("TODO big endian"),
-                    .little => .wtf16le,
-                },
-                @ptrCast(out_new_file.path.slice),
-            );
+            try writer.sendPathEncoding(.wtf16le);
+            try writer.sendPathByteCount(out_new_file.path.byteCount());
+            try writer.sendWindowsPath(out_new_file.path);
             try writer.flush();
         }
 
@@ -1531,7 +1508,7 @@ pub const TxData = union(enum) {
     pub const OutFileContents = struct {
         state: State,
         file_id: network.FileId,
-        path: Wtf16, // TODO: this field shouldn't be needed
+        path: Path, // TODO: this field shouldn't be needed
         size: w.ULARGE_INTEGER,
         hash: network.FileHash,
 
@@ -1649,7 +1626,7 @@ pub const TxData = union(enum) {
     pub const OutDeleteFile = struct {
         state: enum { send_file_id, receive_confirmation },
         file_id: network.FileId,
-        path: Wtf16,
+        path: Path,
 
         fn sendFileId(
             out_delete_file: *OutDeleteFile,
