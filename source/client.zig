@@ -36,7 +36,7 @@ pub const Database = struct {
     host_state: std.atomic.Value(Host.State),
     out_path: Path,
     out_file_id: network.FileId,
-    out_file_kind: network.FileKind,
+    out_directory: bool,
     out_metadata: struct {
         size: w.ULARGE_INTEGER,
         hash: network.FileHash,
@@ -113,6 +113,7 @@ pub const Database = struct {
         pub const Event = enum {
             new,
             modified,
+            create_dir,
             deleted,
         };
 
@@ -286,7 +287,7 @@ pub const Database = struct {
             .host_state = .init(.{}),
             .out_path = undefined,
             .out_file_id = undefined,
-            .out_file_kind = undefined,
+            .out_directory = undefined,
             .out_metadata = undefined,
         };
     }
@@ -357,7 +358,7 @@ pub const Database = struct {
                         .tracked, .pending_deletion, .untracked => unreachable,
                     }
                     db.out_path = kv.key;
-                    db.out_file_kind = if (info.directory) .directory else .regular;
+                    db.out_directory = info.directory;
                     break :blk .get_global_file_id;
                 },
                 .modified => {
@@ -372,6 +373,15 @@ pub const Database = struct {
                         .hash = db.tree.hash.get(kv.key).?,
                     };
                     break :blk .sync_file;
+                },
+                .create_dir => {
+                    switch (info.status) {
+                        .tracked => {},
+                        .new, .untracked, .pending_deletion => unreachable,
+                    }
+                    db.out_file_id = info.global_file_id;
+                    db.out_path = kv.key;
+                    break :blk .create_dir;
                 },
                 .deleted => {
                     switch (info.status) {
@@ -455,7 +465,7 @@ pub const Database = struct {
             break :blk try computeFileHash(file, information.EndOfFile);
         } else undefined;
 
-        if (!info.directory) try db.tree.new_events.ensureUnusedCapacity(db.allocator, 1);
+        try db.tree.new_events.ensureUnusedCapacity(db.allocator, 1);
         errdefer comptime unreachable;
 
         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
@@ -483,11 +493,9 @@ pub const Database = struct {
         assert(i == file_id_list.len);
 
         info.status = .tracked;
-        if (!info.directory) {
-            db.tree.hash.getPtr(path).?.* = hash;
-            db.tree.new_events.putAssumeCapacityNoClobber(path, .modified);
-            db.sendAlert(io);
-        }
+        if (!info.directory) db.tree.hash.getPtr(path).?.* = hash;
+        db.tree.new_events.putAssumeCapacityNoClobber(path, if (info.directory) .create_dir else .modified);
+        db.sendAlert(io);
     }
 
     // called from Host
@@ -1059,6 +1067,7 @@ pub const Host = struct {
             acquired,
             get_global_file_id,
             sync_file,
+            create_dir,
             delete_file,
         };
     };
@@ -1145,6 +1154,10 @@ pub const Host = struct {
                     .send_file_contents => try out_file_contents.sendFileContents(host, tx_id, host.tx.peer_tx_id, io, writer),
                     .receive_decision, .receive_result => unreachable,
                 },
+                .out_create_dir => |*out_create_dir| switch (out_create_dir.state) {
+                    .send_id => try out_create_dir.sendId(host, tx_id, host.tx.peer_tx_id, io, writer),
+                    .receive_confirmation => unreachable,
+                },
                 .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                     .send_file_id => try out_delete_file.sendFileId(host, tx_id, host.tx.peer_tx_id, io, writer),
                     .receive_confirmation => unreachable,
@@ -1168,12 +1181,13 @@ pub const Host = struct {
                     .out_new_file = .{
                         .state = .send_path,
                         .path = host.db.out_path,
-                        .kind = host.db.out_file_kind,
+                        .kind = if (host.db.out_directory) .directory else .regular,
                     },
                 };
                 host.tx.peer_tx_id = .invalid;
 
                 host.db.out_path = undefined;
+                host.db.out_directory = undefined;
             },
             .sync_file => {
                 const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
@@ -1196,6 +1210,25 @@ pub const Host = struct {
                 host.db.out_file_id = undefined;
                 host.db.out_path = undefined;
                 host.db.out_metadata = undefined;
+            },
+            .create_dir => {
+                const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
+                    error.NoTxSlotsAvailable => return null,
+                };
+                assert(@intFromEnum(tx_id) == 0); // TODO hardcoded value
+                host.debugLog("creating dir: {f}", .{host.db.out_path.formatUtf8()});
+
+                host.tx.data = .{
+                    .out_create_dir = .{
+                        .state = .send_id,
+                        .file_id = host.db.out_file_id,
+                        .path = host.db.out_path,
+                    },
+                };
+                host.tx.peer_tx_id = .invalid;
+
+                host.db.out_file_id = undefined;
+                host.db.out_path = undefined;
             },
             .delete_file => {
                 const tx_id = host.acquireUnusedTx() catch |err| switch (err) {
@@ -1235,8 +1268,15 @@ pub const Host = struct {
         WrongPeerTxId,
         InvalidAction,
         InvalidHeader,
-    } || network.Reader.ReceiveActionError || network.Reader.ReceiveFileMetadataError || network.Reader.ReceiveResolvePathResponseError ||
-        Io.Cancelable || Allocator.Error || AddOutgoingTxError || wave.windows.ReceiveFileError;
+    } ||
+        network.Reader.ReceiveActionError ||
+        network.Reader.ReceiveFileMetadataError ||
+        network.Reader.ReceiveResolvePathResponseError ||
+        network.Reader.ReceiveCreateDirResponseError ||
+        Io.Cancelable ||
+        Allocator.Error ||
+        AddOutgoingTxError ||
+        wave.windows.ReceiveFileError;
 
     fn receiveMessages(host: *Host, reader: network.Reader, io: Io) ReceiveMessagesError!void {
         host.debugLog("receiving on thread {}", .{std.os.windows.GetCurrentThreadId()});
@@ -1286,6 +1326,17 @@ pub const Host = struct {
                             .receive_result => return error.InvalidHeader,
                             .send_metadata, .send_file_contents => unreachable,
                         },
+                        .out_create_dir => |*out_create_dir| switch (out_create_dir.state) {
+                            .receive_confirmation => try out_create_dir.receiveConfirmation(
+                                host,
+                                reader,
+                                io,
+                                header.tx_id,
+                                header.peer_tx_id,
+                                action,
+                            ),
+                            .send_id => unreachable,
+                        },
                         .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                             .send_file_id => unreachable,
                             .receive_confirmation => try out_delete_file.receiveConfirmation(
@@ -1315,6 +1366,10 @@ pub const Host = struct {
                                 try out_file_contents.receiveResult(host, reader, io, header.tx_id, action);
                             },
                             .send_metadata, .send_file_contents => unreachable,
+                        },
+                        .out_create_dir => |*out_create_dir| switch (out_create_dir.state) {
+                            .receive_confirmation => return error.InvalidHeader,
+                            .send_id => unreachable,
                         },
                         .out_delete_file => |*out_delete_file| switch (out_delete_file.state) {
                             .send_file_id => unreachable,
@@ -1429,6 +1484,7 @@ pub const Host = struct {
 pub const TxData = union(enum) {
     out_new_file: OutNewFile,
     out_file_contents: OutFileContents,
+    out_create_dir: OutCreateDir,
     out_delete_file: OutDeleteFile,
 
     pub const OutNewFile = struct {
@@ -1497,7 +1553,11 @@ pub const TxData = union(enum) {
                     host.debugLog("received file id {} for file {f}\n", .{ @intFromEnum(file_id_list.items[0]), out_new_file.path.formatUtf8() });
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
-                else => {
+                .exhausted_file_ids,
+                .too_many_components,
+                .invalid_folder,
+                .wrong_file_kind,
+                => {
                     host.debugLog("error '{s}' while resolving path {f}\n", .{ @tagName(response), out_new_file.path.formatUtf8() });
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
@@ -1620,6 +1680,72 @@ pub const TxData = union(enum) {
                 else => return error.InvalidAction,
             }
             host.deleteTransaction(tx_id, .incoming, io);
+        }
+    };
+
+    pub const OutCreateDir = struct {
+        state: State,
+        file_id: network.FileId,
+        path: Path,
+
+        pub const State = enum {
+            send_id,
+            receive_confirmation,
+        };
+
+        fn sendId(
+            out_create_dir: *OutCreateDir,
+            host: *Host,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            writer: network.Writer,
+        ) !void {
+            assert(out_create_dir.state == .send_id);
+            assert(peer_tx_id == .invalid);
+
+            const action: network.Action = .create_dir;
+            host.logMessage(.outgoing, tx_id, action, peer_tx_id);
+
+            out_create_dir.state = .receive_confirmation;
+            host.flipTransaction(.incoming, tx_id, io);
+
+            try writer.sendMessageHeaderNewTx(tx_id);
+            try writer.sendAction(action);
+            try writer.sendFileId(out_create_dir.file_id);
+            try writer.flush();
+        }
+
+        fn receiveConfirmation(
+            out_create_dir: *const OutCreateDir,
+            host: *Host,
+            reader: network.Reader,
+            io: Io,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            action: network.Action,
+        ) !void {
+            assert(out_create_dir.state == .receive_confirmation);
+            if (peer_tx_id != .invalid) return error.InvalidPeerTxId;
+            if (action != .create_dir_response) return error.InvalidAction;
+
+            const response = try reader.receiveCreateDirResponse();
+            switch (response) {
+                .success => {
+                    host.debugLog(
+                        "create dir with id {} name {f}\n",
+                        .{ @intFromEnum(out_create_dir.file_id), out_create_dir.path.formatUtf8() },
+                    );
+                    host.deleteTransaction(tx_id, .incoming, io);
+                },
+                .not_a_directory, .unknown_file, .unexpected => {
+                    host.debugLog(
+                        "error '{s}' while creating dir {} {f}\n",
+                        .{ @tagName(response), @intFromEnum(out_create_dir.file_id), out_create_dir.path.formatUtf8() },
+                    );
+                    host.deleteTransaction(tx_id, .incoming, io);
+                },
+            }
         }
     };
 

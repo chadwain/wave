@@ -56,6 +56,10 @@ pub const Action = enum(u8) {
     transfer_file_success,
     transfer_file_failure,
 
+    /// The client asks the server to locally create a directory.
+    create_dir,
+    create_dir_response,
+
     /// A client has seen a file get deleted on its local filesystem.
     delete_file,
     /// The server notifies that a file has been globally deleted.
@@ -96,6 +100,13 @@ pub const ResolvePathResponse = enum(u8) {
     too_many_components,
     invalid_folder,
     wrong_file_kind,
+};
+
+pub const CreateDirResponse = enum(u8) {
+    success,
+    not_a_directory,
+    unknown_file,
+    unexpected,
 };
 
 pub const min_reader_writer_buffer_size = FileHash.byte_size;
@@ -181,6 +192,10 @@ pub const Writer = struct {
 
     pub fn sendResolvePathResponse(writer: Writer, response: ResolvePathResponse) Io.Writer.Error!void {
         try writer.writeEnum(ResolvePathResponse, response);
+    }
+
+    pub fn sendCreateDirResponse(writer: Writer, response: CreateDirResponse) Io.Writer.Error!void {
+        try writer.writeEnum(CreateDirResponse, response);
     }
 };
 
@@ -273,5 +288,11 @@ pub const Reader = struct {
 
     pub fn receiveResolvePathResponse(reader: Reader) ReceiveResolvePathResponseError!ResolvePathResponse {
         return try reader.readEnum(ResolvePathResponse) orelse error.UnknownResolvePathResponse;
+    }
+
+    pub const ReceiveCreateDirResponseError = error{UnknownCreateDirResponse} || Io.Reader.Error;
+
+    pub fn receiveCreateDirResponse(reader: Reader) ReceiveCreateDirResponseError!CreateDirResponse {
+        return try reader.readEnum(CreateDirResponse) orelse error.UnknownCreateDirResponse;
     }
 };

@@ -14,14 +14,17 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 ///
 /// A path must have these properties:
 /// - It must be non-empty.
-/// - It must not be longer than `std.os.windows.PATH_MAX_WIDE` codepoints long.
+/// - It must not be longer than `std.os.windows.PATH_MAX_WIDE` code units long.
 /// - It must not contain more than `wave.max_path_components` components.
 /// - It must not contain any '/' codepoints.
 /// - It must not end with a '\' codepoint.
 /// - No component may be empty. (Thus consecutive '\' codepoints are disallowed.)
-/// - No component may be longer than `std.os.windows.NAME_MAX` codepoints long.
+/// - No component may be longer than `std.os.windows.NAME_MAX` code units long.
 /// - No component may end with a '.', or ' ' codepoint. (Thus '.' and '..' are not valid components.)
 /// - No component may refer to a special device.
+
+// TODO: The maximum length of a path component is actually a run-time known value,
+//       it can be retrieved using NtQueryVolumeInformationFile.
 pub const Path = struct {
     slice: []const u16,
 
@@ -76,6 +79,9 @@ pub const Path = struct {
 };
 
 pub fn isValidWindowsPath(path: []const u16) bool {
+    // My reference for how NT paths work is here:
+    // https://projectzero.google/2016/02/the-definitive-guide-on-win32-to-nt.html
+
     if (path.len == 0) return false;
     if (path.len > w.PATH_MAX_WIDE) return false;
     switch (std.fs.path.getWin32PathType(u16, path)) {
@@ -190,7 +196,7 @@ pub fn openSyncDir(path: []const u16) !w.HANDLE {
         .{
             .STANDARD = .{
                 .RIGHTS = .READ,
-                .SYNCHRONIZE = true, // NOTE: Not required if we wait on events rather than the file handle itself.
+                .SYNCHRONIZE = true,
             },
             .SPECIFIC = .{
                 .FILE_DIRECTORY = .{

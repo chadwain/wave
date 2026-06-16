@@ -67,7 +67,7 @@ pub const Database = struct {
     }
 
     pub fn deinit(db: *Database) void {
-        wave.windows.closeSyncDir(db.sync_dir);
+        wave.windows.closeHandle(db.sync_dir);
 
         var path_arena = db.path_arena.promote(db.allocator);
         path_arena.deinit();
@@ -232,21 +232,21 @@ pub const Database = struct {
         return wave.windows.openFile(db.sync_dir, path, .read);
     }
 
-    const CreateFileError = error{ CreateDirFail, Unexpected };
+    const CreateParentDirectoriesError = error{ CreateParentDirFail, Unexpected };
 
-    fn createFile(db: *const Database, path: Path, file_size: w.LARGE_INTEGER) CreateFileError!w.HANDLE {
-        // TODO create a temporary file instead
+    const CreateParentDirectoriesResult = struct {
+        parent: union(enum) {
+            handle: w.HANDLE,
+            sync_dir,
+        },
+        name: Path,
+    };
 
-        if (wave.windows.createFile(db.sync_dir, path, .{ .initial_size = file_size })) |handle| {
-            return handle;
-        } else |err| switch (err) {
-            error.ParentDirNotFound => {},
-            error.Unexpected => |e| return e,
-        }
-
+    fn createParentDirectories(db: *const Database, path: Path) CreateParentDirectoriesError!CreateParentDirectoriesResult {
         var it = path.componentIterator();
         const first = it.first().?;
         const last = it.last().?;
+        if (first.path.len == last.path.len) return .{ .parent = .sync_dir, .name = .assumeValidPath(last.name) };
         var handle = blk: while (it.previous()) |component| {
             const handle = wave.windows.createDir(db.sync_dir, .assumeValidPath(component.path)) catch |err| switch (err) {
                 error.ParentDirNotFound => continue,
@@ -254,16 +254,17 @@ pub const Database = struct {
             };
             if (component.path.len != first.path.len) _ = it.next().?;
             break :blk handle;
-        } else return error.CreateDirFail;
-        defer wave.windows.closeHandle(handle);
+        } else return error.CreateParentDirFail;
+        errdefer wave.windows.closeHandle(handle);
 
+        // TODO errdefer delete whatever we created
         while (it.next()) |component| {
             if (component.path.len == last.path.len) break;
             const child_handle = wave.windows.createDir(handle, .assumeValidPath(component.name)) catch |err| switch (err) {
                 error.ParentDirNotFound => {
                     // TODO: The directory we just created was deleted.
                     //       Either try to re-create it, or obtain exclusive delete access to it.
-                    return error.CreateDirFail;
+                    return error.CreateParentDirFail;
                 },
                 error.Unexpected => |e| return e,
             };
@@ -272,21 +273,14 @@ pub const Database = struct {
             handle = child_handle;
         }
 
-        return wave.windows.createFile(
-            handle,
-            .assumeValidPath(last.name),
-            .{ .initial_size = file_size },
-        ) catch |err| switch (err) {
-            error.ParentDirNotFound => {
-                // TODO: The directory we just created was deleted.
-                //       Either try to re-create it, or obtain exclusive delete access to it.
-                return error.CreateDirFail;
-            },
-            error.Unexpected => |e| return e,
-        };
+        return .{ .parent = .{ .handle = handle }, .name = .assumeValidPath(last.name) };
     }
 
-    fn closeFile(_: *const Database, file: w.HANDLE) void {
+    fn createFile(_: *const Database, parent: w.HANDLE, name: Path, initial_size: w.LARGE_INTEGER) !w.HANDLE {
+        return wave.windows.createFile(parent, name, .{ .initial_size = initial_size });
+    }
+
+    fn closeHandle(_: *const Database, file: w.HANDLE) void {
         wave.windows.closeHandle(file);
     }
 
@@ -342,6 +336,36 @@ pub const Database = struct {
             .modified_time = basic_information.ChangeTime,
             .size = @intCast(file_size),
         };
+    }
+
+    fn createDir(db: *Database, file_id: network.FileId, io: Io) !void {
+        try db.mutex.lock(io);
+        defer db.mutex.unlock(io);
+
+        const file_info = db.files.getPtr(file_id) orelse return error.UnknownFile;
+        if (!file_info.directory) return error.NotADirectory;
+
+        const create_result = try db.createParentDirectories(file_info.path);
+        defer switch (create_result.parent) {
+            .handle => |handle| db.closeHandle(handle),
+            .sync_dir => {},
+        };
+
+        const parent = switch (create_result.parent) {
+            .handle => |handle| handle,
+            .sync_dir => db.sync_dir,
+        };
+        const handle = wave.windows.createDir(parent, create_result.name) catch |err| switch (err) {
+            error.ParentDirNotFound => {
+                // TODO: The directory we just created was deleted.
+                //       Either try to re-create it, or obtain exclusive delete access to it.
+                return error.CreateParentDirFail;
+            },
+            error.Unexpected => |e| return e,
+        };
+        db.closeHandle(handle);
+
+        // TODO file_info.status = .synced;
     }
 
     const DeleteGlobalFileResult = union(enum) {
@@ -503,6 +527,9 @@ pub const Host = struct {
                     .send_result => try in_file_contents.sendResult(host, tx_id, host.tx.peer_tx_id, io, writer),
                     .receive_file_contents => unreachable,
                 },
+                .in_create_dir => |*in_create_dir| {
+                    try in_create_dir.sendResponse(host, tx_id, host.tx.peer_tx_id, io, writer);
+                },
                 .in_delete_file => |*in_delete_file| {
                     try in_delete_file.sendConfirmation(host, tx_id, host.tx.peer_tx_id, io, writer);
                 },
@@ -527,7 +554,7 @@ pub const Host = struct {
         Allocator.Error ||
         AddOutgoingTxError ||
         wave.windows.ReceiveFileError ||
-        Database.CreateFileError;
+        Database.CreateParentDirectoriesError;
 
     fn receiveIncomingTxs(host: *Host, reader: network.Reader, io: Io) RecvError!void {
         while (true) {
@@ -548,6 +575,9 @@ pub const Host = struct {
                         .transfer_file_metadata => {
                             try TxData.InFileContents.newTx(host, header.peer_tx_id, io, reader);
                         },
+                        .create_dir => {
+                            try TxData.InCreateDir.newTx(host, header.peer_tx_id, io, reader);
+                        },
                         .delete_file => {
                             try TxData.InDeleteFile.newTx(host, header.peer_tx_id, io, reader);
                         },
@@ -565,6 +595,7 @@ pub const Host = struct {
                             .receive_file_contents => return error.InvalidHeader,
                             .send_decision, .send_result => unreachable,
                         },
+                        .in_create_dir => unreachable,
                         .in_delete_file => unreachable,
                     }
                 },
@@ -581,6 +612,7 @@ pub const Host = struct {
                             },
                             .send_decision, .send_result => unreachable,
                         },
+                        .in_create_dir => unreachable,
                         .in_delete_file => unreachable,
                     }
                 },
@@ -692,6 +724,7 @@ pub const Host = struct {
 pub const TxData = union(enum) {
     in_new_file: InNewFile,
     in_file_contents: InFileContents,
+    in_create_dir: InCreateDir,
     in_delete_file: InDeleteFile,
 
     pub const InNewFile = struct {
@@ -867,8 +900,27 @@ pub const TxData = union(enum) {
             assert(in_file_contents.state == .receive_file_contents);
             switch (action) {
                 .transfer_file_contents => {
-                    const handle = try host.db.createFile(in_file_contents.path, in_file_contents.size);
-                    defer host.db.closeFile(handle);
+                    const create_result = try host.db.createParentDirectories(in_file_contents.path);
+                    defer switch (create_result.parent) {
+                        .handle => |handle| host.db.closeHandle(handle),
+                        .sync_dir => {},
+                    };
+
+                    const handle = host.db.createFile(switch (create_result.parent) {
+                        .handle => |handle| handle,
+                        .sync_dir => host.db.sync_dir,
+                    }, create_result.name, in_file_contents.size) catch |err| switch (err) {
+                        error.ParentDirNotFound => {
+                            // TODO: The directory we just created was deleted.
+                            //       Either try to re-create it, or obtain exclusive delete access to it.
+                            // TODO: report failure to the client
+                            return error.CreateParentDirFail;
+                        },
+                        // TODO: report failure to the client
+                        error.Unexpected => |e| return e,
+                    };
+                    defer host.db.closeHandle(handle);
+
                     try wave.windows.receiveFile(reader.io, handle, in_file_contents.size);
                     try host.db.finishReceiveFileContents(
                         io,
@@ -905,6 +957,54 @@ pub const TxData = union(enum) {
 
             try writer.sendMessageHeaderExistingTx(peer_tx_id);
             try writer.sendAction(action);
+            try writer.flush();
+        }
+    };
+
+    pub const InCreateDir = struct {
+        response: network.CreateDirResponse,
+
+        fn newTx(
+            host: *Host,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            reader: network.Reader,
+        ) !void {
+            const file_id = try reader.receiveFileId();
+            const data: TxData = .{
+                .in_create_dir = .{
+                    .response = if (host.db.createDir(file_id, io)) .success else |err| switch (err) {
+                        error.NotADirectory => .not_a_directory,
+                        error.UnknownFile => .unknown_file,
+                        error.Unexpected, error.CreateParentDirFail => .unexpected,
+                        error.Canceled => |e| return e,
+                    },
+                },
+            };
+            try host.addOutgoingTx(io, data, peer_tx_id);
+        }
+
+        fn sendResponse(
+            in_create_dir: *const InCreateDir,
+            host: *Host,
+            tx_id: network.TransactionId,
+            peer_tx_id: network.TransactionId,
+            io: Io,
+            writer: network.Writer,
+        ) !void {
+            assert(peer_tx_id != .invalid);
+
+            const outgoing_tx_id: network.TransactionId = .invalid;
+
+            const action: network.Action = .create_dir_response;
+            host.logMessage(.outgoing, outgoing_tx_id, action, peer_tx_id);
+
+            const response = in_create_dir.response;
+            host.deleteTransaction(tx_id, .outgoing, io);
+
+            try writer.sendMessageHeaderNewTxReply(outgoing_tx_id, peer_tx_id);
+            try writer.sendAction(action);
+            try writer.sendCreateDirResponse(response);
             try writer.flush();
         }
     };
