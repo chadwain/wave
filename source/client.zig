@@ -1553,8 +1553,8 @@ pub const TxData = union(enum) {
                     host.debugLog("received file id {} for file {f}\n", .{ @intFromEnum(file_id_list.items[0]), out_new_file.path.formatUtf8() });
                     host.deleteTransaction(tx_id, .incoming, io);
                 },
+                .invalid_path,
                 .exhausted_file_ids,
-                .too_many_components,
                 .invalid_folder,
                 .wrong_file_kind,
                 => {

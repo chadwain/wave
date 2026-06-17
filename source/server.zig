@@ -105,8 +105,7 @@ pub const Database = struct {
         defer db.path_arena = path_arena.state;
         const path_allocator = path_arena.allocator();
 
-        const Iterator = std.fs.path.ComponentIterator(.windows, u16);
-        var it = Iterator.init(path.slice);
+        var it = path.componentIterator();
         var is_last = true;
         var parent: ?network.FileId = first_known_directory: while (if (is_last) it.last() else it.previous()) |item| : (is_last = false) {
             const sub_path: Path = .assumeValidPath(item.path);
@@ -126,7 +125,7 @@ pub const Database = struct {
             }
             errdefer db.path_map.removeByPtr(gop.key_ptr);
 
-            const list_item_ptr = file_id_list.addOneBounded() catch return error.PathContainsTooManyComponents;
+            const list_item_ptr = file_id_list.addOneBounded() catch unreachable;
             const file_id_tag = db.next_file_id orelse return error.ExhaustedFileIds;
 
             const sub_path_copy = try sub_path.dupe(path_allocator);
@@ -162,7 +161,7 @@ pub const Database = struct {
         const file_id_range = file_id_list.items;
 
         while (it.previous()) |_| {
-            _ = file_id_list.addOneBounded() catch return error.PathContainsTooManyComponents;
+            _ = file_id_list.addOneBounded() catch unreachable;
         }
 
         for (0..file_id_range.len) |i| {
@@ -732,8 +731,8 @@ pub const TxData = union(enum) {
 
         pub const NewFileResult = union(network.ResolvePathResponse) {
             success: network.FileId,
+            invalid_path,
             exhausted_file_ids,
-            too_many_components,
             invalid_folder,
             wrong_file_kind,
         };
@@ -749,7 +748,17 @@ pub const TxData = union(enum) {
             const path_byte_count = try reader.receivePathByteCount();
 
             var file_path_buffer: network.FilePathBuffer align(@alignOf(w.WCHAR)) = undefined;
-            const path = try reader.receiveWindowsPath(path_byte_count, encoding, &file_path_buffer);
+            const path = reader.receiveWindowsPath(path_byte_count, encoding, &file_path_buffer) catch |err| switch (err) {
+                error.InvalidPath => {
+                    const data: TxData = .{
+                        .in_new_file = .{
+                            .data = .invalid_path,
+                        },
+                    };
+                    return try host.addOutgoingTx(io, data, peer_tx_id);
+                },
+                error.WriteFailed, error.ReadFailed, error.EndOfStream => |e| return e,
+            };
 
             const data: TxData = .{
                 .in_new_file = .{
@@ -757,7 +766,6 @@ pub const TxData = union(enum) {
                         .{ .success = file_id }
                     else |err| switch (err) {
                         error.ExhaustedFileIds => .exhausted_file_ids,
-                        error.PathContainsTooManyComponents => .too_many_components,
                         error.InvalidFolder => .invalid_folder,
                         error.WrongFileKind => .wrong_file_kind,
                         error.Canceled, error.OutOfMemory => |e| return e,
@@ -796,8 +804,8 @@ pub const TxData = union(enum) {
                         try writer.sendFileId(sub_file_id);
                     }
                 },
+                .invalid_path,
                 .exhausted_file_ids,
-                .too_many_components,
                 .invalid_folder,
                 .wrong_file_kind,
                 => {

@@ -96,8 +96,8 @@ pub const FilePathBuffer = [1 << @bitSizeOf(PathByteCount)]u8;
 
 pub const ResolvePathResponse = enum(u8) {
     success,
+    invalid_path,
     exhausted_file_ids,
-    too_many_components,
     invalid_folder,
     wrong_file_kind,
 };
