@@ -4,8 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const wave = b.addModule("wave", .{
-        .root_source_file = b.path("source/wave.zig"),
+    const fairy = b.addModule("fairy", .{
+        .root_source_file = b.path("source/fairy.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "wave", .module = wave },
+                .{ .name = "fairy", .module = fairy },
             },
         }),
         .use_llvm = false,

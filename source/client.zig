@@ -5,13 +5,13 @@ const wtf16 = std.unicode.wtf8ToWtf16LeStringLiteral;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-const wave = @import("wave.zig");
-const network = wave.network;
-const print = wave.print;
-const printf = wave.printf;
-const Path = wave.windows.Path;
-const PathHashMap = wave.windows.PathHashMap;
-const PathArrayHashMap = wave.windows.PathArrayHashMap;
+const fairy = @import("fairy.zig");
+const network = fairy.network;
+const print = fairy.print;
+const printf = fairy.printf;
+const Path = fairy.windows.Path;
+const PathHashMap = fairy.windows.PathHashMap;
+const PathArrayHashMap = fairy.windows.PathArrayHashMap;
 
 const cpu_endian = @import("builtin").cpu.arch.endian();
 
@@ -261,7 +261,7 @@ pub const Database = struct {
 
     pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
         const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
-        const sync_dir = try wave.windows.openSyncDir(sync_dir_path_nt.span());
+        const sync_dir = try fairy.windows.openSyncDir(sync_dir_path_nt.span());
         errdefer comptime unreachable;
 
         return .{
@@ -293,7 +293,7 @@ pub const Database = struct {
     }
 
     pub fn deinit(db: *Database) void {
-        wave.windows.closeHandle(db.sync_dir);
+        fairy.windows.closeHandle(db.sync_dir);
 
         var path_arena = db.path_arena.promote(db.allocator);
         path_arena.deinit();
@@ -446,12 +446,12 @@ pub const Database = struct {
             .directory => if (!info.directory) std.debug.panic("TODO", .{}),
         }
 
-        try db.file_id_map.ensureUnusedCapacity(db.allocator, @as(wave.PathComponentCount, @intCast(file_id_list.len)));
+        try db.file_id_map.ensureUnusedCapacity(db.allocator, @as(fairy.PathComponentCount, @intCast(file_id_list.len)));
 
         // TODO: create a Database event that will compute the hash later
         const hash = if (!info.directory) blk: {
-            const file = try wave.windows.openFile(db.sync_dir, path, .read);
-            defer wave.windows.closeHandle(file);
+            const file = try fairy.windows.openFile(db.sync_dir, path, .read);
+            defer fairy.windows.closeHandle(file);
 
             const Information = w.FILE.STANDARD_INFORMATION;
             var information: Information = undefined;
@@ -470,7 +470,7 @@ pub const Database = struct {
 
         const Iterator = std.fs.path.ComponentIterator(.windows, u16);
         var it = Iterator.init(path.slice);
-        var i: wave.PathComponentCount = 0;
+        var i: fairy.PathComponentCount = 0;
         while (if (i == 0) it.last() else it.previous()) |component| : (i += 1) {
             const file_id = file_id_list[i];
             const path_info = db.tree.files.getEntry(.assumeValidPath(component.path)).?;
@@ -478,7 +478,7 @@ pub const Database = struct {
                 .unknown => {
                     path_info.value_ptr.global_file_id = file_id;
                     db.file_id_map.putAssumeCapacityNoClobber(file_id, path_info.key_ptr.*);
-                    wave.log.debug("db: set file id {} for {f}", .{ @intFromEnum(file_id), path_info.key_ptr.formatUtf8() });
+                    fairy.log.debug("db: set file id {} for {f}", .{ @intFromEnum(file_id), path_info.key_ptr.formatUtf8() });
                 },
                 _ => {
                     if (path_info.value_ptr.global_file_id != file_id) {
@@ -534,11 +534,11 @@ pub const Database = struct {
     }
 
     fn openFileReadOnly(db: *const Database, path: Path) !w.HANDLE {
-        return wave.windows.openFile(db.sync_dir, path, .read);
+        return fairy.windows.openFile(db.sync_dir, path, .read);
     }
 
     fn closeFile(_: *const Database, file: w.HANDLE) void {
-        wave.windows.closeHandle(file);
+        fairy.windows.closeHandle(file);
     }
 
     pub const Debug = struct {
@@ -811,8 +811,8 @@ const scan = struct {
         if (information.FileAttributes.DIRECTORY) {
             try processDirectoryFile(db, ctx, path, information, set_to_untracked);
 
-            const component_count: wave.PathComponentCount = @intCast(ctx.open_dir_handles.items.len - 1); // Don't count the sync dir itself as a component.
-            if (component_count == wave.max_path_components) return; // TODO: track the folder, but don't track its contents.
+            const component_count: fairy.PathComponentCount = @intCast(ctx.open_dir_handles.items.len - 1); // Don't count the sync dir itself as a component.
+            if (component_count == fairy.max_path_components) return; // TODO: track the folder, but don't track its contents.
 
             const copied_name = try allocator.dupe(u16, name);
             try ctx.pending_dirs.append(allocator, copied_name);
@@ -843,7 +843,7 @@ const scan = struct {
         ctx.parent_paths.appendAssumeCapacity(parent_path);
 
         const parent_dir = ctx.open_dir_handles.items[ctx.open_dir_handles.items.len - 1];
-        const dir = try wave.windows.openDir(parent_dir, .assumeValidPath(dir_name));
+        const dir = try fairy.windows.openDir(parent_dir, .assumeValidPath(dir_name));
         errdefer comptime unreachable;
         ctx.open_dir_handles.appendAssumeCapacity(dir);
     }
@@ -898,7 +898,7 @@ const scan = struct {
                     } else {
                         // TODO: mark the file's hash as stale, compute it later
                         const hash = blk: {
-                            const file = try wave.windows.openFile(db.sync_dir, path, .read);
+                            const file = try fairy.windows.openFile(db.sync_dir, path, .read);
                             defer w.CloseHandle(file);
                             break :blk try computeFileHash(file, information.EndOfFile);
                         };
@@ -1129,7 +1129,7 @@ pub const Host = struct {
         ns.addToDiagnostics(diag, try select.await());
     }
 
-    pub const SendMessagesError = Io.Writer.Error || Io.Cancelable || wave.windows.SendFileError;
+    pub const SendMessagesError = Io.Writer.Error || Io.Cancelable || fairy.windows.SendFileError;
 
     fn sendMessages(host: *Host, writer: network.Writer, io: Io) SendMessagesError!void {
         host.debugLog("sending on thread {}", .{std.os.windows.GetCurrentThreadId()});
@@ -1276,7 +1276,7 @@ pub const Host = struct {
         Io.Cancelable ||
         Allocator.Error ||
         AddOutgoingTxError ||
-        wave.windows.ReceiveFileError;
+        fairy.windows.ReceiveFileError;
 
     fn receiveMessages(host: *Host, reader: network.Reader, io: Io) ReceiveMessagesError!void {
         host.debugLog("receiving on thread {}", .{std.os.windows.GetCurrentThreadId()});
@@ -1454,9 +1454,9 @@ pub const Host = struct {
 
     fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {
         if (host.debug.name) |name| {
-            wave.log.debug("(host:{s}) " ++ fmt, .{name} ++ args);
+            fairy.log.debug("(host:{s}) " ++ fmt, .{name} ++ args);
         } else {
-            wave.log.debug(fmt, args);
+            fairy.log.debug(fmt, args);
         }
     }
 
@@ -1540,7 +1540,7 @@ pub const TxData = union(enum) {
             switch (response) {
                 .success => {
                     // TODO Store this in Database somewhere instead
-                    var file_id_buffer: [wave.max_path_components]network.FileId = undefined;
+                    var file_id_buffer: [fairy.max_path_components]network.FileId = undefined;
                     var file_id_list: std.ArrayList(network.FileId) = .initBuffer(&file_id_buffer);
                     const Iterator = std.fs.path.ComponentIterator(.windows, u16);
                     var it = Iterator.init(out_new_file.path.slice);
@@ -1655,7 +1655,7 @@ pub const TxData = union(enum) {
 
             try writer.sendMessageHeaderExistingTx(peer_tx_id);
             try writer.sendAction(action);
-            try wave.windows.sendFile(writer.io, handle, out_file_contents.size);
+            try fairy.windows.sendFile(writer.io, handle, out_file_contents.size);
             try writer.flush();
         }
 

@@ -4,7 +4,7 @@ const print = std.debug.print;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-const wave = @import("wave");
+const fairy = @import("fairy");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -16,13 +16,13 @@ pub fn main(init: std.process.Init) !void {
     const peer_sync_dir = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, args.peerSyncDir());
     defer allocator.free(peer_sync_dir);
 
-    var cdb = try wave.client.Database.init(sync_dir, allocator);
+    var cdb = try fairy.client.Database.init(sync_dir, allocator);
     defer cdb.deinit();
 
-    var sdb = try wave.server.Database.init(peer_sync_dir, allocator);
+    var sdb = try fairy.server.Database.init(peer_sync_dir, allocator);
     defer sdb.deinit();
 
-    var cdb_run_task = try io.concurrent(wave.client.Database.run, .{ &cdb, io });
+    var cdb_run_task = try io.concurrent(fairy.client.Database.run, .{ &cdb, io });
     defer cdb_run_task.cancel(io) catch {};
 
     var host_pair_task = try io.concurrent(startServerAndClient, .{ io, &cdb, &sdb });
@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     try runCli(io, &cdb, &sdb);
 }
 
-fn runCli(io: Io, cdb: *wave.client.Database, sdb: *wave.server.Database) !void {
+fn runCli(io: Io, cdb: *fairy.client.Database, sdb: *fairy.server.Database) !void {
     var stdin_buffer: [64]u8 = undefined;
     var stdin = Io.File.stdin().reader(io, &stdin_buffer);
     const reader = &stdin.interface;
@@ -120,12 +120,12 @@ const Args = struct {
     }
 };
 
-const buffer_size = @max(wave.network.min_reader_writer_buffer_size, 128);
+const buffer_size = @max(fairy.network.min_reader_writer_buffer_size, 128);
 
 fn startServerAndClient(
     io: Io,
-    client_db: *wave.client.Database,
-    server_db: *wave.server.Database,
+    client_db: *fairy.client.Database,
+    server_db: *fairy.server.Database,
 ) !void {
     const addr = comptime Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch unreachable;
     var server = try addr.listen(io, .{});
@@ -144,9 +144,9 @@ fn startServerAndClient(
     var writer = stream.writer(io, &write_buffer);
 
     const name = "client";
-    var host = wave.client.Host.init(client_db, .{ .name = name });
+    var host = fairy.client.Host.init(client_db, .{ .name = name });
     defer host.deinit();
-    var diag: wave.client.Host.Diagnostics = .{};
+    var diag: fairy.client.Host.Diagnostics = .{};
     defer {
         print("{s} send result: {s}, recv result: {s}\n", .{
             name,
@@ -163,7 +163,7 @@ fn startServerAndClient(
     try host.run(&diag, io, &reader.interface, &writer.interface);
 }
 
-fn startServer(io: Io, server_db: *wave.server.Database, addr: Io.net.IpAddress) !void {
+fn startServer(io: Io, server_db: *fairy.server.Database, addr: Io.net.IpAddress) !void {
     const stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
@@ -173,9 +173,9 @@ fn startServer(io: Io, server_db: *wave.server.Database, addr: Io.net.IpAddress)
     var writer = stream.writer(io, &write_buffer);
 
     const name = "server";
-    var host = wave.server.Host.init(server_db, .{ .name = name });
+    var host = fairy.server.Host.init(server_db, .{ .name = name });
     defer host.deinit();
-    var diag: wave.server.Host.Diagnostics = .{};
+    var diag: fairy.server.Host.Diagnostics = .{};
     defer {
         // TODO (Windows) this print statement randomly doesn't show up in the terminal for some reason
         print("{s} send result: {s}, recv result: {s}\n", .{

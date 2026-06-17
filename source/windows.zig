@@ -4,7 +4,7 @@ const w = std.os.windows;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-const wave = @import("wave.zig");
+const fairy = @import("fairy.zig");
 
 const cpu_endian = @import("builtin").cpu.arch.endian();
 
@@ -15,7 +15,7 @@ const cpu_endian = @import("builtin").cpu.arch.endian();
 /// A path must have these properties:
 /// - It must be non-empty.
 /// - It must not be longer than `std.os.windows.PATH_MAX_WIDE` code units long.
-/// - It must not contain more than `wave.max_path_components` components.
+/// - It must not contain more than `fairy.max_path_components` components.
 /// - It must not contain any '/' codepoints.
 /// - It must not end with a '\' codepoint.
 /// - No component may be empty. (Thus consecutive '\' codepoints are disallowed.)
@@ -92,14 +92,14 @@ pub fn isValidWindowsPath(path: []const u16) bool {
     const L = std.unicode.wtf8ToWtf16LeStringLiteral;
     var index: u16 = 0;
     var component_len: u16 = 0;
-    var component_count: wave.PathComponentCount = 0;
+    var component_count: fairy.PathComponentCount = 0;
     while (index < path.len) : (index += 1) {
         switch (path[index]) {
             L("\\")[0] => {
                 if (index + 1 == path.len) return false;
                 const component = path[index - component_len .. index];
                 component_len = 0;
-                component_count = if (component_count < wave.max_path_components) component_count + 1 else return false;
+                component_count = if (component_count < fairy.max_path_components) component_count + 1 else return false;
                 if (!isValidComponent(component)) return false;
             },
             L("/")[0] => return false,

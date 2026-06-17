@@ -5,10 +5,10 @@ const wtf16 = std.unicode.wtf8ToWtf16LeStringLiteral;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-const wave = @import("wave.zig");
-const network = wave.network;
-const Path = wave.windows.Path;
-const PathHashMap = wave.windows.PathHashMap;
+const fairy = @import("fairy.zig");
+const network = fairy.network;
+const Path = fairy.windows.Path;
+const PathHashMap = fairy.windows.PathHashMap;
 
 const cpu_endian = @import("builtin").cpu.arch.endian();
 
@@ -46,7 +46,7 @@ pub const Database = struct {
 
     pub fn init(sync_dir_path: [:0]const u16, allocator: Allocator) !Database {
         const sync_dir_path_nt = try Io.Threaded.wToPrefixedFileW(null, sync_dir_path, .{ .allow_relative = false });
-        const sync_dir = try wave.windows.openSyncDir(sync_dir_path_nt.span());
+        const sync_dir = try fairy.windows.openSyncDir(sync_dir_path_nt.span());
         errdefer comptime unreachable;
 
         return .{
@@ -67,7 +67,7 @@ pub const Database = struct {
     }
 
     pub fn deinit(db: *Database) void {
-        wave.windows.closeHandle(db.sync_dir);
+        fairy.windows.closeHandle(db.sync_dir);
 
         var path_arena = db.path_arena.promote(db.allocator);
         path_arena.deinit();
@@ -98,7 +98,7 @@ pub const Database = struct {
             db.next_file_id = initial_file_id_tag;
         }
 
-        var file_id_buffer: [wave.max_path_components]network.FileId = undefined;
+        var file_id_buffer: [fairy.max_path_components]network.FileId = undefined;
         var file_id_list: std.ArrayList(network.FileId) = .initBuffer(&file_id_buffer);
 
         var path_arena = db.path_arena.promote(db.allocator);
@@ -174,7 +174,7 @@ pub const Database = struct {
         return file_id_range[0];
     }
 
-    fn getReverseFileIdPath(db: *Database, file_id: network.FileId, buffer: *[wave.max_path_components]network.FileId, io: Io) ![]network.FileId {
+    fn getReverseFileIdPath(db: *Database, file_id: network.FileId, buffer: *[fairy.max_path_components]network.FileId, io: Io) ![]network.FileId {
         try db.mutex.lock(io);
         defer db.mutex.unlock(io);
 
@@ -228,7 +228,7 @@ pub const Database = struct {
     }
 
     fn openFileReadOnly(db: *const Database, path: Path) !w.HANDLE {
-        return wave.windows.openFile(db.sync_dir, path, .read);
+        return fairy.windows.openFile(db.sync_dir, path, .read);
     }
 
     const CreateParentDirectoriesError = error{ CreateParentDirFail, Unexpected };
@@ -247,19 +247,19 @@ pub const Database = struct {
         const last = it.last().?;
         if (first.path.len == last.path.len) return .{ .parent = .sync_dir, .name = .assumeValidPath(last.name) };
         var handle = blk: while (it.previous()) |component| {
-            const handle = wave.windows.createDir(db.sync_dir, .assumeValidPath(component.path)) catch |err| switch (err) {
+            const handle = fairy.windows.createDir(db.sync_dir, .assumeValidPath(component.path)) catch |err| switch (err) {
                 error.ParentDirNotFound => continue,
                 error.Unexpected => |e| return e,
             };
             if (component.path.len != first.path.len) _ = it.next().?;
             break :blk handle;
         } else return error.CreateParentDirFail;
-        errdefer wave.windows.closeHandle(handle);
+        errdefer fairy.windows.closeHandle(handle);
 
         // TODO errdefer delete whatever we created
         while (it.next()) |component| {
             if (component.path.len == last.path.len) break;
-            const child_handle = wave.windows.createDir(handle, .assumeValidPath(component.name)) catch |err| switch (err) {
+            const child_handle = fairy.windows.createDir(handle, .assumeValidPath(component.name)) catch |err| switch (err) {
                 error.ParentDirNotFound => {
                     // TODO: The directory we just created was deleted.
                     //       Either try to re-create it, or obtain exclusive delete access to it.
@@ -268,7 +268,7 @@ pub const Database = struct {
                 error.Unexpected => |e| return e,
             };
             errdefer comptime unreachable;
-            wave.windows.closeHandle(handle);
+            fairy.windows.closeHandle(handle);
             handle = child_handle;
         }
 
@@ -276,11 +276,11 @@ pub const Database = struct {
     }
 
     fn createFile(_: *const Database, parent: w.HANDLE, name: Path, initial_size: w.LARGE_INTEGER) !w.HANDLE {
-        return wave.windows.createFile(parent, name, .{ .initial_size = initial_size });
+        return fairy.windows.createFile(parent, name, .{ .initial_size = initial_size });
     }
 
     fn closeHandle(_: *const Database, file: w.HANDLE) void {
-        wave.windows.closeHandle(file);
+        fairy.windows.closeHandle(file);
     }
 
     fn finishReceiveFileContents(
@@ -354,7 +354,7 @@ pub const Database = struct {
             .handle => |handle| handle,
             .sync_dir => db.sync_dir,
         };
-        const handle = wave.windows.createDir(parent, create_result.name) catch |err| switch (err) {
+        const handle = fairy.windows.createDir(parent, create_result.name) catch |err| switch (err) {
             error.ParentDirNotFound => {
                 // TODO: The directory we just created was deleted.
                 //       Either try to re-create it, or obtain exclusive delete access to it.
@@ -388,7 +388,7 @@ pub const Database = struct {
         }
 
         // TODO maybe don't perform the delete right away, but just queue it
-        if (wave.windows.deleteFile(db.sync_dir, file_info.value_ptr.path)) |_| {
+        if (fairy.windows.deleteFile(db.sync_dir, file_info.value_ptr.path)) |_| {
             db.files.removeByPtr(file_info.key_ptr);
             db.regular_file_info.removeByPtr(regular_info.key_ptr);
             db.path_map.removeByPtr(path_info_entry.key_ptr);
@@ -506,7 +506,7 @@ pub const Host = struct {
         ns.addToDiagnostics(diag, try select.await());
     }
 
-    pub const SendError = Io.Writer.Error || Io.Cancelable || wave.windows.SendFileError;
+    pub const SendError = Io.Writer.Error || Io.Cancelable || fairy.windows.SendFileError;
 
     fn sendOutgoingTxs(host: *Host, writer: network.Writer, io: Io) SendError!void {
         while (true) {
@@ -552,7 +552,7 @@ pub const Host = struct {
         Io.Cancelable ||
         Allocator.Error ||
         AddOutgoingTxError ||
-        wave.windows.ReceiveFileError ||
+        fairy.windows.ReceiveFileError ||
         Database.CreateParentDirectoriesError;
 
     fn receiveIncomingTxs(host: *Host, reader: network.Reader, io: Io) RecvError!void {
@@ -693,9 +693,9 @@ pub const Host = struct {
 
     fn debugLog(host: *const Host, comptime fmt: []const u8, args: anytype) void {
         if (host.debug.name) |name| {
-            wave.log.debug("(host:{s}) " ++ fmt, .{name} ++ args);
+            fairy.log.debug("(host:{s}) " ++ fmt, .{name} ++ args);
         } else {
-            wave.log.debug(fmt, args);
+            fairy.log.debug(fmt, args);
         }
     }
 
@@ -792,7 +792,7 @@ pub const TxData = union(enum) {
 
             switch (in_new_file.data) {
                 .success => |file_id| {
-                    var reverse_file_ids_buffer: [wave.max_path_components]network.FileId = undefined;
+                    var reverse_file_ids_buffer: [fairy.max_path_components]network.FileId = undefined;
                     const reversed_file_id_path = try host.db.getReverseFileIdPath(file_id, &reverse_file_ids_buffer, io);
 
                     host.deleteTransaction(tx_id, .outgoing, io);
@@ -929,7 +929,7 @@ pub const TxData = union(enum) {
                     };
                     defer host.db.closeHandle(handle);
 
-                    try wave.windows.receiveFile(reader.io, handle, in_file_contents.size);
+                    try fairy.windows.receiveFile(reader.io, handle, in_file_contents.size);
                     try host.db.finishReceiveFileContents(
                         io,
                         handle,

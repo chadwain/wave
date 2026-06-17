@@ -1,7 +1,7 @@
 .{
-    .name = .wave,
+    .name = .fairy,
     .version = "0.0.1",
     .minimum_zig_version = "0.16.0",
     .paths = .{"."},
-    .fingerprint = 0xda04ad89ad4e2917,
+    .fingerprint = 0x201cc7d5fe9dec2a,
 }

@@ -3,7 +3,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-const wave = @import("wave.zig");
+const fairy = @import("fairy.zig");
 
 /// The endianness of message contents, except for file paths, which have their own encoding.
 pub const endian: std.builtin.Endian = .little;
@@ -175,7 +175,7 @@ pub const Writer = struct {
         try writer.io.writeInt(PathByteCount, byte_count, endian);
     }
 
-    pub fn sendWindowsPath(writer: Writer, path: wave.windows.Path) Io.Writer.Error!void {
+    pub fn sendWindowsPath(writer: Writer, path: fairy.windows.Path) Io.Writer.Error!void {
         try writer.io.writeAll(@ptrCast(path.slice));
     }
 
@@ -251,7 +251,7 @@ pub const Reader = struct {
         byte_count: PathByteCount,
         encoding: PathEncoding,
         buffer: *align(2) FilePathBuffer,
-    ) !wave.windows.Path {
+    ) !fairy.windows.Path {
         switch (encoding) {
             .wtf16le => {},
         }
